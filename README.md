@@ -132,10 +132,9 @@ snapshot join.
 
 Spatial queries prune by file/row-group bbox statistics, then run exact
 `ST_Intersects` only on boundary candidates (fully contained bboxes skip it).
-Page-first planning converts geometry only for the returned page. See
-[`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md) for the 25M-row fixture,
-workload battery and per-request S3 accounting. [`docs/s3-benchmark.md`](docs/s3-benchmark.md)
-records the earlier single-file era and is superseded by the DuckLake design.
+Page-first planning converts geometry only for the returned page. Storage
+behavior (mountpoint disk cache, S3-GET accounting, outage proof) is
+recorded in [`docs/mount-lake.md`](docs/mount-lake.md).
 
 Layercake data is © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright),
 available under the [ODbL](https://opendatacommons.org/licenses/odbl/).
@@ -261,49 +260,23 @@ and wire throughput together. To size capacity, sweep `--connections
 holding p99 under 100 ms with under 1% rejected requests.
 
 Pages carry cursor `next` links: `cursor` is an exclusive lower bound on
-feature id and takes precedence over `offset`, so deep pages traverse fewer
-discarded rows than `OFFSET` (verified 3.5x on full-region pages at offset
-50000; the win is the smaller sort input). Direct `offset` links keep working.
+feature id and takes precedence over `offset`, so deep pages skip leading
+rows through the id ordering instead of traversing them with `OFFSET`.
+Direct `offset` links keep working.
 
 ### Replicas
 
 Snapshots are immutable, so scale past one CPU by running one instance per
-core group against the same catalog. Each replica keeps its own pool:
-budget roughly one `--connections` pool (8 DuckDB threads at one thread
-each) per instance, with repeated storage reads shared node-wide through
-the mountpoint disk cache, and confirm with `ogc_bench.py` round-robining
-across replicas versus one instance:
+core group against the same catalog. Each replica keeps its own pool;
+repeated storage reads are shared node-wide through the mountpoint disk
+cache. Confirm with `ogc_bench.py` against one instance versus round-robined
+replicas at equal total connections.
 
-```sh
-python3 scripts/ogc_bench.py --base http://127.0.0.1:3010 --concurrency 8 --requests 100 --jitter --seed 2
-```
-
-On the 20k Berlin fixture, loopback, two 4-connection replicas served
-jittered misses at ~720 rps against ~350 rps for one 8-connection instance
-at equal totals (measured in the Rust/Cachey era; the scaling shape
-— replicas add DuckDB throughput, the shared cache absorbs storage reads —
-still applies).
-
-Reference loopback run on the 5.17 GB / 14.985M-feature single-file Layercake
-shard (DuckDB 1.5.5 era, before the DuckLake-only rewrite; kept for scale
-context, not quoted as current capacity):
-
-| Workload | Local | `rclone serve s3` |
-|---|---:|---:|
-| First OGC page | 137 ms | 530 ms |
-| Cached OGC pages | 1,435 req/s | 1,385 req/s |
-| Flight-first, 1,000 rows | 237 ms | 255 ms |
-| Random OGC bbox p99 | 61 ms | 230 ms |
-
-The S3 simulation is loopback and therefore excludes real network latency.
-The DuckLake matrix in [`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md)
-is the current reference; re-run it on the 2.0 nightly before quoting
-ratios externally.
-
-Verified on the nightly (`v2.0.0-alpha42069`, 20k Berlin lake, loopback
-`rclone serve s3`): local and S3 return identical items and MVT bytes;
-miss-path HTTP runs 56 vs 54 rps and 1,000-row Flight runs 40 vs 41 rps
-(measured before the app-cache removal, on unique-URL miss traffic).
+Current loopback baselines (DuckDB 2.0 alpha, local disk): NW-Europe city
+window, 8 connections, `ogc_bench.py`: ~50 rps, p50 ~130 ms nonempty
+(large match sets sort by id — same SQL as ever); Berlin seed in kind:
+171 rps, p50 34 ms. Mount-cache behavior with S3-GET accounting lives in
+[`docs/mount-lake.md`](docs/mount-lake.md).
 
 These are not universal capacity claims; run the included tools on the target
 CPU, storage, shard size and response shape.
