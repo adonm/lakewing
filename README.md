@@ -94,7 +94,11 @@ mount's data prefix, so relative Parquet paths resolve to local mount paths
 everywhere. `build --content-address` names data files by content
 hash so unchanged snapshots upload nothing new, and every build writes a
 `<catalog>.serving.json` spatial file index beside the catalog (`index`
-recompiles it for older catalogs).
+recompiles it for older catalogs). Validated end to end on SeaweedFS
+(`just lake-publish` × 3, serve off the mount): additive-only uploads
+(identical republish added zero data keys; shared files dedupe by hash),
+coexisting catalog keys, readers pinned across ref moves, snapshots
+isolated per bbox.
 
 ```sh
 just fixture-nw-europe            # ~10 GB Benelux + N. France buildings
