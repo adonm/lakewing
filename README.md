@@ -185,12 +185,13 @@ Optional projections also include `x`, `y` (centroid coordinates), and `name`.
 `offset` defaults to 0; `limit` defaults to 10,000 and is capped at 100,000.
 Unknown or duplicate columns are rejected. Empty streams include their schema.
 
-DuckDB produces native Arrow batches, which are encoded directly for Flight without a result cache. A bounded query result is materialized before transmission. The service provides read-only Flight with JSON tickets.
+DuckDB rows stream as 1024-row Arrow batches; the schema is always sent,
+even for empty streams. The service provides read-only Flight with JSON tickets.
 
 ## Bulk access
 
 Bulk consumers use Arrow Flight (same pinned snapshot, bulk admission
-lane, byte budgets) or query the published Parquet directly with any
+lane) or query the published Parquet directly with any
 DuckDB. Run broad scans on the dedicated bulk pool
 (`bulk.enabled=true` in the chart), not the interactive readers.
 
@@ -211,16 +212,14 @@ DuckDB's unbounded default). Repeated Parquet block reads are absorbed by
 the mountpoint local disk cache on each node, not by in-DuckDB tuning:
 there are no storage-tuning flags by design (see
 [`docs/mount-lake.md`](docs/mount-lake.md)).
-`--query-timeout-ms` interrupts HTTP and Flight
-queries past their deadline (default 30000; 0 disables). Queries run on blocking
-workers with one bounded lifecycle: cancellation is owned from before
-execution through final delivery, the worker clears its interrupt handle
-before the connection returns to the pool (late drops cannot cancel the next
-query), oversized batches drain instead of spinning, and fetch failures
-surface as errors instead of truncated streams. Batches flow through a
-per-stream byte budget (`--flight-stream-mb`, default 32) plus a process-wide
-budget (`--flight-total-mb`, default 128). Narrow scans fetch page payloads
-late via file/row-number instead of reading geom+properties first. `/metrics`
+`--query-timeout-ms` bounds HTTP and Flight queries past their deadline
+(default 30000; 0 disables): over-deadline requests fail fast with 500 and
+the connection returns to the pool healthy. Unlike the old stack there is
+no cross-thread interrupt handle — cancellation is via context, so the
+deadline bounds client-visible latency and pool behavior, not guaranteed
+backend abort. Flight streams in 1024-row Arrow batches; bulk admission
+(`--flight-concurrency`) is the backpressure mechanism — there are no
+per-stream or process-wide byte budgets in this implementation. `/metrics`
 is `no-store` and reports `http_requests` plus `duck_setting_*` engine
 budgets (threads, memory). Storage-cache benchmarks measure the mountpoint
 local disk cache instead: see [`docs/mount-lake.md`](docs/mount-lake.md) for
