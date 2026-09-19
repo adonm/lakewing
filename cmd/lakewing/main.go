@@ -152,7 +152,9 @@ func serveCmd() *cobra.Command {
 			slog.Info("serving shard", "shard", shard, "snapshot", st.Snapshot, "http", listen, "flight", flightListen)
 
 			router := chi.NewMux()
-			api := humachi.New(router, huma.DefaultConfig("lakewing", "0.1.0"))
+			cfg := huma.DefaultConfig("lakewing", "0.1.0")
+			cfg.OpenAPIPath = "/api"
+			api := humachi.New(router, cfg)
 			ogc.Register(api, st)
 
 			httpSrv := &http.Server{Addr: listen, Handler: router}

@@ -4,10 +4,11 @@
 > Cachey HTTP reads). It is now `lakewing` (Go, Huma OGC + Arrow Flight,
 > mountpoint-S3-CSI reads, direct-S3 writes, SeaweedFS local rig). `build`,
 > `index` and `serve` (OGC + tiles + Flight) are wired against DuckDB 2.0
-> (`v2.0.0-alpha42069` via `-tags=duckdb_use_lib`; the preview binding's
-> bundled engine is 1.5.x and cannot open 2.0 catalogs). Remaining deltas
-> from the old stack: Flight load-benchmarks, refreshed OpenAPI snapshot,
-> kind CSI-driver install against real S3 (kind runs hostPath).
+> (`v2.0.0-alpha42069` via `-tags=duckdb_use_lib,duckdb_arrow`; the preview
+> binding's bundled engine is 1.5.x and cannot open 2.0 catalogs, and its
+> Arrow export is the zero-copy-ish path Flight streams through). Remaining
+> deltas from the old stack: Flight load-benchmarks, refreshed OpenAPI
+> snapshot, kind CSI-driver install against real S3 (kind runs hostPath).
 
 **Build a DuckLake snapshot on S3, then serve it through OGC REST and Arrow Flight.**
 
@@ -185,8 +186,10 @@ Optional projections also include `x`, `y` (centroid coordinates), and `name`.
 `offset` defaults to 0; `limit` defaults to 10,000 and is capped at 100,000.
 Unknown or duplicate columns are rejected. Empty streams include their schema.
 
-DuckDB rows stream as 1024-row Arrow batches; the schema is always sent,
-even for empty streams. The service provides read-only Flight with JSON tickets.
+DuckDB rows stream as 1024-row Arrow batches via the engine's native Arrow
+export (chunk-to-batch conversion inside the driver; the streamed schema is
+validated against the Flight contract, all fields nullable). Empty streams
+still carry the schema. The service provides read-only Flight with JSON tickets.
 
 ## Bulk access
 

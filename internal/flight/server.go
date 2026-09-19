@@ -29,21 +29,24 @@ const batchRows = 1024
 
 // SchemaForColumns mirrors the Flight projection contract.
 func SchemaForColumns(cols []string) (*arrow.Schema, error) {
+	// All fields nullable: the native Arrow export marks every field
+	// nullable, and the IPC writer requires exact schema agreement with
+	// the streamed batches.
 	fields := make([]arrow.Field, len(cols))
 	for i, c := range cols {
 		switch c {
 		case "id":
-			fields[i] = arrow.Field{Name: "id", Type: arrow.BinaryTypes.String}
+			fields[i] = arrow.Field{Name: "id", Type: arrow.BinaryTypes.String, Nullable: true}
 		case "geometry":
-			fields[i] = arrow.Field{Name: "geometry", Type: arrow.BinaryTypes.Binary}
+			fields[i] = arrow.Field{Name: "geometry", Type: arrow.BinaryTypes.Binary, Nullable: true}
 		case "properties":
-			fields[i] = arrow.Field{Name: "properties", Type: arrow.BinaryTypes.String}
+			fields[i] = arrow.Field{Name: "properties", Type: arrow.BinaryTypes.String, Nullable: true}
 		case "source_id":
-			fields[i] = arrow.Field{Name: "source_id", Type: arrow.PrimitiveTypes.Int64}
+			fields[i] = arrow.Field{Name: "source_id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
 		case "x":
-			fields[i] = arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Float64}
+			fields[i] = arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Float64, Nullable: true}
 		case "y":
-			fields[i] = arrow.Field{Name: "y", Type: arrow.PrimitiveTypes.Float64}
+			fields[i] = arrow.Field{Name: "y", Type: arrow.PrimitiveTypes.Float64, Nullable: true}
 		case "name":
 			fields[i] = arrow.Field{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true}
 		default:
@@ -243,52 +246,8 @@ func (s *Server) DoGet(tick *flightpb.Ticket, stream flightpb.FlightService_DoGe
 		return invalid(err)
 	}
 	w := flight.NewRecordWriter(stream, ipc.WithSchema(schema))
-	wrote := false
 	qerr := s.store.Query(stream.Context(), true, func(ctx context.Context, c *sql.Conn) error {
-		rows, err := c.QueryContext(ctx, query)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		rb := array.NewRecordBuilder(s.mem, schema)
-		defer rb.Release()
-		flush := func() error {
-			rec := rb.NewRecord()
-			defer rec.Release()
-			wrote = true
-			return w.Write(rec)
-		}
-		n := 0
-		cols, _ := rows.Columns()
-		for rows.Next() {
-			vals := make([]any, len(cols))
-			ptrs := make([]any, len(cols))
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				return err
-			}
-			if err := appendRow(rb, nt.Columns, vals); err != nil {
-				return err
-			}
-			n++
-			if n >= batchRows {
-				if err := flush(); err != nil {
-					return err
-				}
-				n = 0
-			}
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if n > 0 || !wrote {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-		return nil
+		return streamBatches(ctx, c, query, nt.Columns, schema, w, s.mem)
 	})
 	if qerr != nil {
 		return toStatus(qerr)

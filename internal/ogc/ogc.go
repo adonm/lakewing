@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"embed"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -36,10 +35,29 @@ var Conformance = []string{
 	"http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
 }
 
-// Static API description + docs, mirroring the historical /api contract.
-//
-//go:embed spec/openapi.json spec/api.html
-var specFS embed.FS
+// raw routes a handler with full byte control while also documenting the
+// operation in Huma's generated spec (Adapter.Handle alone only routes).
+func raw(api huma.API, op huma.Operation, params []*huma.Param, handler func(huma.Context)) {
+	api.Adapter().Handle(&op, handler)
+	op.Parameters = params
+	item := api.OpenAPI().Paths[op.Path]
+	if item == nil {
+		item = &huma.PathItem{}
+		api.OpenAPI().Paths[op.Path] = item
+	}
+	get := op
+	if op.Method == http.MethodGet {
+		item.Get = &get
+	}
+}
+
+func qp(name, desc string) *huma.Param {
+	return &huma.Param{Name: name, In: "query", Description: desc}
+}
+
+func pp(name, desc string) *huma.Param {
+	return &huma.Param{Name: name, In: "path", Required: true, Description: desc}
+}
 
 // Register wires all OGC routes onto the Huma API.
 func Register(api huma.API, st *store.Store) {
@@ -55,7 +73,7 @@ func Register(api huma.API, st *store.Store) {
 			"links": []any{
 				link("/", "self", "application/json"),
 				link("/api", "service-desc", "application/vnd.oai.openapi+json;version=3.0"),
-				link("/api.html", "service-doc", "text/html"),
+				link("/docs", "service-doc", "text/html"),
 				link("/conformance", "conformance", "application/json"),
 				link("/collections", "data", "application/json"),
 			}}
@@ -72,17 +90,17 @@ func Register(api huma.API, st *store.Store) {
 		return out, nil
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "health", Method: http.MethodGet, Path: "/healthz",
 		Summary: "Liveness",
-	}, func(ctx huma.Context) {
+	}, nil, func(ctx huma.Context) {
 		writeBody(ctx, 200, []byte("ok"), "text/plain; charset=utf-8", "no-store")
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "metrics", Method: http.MethodGet, Path: "/metrics",
 		Summary: "Point-in-time counters",
-	}, func(ctx huma.Context) {
+	}, nil, func(ctx huma.Context) {
 		writeBody(ctx, 200, []byte(st.Metrics()), "text/plain; charset=utf-8", "no-store")
 	})
 
@@ -101,10 +119,10 @@ func Register(api huma.API, st *store.Store) {
 		return out, nil
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "collection", Method: http.MethodGet, Path: "/collections/{collection}",
 		Summary: "Collection metadata",
-	}, func(ctx huma.Context) {
+	}, []*huma.Param{pp("collection", "Collection id")}, func(ctx huma.Context) {
 		id := ctx.Param("collection")
 		if err := st.Collection(id); err != nil {
 			fail(ctx, err)
@@ -114,49 +132,62 @@ func Register(api huma.API, st *store.Store) {
 		writeBody(ctx, 200, body, "application/json", cacheControl)
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "items", Method: http.MethodGet, Path: "/collections/{collection}/items",
 		Summary: "Collection features as GeoJSON",
+	}, []*huma.Param{
+		pp("collection", "Collection id"),
+		qp("bbox", "CRS84 bounds w,s,e,n (west > east crosses the antimeridian)"),
+		qp("limit", "Page size 1..1000 (default 10)"),
+		qp("offset", "Rows to skip (default 0; cursor wins)"),
+		qp("cursor", "Exclusive lower bound on feature id (next links)"),
+		qp("datetime", "RFC3339 instant or interval (validated only)"),
+		qp("sources", "Comma-separated source ids (intersects X-Source-Ids)"),
 	}, func(ctx huma.Context) {
 		itemsHandler(ctx, st)
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "item", Method: http.MethodGet, Path: "/collections/{collection}/items/{featureId}",
 		Summary: "Single feature",
+	}, []*huma.Param{
+		pp("collection", "Collection id"),
+		pp("featureId", "Feature id"),
+		qp("sources", "Comma-separated source ids (intersects X-Source-Ids)"),
 	}, func(ctx huma.Context) {
 		itemHandler(ctx, st)
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "tile", Method: http.MethodGet, Path: "/collections/{collection}/tiles/{z}/{x}/{y}",
 		Summary: "XYZ vector tile",
+	}, []*huma.Param{
+		pp("collection", "Collection id"),
+		pp("z", "Zoom level"),
+		pp("x", "Tile column"),
+		pp("y", "Tile row"),
+		qp("sources", "Comma-separated source ids (intersects X-Source-Ids)"),
 	}, func(ctx huma.Context) {
 		tileHandler(ctx, st)
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "spec", Method: http.MethodGet, Path: "/api",
-		Summary: "OpenAPI description",
-	}, func(ctx huma.Context) {
-		raw, err := specFS.ReadFile("spec/openapi.json")
-		if err != nil {
-			fail(ctx, store.Backend(err.Error()))
-			return
-		}
-		writeBody(ctx, 200, raw, "application/vnd.oai.openapi+json;version=3.0", cacheControl)
+		Summary: "OpenAPI description (3.0, generated)",
+	}, nil, func(ctx huma.Context) {
+		// Single source: Huma's registry. /api stays on the 3.0
+		// downgrade to match the oas30 conformance claim and the
+		// historical versioned content type; /api.json serves 3.1.
+		ctx.SetHeader("Location", "/api-3.0.json")
+		ctx.SetStatus(302)
 	})
 
-	api.Adapter().Handle(&huma.Operation{
+	raw(api, huma.Operation{
 		OperationID: "apidocs", Method: http.MethodGet, Path: "/api.html",
 		Summary: "API documentation",
-	}, func(ctx huma.Context) {
-		raw, err := specFS.ReadFile("spec/api.html")
-		if err != nil {
-			fail(ctx, store.Backend(err.Error()))
-			return
-		}
-		writeBody(ctx, 200, raw, "text/html", cacheControl)
+	}, nil, func(ctx huma.Context) {
+		ctx.SetHeader("Location", "/docs")
+		ctx.SetStatus(302)
 	})
 }
 

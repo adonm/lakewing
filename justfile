@@ -6,7 +6,7 @@ DUCKDB_DIR := justfile_directory() + "/.deps/duckdb"
 export CGO_LDFLAGS := "-L" + DUCKDB_DIR
 export LD_LIBRARY_PATH := DUCKDB_DIR
 export DYLD_LIBRARY_PATH := DUCKDB_DIR
-export GOFLAGS := "-tags=duckdb_use_lib"
+export GOFLAGS := "-tags=duckdb_use_lib,duckdb_arrow"
 
 default: check
 
@@ -23,10 +23,10 @@ check: setup-duckdb
 test: setup-duckdb
     go test ./...
 
-# Real-DuckDB smoke: boots the pooled store over the fixture catalog
-# (needs the 2.0 prebuilt lib + fixture files).
+# Real-DuckDB tests: pooled store boot + Flight round trip over the
+# fixture catalog (needs the 2.0 prebuilt lib + fixture files).
 test-duckdb shard="fixtures/nw-europe.ducklake": setup-duckdb
-    LAKEWING_TEST_SHARD="{{justfile_directory()}}/{{shard}}" go test -count=1 ./internal/store/ -run TestPreviewSmoke -v
+    LAKEWING_TEST_SHARD="{{justfile_directory()}}/{{shard}}" go test -count=1 ./internal/store/ ./internal/flight/ -v 2>&1 | grep -E "^(=== RUN|--- PASS|--- FAIL|PASS|FAIL|ok)"
 
 build: setup-duckdb
     go build ./...

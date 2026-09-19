@@ -14,7 +14,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 COPY .deps/duckdb /duckdb-lib
 ENV CGO_LDFLAGS=-L/duckdb-lib
-ENV GOFLAGS=-tags=duckdb_use_lib
+ENV GOFLAGS=-tags=duckdb_use_lib,duckdb_arrow
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 go build -o /lakewing ./cmd/lakewing
 
