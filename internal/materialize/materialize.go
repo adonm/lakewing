@@ -127,7 +127,7 @@ func Run(ctx context.Context, spec Spec) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer os.RemoveAll(staging)
+	defer func() { _ = os.RemoveAll(staging) }()
 	stagingCatalog := filepath.Join(staging, "catalog.ducklake")
 	stagingData := filepath.Join(staging, "files")
 	if err := os.MkdirAll(stagingData, 0o755); err != nil {

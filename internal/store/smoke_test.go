@@ -67,7 +67,7 @@ func TestPreviewSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	t.Logf("snapshot=%d collections=%v serving_files=%d", st.Snapshot, st.Collections, st.ServingFiles())
 	if len(st.Collections) == 0 || st.Snapshot <= 0 {
 		t.Fatal("store opened without collections/snapshot")
@@ -98,7 +98,7 @@ func TestPreviewSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open tempdir: %v", err)
 	}
-	defer st2.Close()
+	defer func() { _ = st2.Close() }()
 	var got string
 	if err := st2.Query(context.Background(), false, func(ctx context.Context, c *sql.Conn) error {
 		return c.QueryRowContext(ctx, "SELECT current_setting('temp_directory')").Scan(&got)

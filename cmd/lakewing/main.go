@@ -158,7 +158,7 @@ func serveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			slog.Info("serving shard", "shard", shard, "snapshot", st.Snapshot, "http", listen, "flight", flightListen)
 
 			router := chi.NewMux()

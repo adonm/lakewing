@@ -26,6 +26,14 @@ check: setup-duckdb
 test: setup-duckdb
     go test ./...
 
+# Race-detector suite for the concurrent proxy surface (pure Go, fast).
+test-race:
+    go test -race -count=1 ./internal/s3cache/
+
+# golangci-lint (staticcheck, gosec, errcheck…) via mise.
+lint:
+    golangci-lint run ./...
+
 # Real-DuckDB tests: pooled store boot + Flight round trip over the
 # fixture catalog (needs the 2.0 prebuilt lib + fixture files).
 test-duckdb shard="fixtures/nw-europe.ducklake": setup-duckdb

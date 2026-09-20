@@ -88,18 +88,18 @@ func (o *origin) handler() http.Handler {
 			o.mu.Unlock()
 			if rg == "" {
 				w.Header().Set("Content-Length", strconv.Itoa(len(o.data)))
-				w.Write(o.data)
+				_, _ = w.Write(o.data)
 				return
 			}
 			var lo, hi int
-			fmt.Sscanf(rg, "bytes=%d-%d", &lo, &hi)
+			_, _ = fmt.Sscanf(rg, "bytes=%d-%d", &lo, &hi)
 			if hi >= len(o.data) {
 				hi = len(o.data) - 1
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", lo, hi, len(o.data)))
 			w.Header().Set("Content-Length", strconv.Itoa(hi-lo+1))
 			w.WriteHeader(http.StatusPartialContent)
-			w.Write(o.data[lo : hi+1])
+			_, _ = w.Write(o.data[lo : hi+1])
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -279,7 +279,7 @@ func TestEvictionBounded(t *testing.T) {
 	get(t, front+"/b/a.parquet", "", "sig")
 	get(t, front+"/b/b.parquet", "", "sig")
 	var total int64
-	filepath.Walk(proxy.cfg.CacheDir, func(_ string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(proxy.cfg.CacheDir, func(_ string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() {
 			total += info.Size()
 		}
@@ -392,7 +392,7 @@ func TestMetricsUnderChurn(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != 200 {
 			t.Fatalf("metrics status=%d", resp.StatusCode)

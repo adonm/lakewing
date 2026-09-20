@@ -8,6 +8,7 @@ require (
 	github.com/duckdb/duckdb-go/v2 v2.20000.0-6.preview
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/sync v0.22.0
 	google.golang.org/grpc v1.83.2
 )
 

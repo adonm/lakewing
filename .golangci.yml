@@ -1,0 +1,29 @@
+# golangci-lint v2. Default linters plus targeted errcheck exclusions for
+# deliberate cleanup-ignores; everything else stays flagged.
+version: "2"
+run:
+  # Lint the shipping build: stream_arrow.go is the tagged-in path.
+  build-tags:
+    - duckdb_arrow
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        # Cleanup closes: the error carries no recoverable information
+        # once the request/transaction is already finished.
+        - (*os.File).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Conn).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Stmt).Close
+        - (*database/sql.Tx).Rollback
+        - (io.ReadCloser).Close
+        # Best-effort writes to an HTTP response or scrape/health sinks.
+        - fmt.Fprintln
+        - fmt.Fprintf
+        - io.WriteString
+        - (io.Writer).Write
+        - (*encoding/json.Encoder).Encode
+        # Our own drain/teardown API.
+        - github.com/adonm/lakewing/internal/store.(*Store).Close
+        - github.com/apache/arrow-go/v18/arrow/flight.Client.Close

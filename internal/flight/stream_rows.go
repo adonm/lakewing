@@ -24,9 +24,9 @@ func streamBatches(ctx context.Context, c *sql.Conn, query string, cols []string
 	rb := array.NewRecordBuilder(mem, schema)
 	defer rb.Release()
 	flush := func() error {
-		rec := rb.NewRecord()
-		defer rec.Release()
-		return w.Write(rec)
+		batch := rb.NewRecordBatch()
+		defer batch.Release()
+		return w.Write(batch)
 	}
 	names, err := rows.Columns()
 	if err != nil {

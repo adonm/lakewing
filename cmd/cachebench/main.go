@@ -301,7 +301,8 @@ func (s *worker) handler() http.Handler {
 		for key := range ioDelta {
 			ioDelta[key] -= beforeIO[key]
 		}
-		s.conn.ExecContext(r.Context(), "PRAGMA disable_profiling")
+		// Best-effort: the query result is already consumed.
+		_, _ = s.conn.ExecContext(r.Context(), "PRAGMA disable_profiling")
 		if err == nil && len(rows) == 0 {
 			err = fmt.Errorf("empty result for %s", name)
 		}

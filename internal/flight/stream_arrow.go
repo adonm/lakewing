@@ -65,7 +65,7 @@ func streamBatches(ctx context.Context, c *sql.Conn, query string, cols []string
 	wrote := false
 	for reader.Next() {
 		wrote = true
-		if err := w.Write(reader.Record()); err != nil {
+		if err := w.Write(reader.RecordBatch()); err != nil {
 			return err
 		}
 	}
@@ -76,9 +76,9 @@ func streamBatches(ctx context.Context, c *sql.Conn, query string, cols []string
 		// Empty streams still carry the schema.
 		rb := array.NewRecordBuilder(mem, schema)
 		defer rb.Release()
-		rec := rb.NewRecord()
-		defer rec.Release()
-		return w.Write(rec)
+		batch := rb.NewRecordBatch()
+		defer batch.Release()
+		return w.Write(batch)
 	}
 	return nil
 }

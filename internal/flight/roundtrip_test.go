@@ -41,7 +41,7 @@ func testStore(t *testing.T) *store.Store {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	return st
 }
 
@@ -60,11 +60,11 @@ func TestFlightRoundTrip(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	cl, err := flight.NewFlightClient(addr, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cl, err := flight.NewClientWithMiddleware(addr, nil, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cl.Close()
+	defer cl.Close() //nolint:errcheck // test client
 
 	// ListFlights: one entry per collection, empty criteria required.
 	infos := 0

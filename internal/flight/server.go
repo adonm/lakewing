@@ -11,7 +11,6 @@ import (
 	"net"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	flightpb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
@@ -24,8 +23,6 @@ import (
 	"github.com/adonm/lakewing/internal/filter"
 	"github.com/adonm/lakewing/internal/store"
 )
-
-const batchRows = 1024
 
 // SchemaForColumns mirrors the Flight projection contract.
 func SchemaForColumns(cols []string) (*arrow.Schema, error) {
@@ -251,125 +248,6 @@ func (s *Server) DoGet(tick *flightpb.Ticket, stream flightpb.FlightService_DoGe
 	})
 	if qerr != nil {
 		return toStatus(qerr)
-	}
-	return nil
-}
-
-func toInt64(v any) (int64, error) {
-	switch t := v.(type) {
-	case int64:
-		return t, nil
-	case int32:
-		return int64(t), nil
-	case uint64:
-		return int64(t), nil
-	case int:
-		return int64(t), nil
-	default:
-		return 0, fmt.Errorf("not an integer: %T", v)
-	}
-}
-
-func toFloat64(v any) (float64, error) {
-	switch t := v.(type) {
-	case float64:
-		return t, nil
-	case float32:
-		return float64(t), nil
-	case int64:
-		return float64(t), nil
-	default:
-		return 0, fmt.Errorf("not a float: %T", v)
-	}
-}
-
-func toBytes(v any) ([]byte, error) {
-	switch t := v.(type) {
-	case nil:
-		return nil, nil
-	case []byte:
-		return t, nil
-	case string:
-		return []byte(t), nil
-	default:
-		return nil, fmt.Errorf("not bytes: %T", v)
-	}
-}
-
-func toJSONString(v any) (string, bool, error) {
-	switch t := v.(type) {
-	case nil:
-		return "", false, nil
-	case string:
-		return t, true, nil
-	case []byte:
-		return string(t), true, nil
-	default:
-		b, err := json.Marshal(t)
-		return string(b), true, err
-	}
-}
-
-// appendRow appends one scanned row to the record builder.
-func appendRow(rb *array.RecordBuilder, cols []string, vals []any) error {
-	for i, c := range cols {
-		v := vals[i]
-		switch c {
-		case "id":
-			s, _ := v.(string)
-			if v == nil {
-				rb.Field(i).(*array.StringBuilder).AppendNull()
-			} else {
-				rb.Field(i).(*array.StringBuilder).Append(s)
-			}
-		case "geometry":
-			b, err := toBytes(v)
-			if err != nil {
-				return err
-			}
-			if b == nil {
-				rb.Field(i).(*array.BinaryBuilder).AppendNull()
-			} else {
-				rb.Field(i).(*array.BinaryBuilder).Append(b)
-			}
-		case "properties":
-			s, ok, err := toJSONString(v)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				rb.Field(i).(*array.StringBuilder).AppendNull()
-			} else {
-				rb.Field(i).(*array.StringBuilder).Append(s)
-			}
-		case "source_id":
-			if v == nil {
-				rb.Field(i).(*array.Int64Builder).AppendNull()
-			} else {
-				n, err := toInt64(v)
-				if err != nil {
-					return err
-				}
-				rb.Field(i).(*array.Int64Builder).Append(n)
-			}
-		case "x", "y":
-			if v == nil {
-				rb.Field(i).(*array.Float64Builder).AppendNull()
-			} else {
-				f, err := toFloat64(v)
-				if err != nil {
-					return err
-				}
-				rb.Field(i).(*array.Float64Builder).Append(f)
-			}
-		case "name":
-			s, _ := v.(string)
-			if v == nil {
-				rb.Field(i).(*array.StringBuilder).AppendNull()
-			} else {
-				rb.Field(i).(*array.StringBuilder).Append(s)
-			}
-		}
 	}
 	return nil
 }
