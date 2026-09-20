@@ -1,0 +1,104 @@
+# In-cluster consistency tests: run the OGC surface against the live
+# read pool and assert exact behaviors (no mocks, real server + data).
+# `just kind-test` applies this, waits, and fails on any assert.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kind-test
+  namespace: lake
+data:
+  test.py: |
+    import json
+    import sys
+    import urllib.request
+
+    BASE = "http://lake-read.lake.svc.cluster.local:3000"
+    BBOX = "13.38,52.50,13.42,52.54"
+    failures = []
+
+    def check(name, cond, detail=""):
+        print(("PASS " if cond else "FAIL ") + name, detail)
+        if not cond:
+            failures.append(name)
+
+    def get(path, headers=None):
+        req = urllib.request.Request(BASE + path, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, r.read(), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), dict(e.headers)
+
+    s, body, _ = get("/collections")
+    cols = json.loads(body)["collections"]
+    check("collections", s == 200 and [c["id"] for c in cols] == ["buildings"], f"status={s}")
+
+    s, body, _ = get(f"/collections/buildings/items?bbox={BBOX}&sources=1&limit=10")
+    page = json.loads(body)
+    feats = page["features"]
+    check("items-nonempty", s == 200 and page["numberReturned"] == len(feats) > 0, f"status={s} n={page.get('numberReturned')}")
+    rels = [l["rel"] for l in page["links"]]
+    check("items-links", "self" in rels and "collection" in rels and "next" in rels, str(rels))
+    ids = [f["id"] for f in feats]
+    check("items-ordered-unique", ids == sorted(ids) and len(set(ids)) == len(ids))
+    check("items-geojson", all(f["type"] == "Feature" and f["geometry"]["type"] in ("Polygon", "MultiPolygon") for f in feats))
+
+    fid = ids[0]
+    s, body, _ = get(f"/collections/buildings/items/{fid}?sources=1")
+    one = json.loads(body)
+    check("item-roundtrip", s == 200 and one["id"] == fid, f"status={s}")
+
+    s, _, _ = get("/collections/buildings/items/does:not-exist?sources=1")
+    check("item-404", s == 404, f"status={s}")
+    s, _, _ = get("/collections/nowhere/items?sources=1")
+    check("collection-404", s == 404, f"status={s}")
+    s, _, _ = get("/collections/buildings/items?sources=1&limit=9999")
+    check("limit-400", s == 400, f"status={s}")
+    s, _, _ = get("/collections/buildings/items?sources=1&bogus=1")
+    check("unknown-param-400", s == 400, f"status={s}")
+
+    got200 = False
+    for z, x, y in [(14, 8801, 5373), (14, 8800, 5373), (14, 8802, 5373), (13, 4400, 2686)]:
+        s, body, h = get(f"/collections/buildings/tiles/{z}/{x}/{y}?sources=1")
+        if s == 200 and len(body) > 0 and h.get("Content-Type") == "application/vnd.mapbox-vector-tile":
+            got200 = (z, x, y)
+            break
+    check("tile-200", bool(got200), f"tile={got200}")
+    s, _, _ = get("/collections/buildings/tiles/5/13/16?sources=1")
+    check("tile-204", s == 204, f"status={s}")
+
+    s, body, _ = get("/metrics")
+    text = body.decode()
+    check("metrics", s == 200 and 'lakewing_http_responses_total{status="200"}' in text, f"status={s}")
+
+    s, body, _ = get("/api-3.0.json")
+    spec = json.loads(body)
+    check("openapi", s == 200 and spec["openapi"].startswith("3.0.") and "/collections/{collection}/items" in spec["paths"], spec.get("openapi"))
+
+    s, body, _ = get("/healthz")
+    check("healthz", s == 200 and body == b"ok", f"status={s}")
+
+    print(f"{len(failures)} failures" if failures else "ALL PASS")
+    sys.exit(1 if failures else 0)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lake-test
+  namespace: lake
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: python:3.14-slim
+          command: ["python3", "/tests/test.py"]
+          volumeMounts:
+            - name: tests
+              mountPath: /tests
+      volumes:
+        - name: tests
+          configMap:
+            name: kind-test

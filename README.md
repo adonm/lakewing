@@ -232,8 +232,10 @@ deadline bounds client-visible latency and pool behavior, not guaranteed
 backend abort. Flight streams in 1024-row Arrow batches; bulk admission
 (`--flight-concurrency`) is the backpressure mechanism — there are no
 per-stream or process-wide byte budgets in this implementation. `/metrics`
-is `no-store` and reports `http_requests` plus `duck_setting_*` engine
-budgets (threads, memory). Storage-cache benchmarks measure the mountpoint
+is `no-store` Prometheus exposition: `lakewing_http_responses_total{status}`
+plus attempts, DuckDB threads/memory, and Go runtime gauges. Alloy scrapes
+it into Mimir and ships pod logs into Loki (`just kind-obs`).
+Storage-cache benchmarks measure the mountpoint
 local disk cache instead: see [`docs/mount-lake.md`](docs/mount-lake.md) for
 the local rig (`just seaweed-up`, `just lake-mount`, `just lake-publish`,
 `just lake-serve`).

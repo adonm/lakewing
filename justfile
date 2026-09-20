@@ -84,6 +84,12 @@ lake-mount mnt="/tmp/opencode/mnt/lake":
 test-mount-cache *args:
     bash scripts/mount_cache_test.sh {{args}}
 
+# Side-by-side storage backends: DuckDB httpfs/S3 (2.0 external file
+# cache) vs mountpoint disk cache, same OGC-shaped queries cold + warm,
+# plus DuckLake catalog-table variants.
+bench-paths:
+    bash scripts/bench_paths.sh
+
 # Publish a new immutable snapshot, then move a ref at it. Writes go
 # direct to S3 (never via the mount); reads resolve mount paths.
 # Uploads are additive only and catalog keys are never overwritten.
@@ -181,6 +187,21 @@ kind-seed:
 # Berlin benchmark against a port-forwarded read pool.
 kind-bench base="http://127.0.0.1:3000" workload="workloads/berlin/mixed.txt": workloads-berlin
     python3 scripts/ogc_bench.py --base {{quote(base)}} --concurrency 8 --requests 100 --workload {{quote(workload)}}
+
+# Observability: Grafana LGTM (metrics/logs/traces backends) + Alloy
+# (scrapes lakewing /metrics into Mimir, ships pod logs into Loki).
+kind-obs:
+    kubectl apply -f k8s/lgtm.yaml
+    kubectl apply -f k8s/alloy.yaml
+    kubectl -n monitoring rollout status deployment/lgtm --timeout=300s
+    kubectl -n monitoring rollout status daemonset/alloy --timeout=300s
+
+# In-cluster consistency tests against the live read pool.
+kind-test:
+    kubectl -n lake delete job/lake-test --ignore-not-found
+    kubectl apply -f k8s/kind-test.yaml
+    kubectl -n lake wait --for=condition=complete --timeout=600s job/lake-test
+    kubectl -n lake logs job/lake-test | tail -25
 
 bench-ogc *args:
     python3 scripts/ogc_bench.py --base "${BASE:-http://127.0.0.1:3000}" --concurrency "${CONC:-32}" --requests "${REQ:-100}" {{args}}

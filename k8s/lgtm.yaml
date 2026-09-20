@@ -1,0 +1,71 @@
+# Grafana LGTM (Loki + Grafana + Tempo + Mimir) all-in-one for the kind
+# rig: metrics, logs and traces backends behind one Service. The image
+# ships Grafana pre-wired to its bundled backends; Alloy (alloy.yaml)
+# scrapes lakewing /metrics into Mimir and ships pod logs into Loki.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lgtm
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lgtm
+  template:
+    metadata:
+      labels:
+        app: lgtm
+    spec:
+      containers:
+        - name: lgtm
+          image: grafana/otel-lgtm:0.33.1
+          ports:
+            - name: grafana
+              containerPort: 3000
+            - name: loki
+              containerPort: 3100
+            - name: tempo
+              containerPort: 3200
+            - name: prom
+              containerPort: 9090
+            - name: pyro
+              containerPort: 4040
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lgtm
+  namespace: monitoring
+spec:
+  selector:
+    app: lgtm
+  ports:
+    - name: grafana
+      port: 3000
+      targetPort: grafana
+    - name: loki
+      port: 3100
+      targetPort: loki
+    - name: tempo
+      port: 3200
+      targetPort: tempo
+    - name: prom
+      port: 9090
+      targetPort: prom
+    - name: pyro
+      port: 4040
+      targetPort: pyro

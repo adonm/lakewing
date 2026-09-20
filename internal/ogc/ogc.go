@@ -125,7 +125,7 @@ func Register(api huma.API, st *store.Store) {
 	}, []*huma.Param{pp("collection", "Collection id")}, func(ctx huma.Context) {
 		id := ctx.Param("collection")
 		if err := st.Collection(id); err != nil {
-			fail(ctx, err)
+			fail(ctx, st, err)
 			return
 		}
 		body, _ := json.Marshal(metadata(id))
@@ -211,7 +211,7 @@ func writeBody(ctx huma.Context, status int, body []byte, contentType, cache str
 }
 
 // fail mirrors poem::error::ResponseError for store::Error.
-func fail(ctx huma.Context, err error) {
+func fail(ctx huma.Context, st *store.Store, err error) {
 	status := 500
 	desc := "shard query failed"
 	if se, ok := err.(*store.StoreError); ok {
@@ -231,6 +231,7 @@ func fail(ctx huma.Context, err error) {
 	} else if err != nil {
 		slog.Error("shard query failed", "err", err.Error())
 	}
+	st.CountResponse(status)
 	body, _ := json.Marshal(map[string]any{"code": status, "description": desc})
 	ctx.SetHeader("Content-Type", "application/json")
 	ctx.SetHeader("Vary", vary)
@@ -244,9 +245,10 @@ func fail(ctx huma.Context, err error) {
 
 // success serves a fresh body with ETag + conditional + gzip negotiation,
 // mirroring api::body_response. MVT callers pass gz=false (identity only).
-func success(ctx huma.Context, body store.CachedBody, contentType string, gz bool) {
+func success(ctx huma.Context, st *store.Store, body store.CachedBody, contentType string, gz bool) {
 	ifNoneMatch := ctx.Header("If-None-Match")
 	if etagMatches(ifNoneMatch, body.ETag) {
+		st.CountResponse(304)
 		notModified(ctx, body.ETag)
 		return
 	}
@@ -255,6 +257,7 @@ func success(ctx huma.Context, body store.CachedBody, contentType string, gz boo
 		if err == nil {
 			gb := store.WithBytes(gzipped)
 			if etagMatches(ifNoneMatch, gb.ETag) {
+				st.CountResponse(304)
 				notModified(ctx, gb.ETag)
 				return
 			}
@@ -263,6 +266,7 @@ func success(ctx huma.Context, body store.CachedBody, contentType string, gz boo
 			ctx.SetHeader("Vary", vary)
 			ctx.SetHeader("ETag", gb.ETag)
 			ctx.SetHeader("Cache-Control", cacheControl)
+			st.CountResponse(200)
 			ctx.SetStatus(200)
 			ctx.BodyWriter().Write(gb.Bytes)
 			return
@@ -272,6 +276,7 @@ func success(ctx huma.Context, body store.CachedBody, contentType string, gz boo
 	ctx.SetHeader("Vary", vary)
 	ctx.SetHeader("ETag", body.ETag)
 	ctx.SetHeader("Cache-Control", cacheControl)
+	st.CountResponse(200)
 	ctx.SetStatus(200)
 	ctx.BodyWriter().Write(body.Bytes)
 }
@@ -454,9 +459,10 @@ func renderFeature(collection, id string, geomJSON, props []byte, sources []int6
 }
 
 func itemsHandler(ctx huma.Context, st *store.Store) {
+	st.CountRequest()
 	collection := ctx.Param("collection")
 	if err := st.Collection(collection); err != nil {
-		fail(ctx, err)
+		fail(ctx, st, err)
 		return
 	}
 	kind, ok := geojsonType(ctx)
@@ -470,7 +476,7 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 		return
 	}
 	if err := rejectUnknown(ctx, "bbox", "limit", "offset", "cursor", "datetime", "sources"); err != nil {
-		fail(ctx, err)
+		fail(ctx, st, err)
 		return
 	}
 	u := ctx.URL()
@@ -479,20 +485,20 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			fail(ctx, store.Invalid("limit must be an integer"))
+			fail(ctx, st, store.Invalid("limit must be an integer"))
 			return
 		}
 		limit = n
 	}
 	if limit < 1 || limit > 1000 {
-		fail(ctx, store.Invalid("limit must be between 1 and 1000"))
+		fail(ctx, st, store.Invalid("limit must be between 1 and 1000"))
 		return
 	}
 	offset := 0
 	if v := q.Get("offset"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
-			fail(ctx, store.Invalid("offset must be a non-negative integer"))
+			fail(ctx, st, store.Invalid("offset must be a non-negative integer"))
 			return
 		}
 		offset = n
@@ -501,7 +507,7 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 	if v := q.Get("bbox"); v != "" {
 		b, err := filter.ParseBBox(v)
 		if err != nil {
-			fail(ctx, store.Invalid(err.Error()))
+			fail(ctx, st, store.Invalid(err.Error()))
 			return
 		}
 		bounds = &b
@@ -509,7 +515,7 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 	var dt *string
 	if v := q.Get("datetime"); v != "" {
 		if err := filter.ValidateDatetime(v); err != nil {
-			fail(ctx, store.Invalid(err.Error()))
+			fail(ctx, st, store.Invalid(err.Error()))
 			return
 		}
 		dt = &v
@@ -517,7 +523,7 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 	_, hasSources := q["sources"]
 	sources, err := sourceIDs(ctx, q.Get("sources"), hasSources)
 	if err != nil {
-		fail(ctx, store.Invalid(err.Error()))
+		fail(ctx, st, store.Invalid(err.Error()))
 		return
 	}
 	var pagination plan.Pagination
@@ -545,7 +551,6 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 
 	type row struct{ id, geom, props string }
 	var rows []row
-	st.CountRequest()
 	qerr := st.Query(ctx.Context(), heavy, func(qctx context.Context, c *sql.Conn) error {
 		r, err := c.QueryContext(qctx, query)
 		if err != nil {
@@ -577,7 +582,7 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 		return r.Err()
 	})
 	if qerr != nil {
-		fail(ctx, qerr)
+		fail(ctx, st, qerr)
 		return
 	}
 	hasNext := len(rows) > limit
@@ -612,14 +617,15 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 	lb, _ := json.Marshal(links)
 	buf.Write(lb)
 	buf.WriteByte('}')
-	success(ctx, store.WithBytes(buf.Bytes()), kind, true)
+	success(ctx, st, store.WithBytes(buf.Bytes()), kind, true)
 }
 
 func itemHandler(ctx huma.Context, st *store.Store) {
+	st.CountRequest()
 	collection := ctx.Param("collection")
 	id := ctx.Param("featureId")
 	if err := st.Collection(collection); err != nil {
-		fail(ctx, err)
+		fail(ctx, st, err)
 		return
 	}
 	kind, ok := geojsonType(ctx)
@@ -633,7 +639,7 @@ func itemHandler(ctx huma.Context, st *store.Store) {
 		return
 	}
 	if err := rejectUnknown(ctx, "sources"); err != nil {
-		fail(ctx, err)
+		fail(ctx, st, err)
 		return
 	}
 	u := ctx.URL()
@@ -641,11 +647,11 @@ func itemHandler(ctx huma.Context, st *store.Store) {
 	_, hasSources := q["sources"]
 	sources, err := sourceIDs(ctx, q.Get("sources"), hasSources)
 	if err != nil {
-		fail(ctx, store.Invalid(err.Error()))
+		fail(ctx, st, store.Invalid(err.Error()))
 		return
 	}
 	if len(sources) == 0 {
-		fail(ctx, store.NotFound(id))
+		fail(ctx, st, store.NotFound(id))
 		return
 	}
 	srcs := make([]string, len(sources))
@@ -657,21 +663,20 @@ func itemHandler(ctx huma.Context, st *store.Store) {
 		from, filter.Quote(id), filter.Quote(collection), strings.Join(srcs, ","))
 	var rawID string
 	var geomRaw, propsRaw any
-	st.CountRequest()
 	qerr := st.Query(ctx.Context(), false, func(qctx context.Context, c *sql.Conn) error {
 		return c.QueryRowContext(qctx, query).Scan(&rawID, &geomRaw, &propsRaw)
 	})
 	if qerr != nil {
 		if qerr == sql.ErrNoRows {
-			fail(ctx, store.NotFound(id))
+			fail(ctx, st, store.NotFound(id))
 			return
 		}
-		fail(ctx, qerr)
+		fail(ctx, st, qerr)
 		return
 	}
 	g, err := cellString(geomRaw)
 	if err != nil {
-		fail(ctx, store.Backend(err.Error()))
+		fail(ctx, st, store.Backend(err.Error()))
 		return
 	}
 	if g == "" {
@@ -679,43 +684,44 @@ func itemHandler(ctx huma.Context, st *store.Store) {
 	}
 	p, err := cellString(propsRaw)
 	if err != nil {
-		fail(ctx, store.Backend(err.Error()))
+		fail(ctx, st, store.Backend(err.Error()))
 		return
 	}
 	if p == "" {
 		p = "{}"
 	}
-	success(ctx, store.WithBytes(renderFeature(collection, rawID, []byte(g), []byte(p), sources)), kind, true)
+	success(ctx, st, store.WithBytes(renderFeature(collection, rawID, []byte(g), []byte(p), sources)), kind, true)
 }
 
 func tileHandler(ctx huma.Context, st *store.Store) {
+	st.CountRequest()
 	collection := ctx.Param("collection")
 	if err := st.Collection(collection); err != nil {
-		fail(ctx, err)
+		fail(ctx, st, err)
 		return
 	}
 	if err := rejectUnknown(ctx, "sources"); err != nil {
-		fail(ctx, err)
+		fail(ctx, st, err)
 		return
 	}
 	z64, err := strconv.ParseUint(ctx.Param("z"), 10, 8)
 	if err != nil {
-		fail(ctx, store.Invalid("tile coordinates outside XYZ matrix"))
+		fail(ctx, st, store.Invalid("tile coordinates outside XYZ matrix"))
 		return
 	}
 	x64, err := strconv.ParseUint(ctx.Param("x"), 10, 32)
 	if err != nil {
-		fail(ctx, store.Invalid("tile coordinates outside XYZ matrix"))
+		fail(ctx, st, store.Invalid("tile coordinates outside XYZ matrix"))
 		return
 	}
 	y64, err := strconv.ParseUint(ctx.Param("y"), 10, 32)
 	if err != nil {
-		fail(ctx, store.Invalid("tile coordinates outside XYZ matrix"))
+		fail(ctx, st, store.Invalid("tile coordinates outside XYZ matrix"))
 		return
 	}
 	z, x, y := uint8(z64), uint32(x64), uint32(y64)
 	if err := tiles.ValidateTile(z, x, y); err != nil {
-		fail(ctx, store.Invalid(err.Error()))
+		fail(ctx, st, store.Invalid(err.Error()))
 		return
 	}
 	u := ctx.URL()
@@ -723,7 +729,7 @@ func tileHandler(ctx huma.Context, st *store.Store) {
 	_, hasSources := q["sources"]
 	sources, err := sourceIDs(ctx, q.Get("sources"), hasSources)
 	if err != nil {
-		fail(ctx, store.Invalid(err.Error()))
+		fail(ctx, st, store.Invalid(err.Error()))
 		return
 	}
 	bbox := tiles.XYZToBBox(z, x, y)
@@ -735,7 +741,6 @@ func tileHandler(ctx huma.Context, st *store.Store) {
 	north := half - float64(y)*span
 	query := tiles.MVTSQL(collection, from, fetch, west, north-span, west+span, north)
 	var tile []byte
-	st.CountRequest()
 	qerr := st.Query(ctx.Context(), true, func(qctx context.Context, c *sql.Conn) error {
 		var raw []byte
 		if err := c.QueryRowContext(qctx, query).Scan(&raw); err != nil {
@@ -748,7 +753,7 @@ func tileHandler(ctx huma.Context, st *store.Store) {
 		return nil
 	})
 	if qerr != nil {
-		fail(ctx, qerr)
+		fail(ctx, st, qerr)
 		return
 	}
 	if len(tile) == 0 {
@@ -757,5 +762,5 @@ func tileHandler(ctx huma.Context, st *store.Store) {
 		ctx.SetStatus(204)
 		return
 	}
-	success(ctx, store.WithBytes(tile), "application/vnd.mapbox-vector-tile", false)
+	success(ctx, st, store.WithBytes(tile), "application/vnd.mapbox-vector-tile", false)
 }

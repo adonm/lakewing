@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -123,7 +125,8 @@ type Store struct {
 
 	db *sql.DB
 
-	httpRequests atomic.Uint64
+	httpRequests atomic.Uint64 // total OGC attempts (items/item/tiles)
+	responses    responseCounts
 	tuning       [][2]string
 	manifest     *ShardManifest
 }
@@ -740,17 +743,113 @@ func (s *Store) Query(ctx context.Context, bulk bool, fn func(ctx context.Contex
 	return fn(ctx, co.conn)
 }
 
-// Metrics mirrors /metrics without consuming a pool connection.
+// responseCounts buckets OGC responses by status for Prometheus.
+type responseCounts struct {
+	ok200, ok204, ok304    atomic.Uint64
+	err400, err404, err406 atomic.Uint64
+	err429, err500         atomic.Uint64
+}
+
+// Metrics mirrors /metrics without consuming a pool connection, in
+// Prometheus text exposition (valid numbers only).
 func (s *Store) Metrics() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "http_requests %d\n", s.httpRequests.Load())
-	for _, kv := range s.tuning {
-		fmt.Fprintf(&b, "duck_setting_%s %s\n", kv[0], kv[1])
+	b.WriteString("# HELP lakewing_http_responses_total OGC responses served by status.\n# TYPE lakewing_http_responses_total counter\n")
+	for _, kv := range [][2]string{
+		{"200", u64toa(s.responses.ok200.Load())},
+		{"204", u64toa(s.responses.ok204.Load())},
+		{"304", u64toa(s.responses.ok304.Load())},
+		{"400", u64toa(s.responses.err400.Load())},
+		{"404", u64toa(s.responses.err404.Load())},
+		{"406", u64toa(s.responses.err406.Load())},
+		{"429", u64toa(s.responses.err429.Load())},
+		{"500", u64toa(s.responses.err500.Load())},
+	} {
+		fmt.Fprintf(&b, "lakewing_http_responses_total{status=%q} %s\n", kv[0], kv[1])
 	}
+	b.WriteString("# HELP lakewing_http_requests_total OGC request attempts.\n# TYPE lakewing_http_requests_total counter\n")
+	fmt.Fprintf(&b, "lakewing_http_requests_total %d\n", s.httpRequests.Load())
+	threads, memory := "", ""
+	for _, kv := range s.tuning {
+		switch kv[0] {
+		case "threads":
+			threads = kv[1]
+		case "memory_limit":
+			memory = kv[1]
+		}
+	}
+	b.WriteString("# HELP lakewing_duckdb_threads Shared DuckDB threads.\n# TYPE lakewing_duckdb_threads gauge\n")
+	fmt.Fprintf(&b, "lakewing_duckdb_threads %s\n", numericOrZero(threads))
+	b.WriteString("# HELP lakewing_duckdb_memory_limit_bytes Shared DuckDB memory budget.\n# TYPE lakewing_duckdb_memory_limit_bytes gauge\n")
+	fmt.Fprintf(&b, "lakewing_duckdb_memory_limit_bytes %d\n", parseBytes(memory))
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	b.WriteString("# HELP lakewing_go_goroutines Live goroutines.\n# TYPE lakewing_go_goroutines gauge\n")
+	fmt.Fprintf(&b, "lakewing_go_goroutines %d\n", runtime.NumGoroutine())
+	b.WriteString("# HELP lakewing_go_heap_bytes Go heap in use.\n# TYPE lakewing_go_heap_bytes gauge\n")
+	fmt.Fprintf(&b, "lakewing_go_heap_bytes %d\n", mem.HeapInuse)
 	return b.String()
 }
 
+func u64toa(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// numericOrZero passes through plain integers, else 0 (Prometheus needs
+// bare numbers).
+func numericOrZero(s string) string {
+	s = strings.TrimSpace(s)
+	if _, err := strconv.Atoi(s); err == nil {
+		return s
+	}
+	return "0"
+}
+
+// parseBytes parses DuckDB byte quantities ("1.0 GiB", "512MiB", "4096").
+func parseBytes(s string) uint64 {
+	s = strings.TrimSpace(s)
+	mult := 1.0
+	// Longest suffixes first so "GiB" wins over "B" (map order is random).
+	for _, suf := range []struct {
+		suffix string
+		mult   float64
+	}{
+		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10},
+		{"TB", 1e12}, {"GB", 1e9}, {"MB", 1e6}, {"KB", 1e3}, {"B", 1},
+	} {
+		if v, ok := strings.CutSuffix(s, suf.suffix); ok {
+			s, mult = strings.TrimSpace(v), suf.mult
+			break
+		}
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return uint64(f * mult)
+}
+
 func (s *Store) CountRequest() { s.httpRequests.Add(1) }
+
+// CountResponse buckets one served OGC response by status.
+func (s *Store) CountResponse(status int) {
+	switch status {
+	case 200:
+		s.responses.ok200.Add(1)
+	case 204:
+		s.responses.ok204.Add(1)
+	case 304:
+		s.responses.ok304.Add(1)
+	case 400:
+		s.responses.err400.Add(1)
+	case 404:
+		s.responses.err404.Add(1)
+	case 406:
+		s.responses.err406.Add(1)
+	case 429:
+		s.responses.err429.Add(1)
+	default:
+		s.responses.err500.Add(1)
+	}
+}
 
 // Close drains the pool.
 func (s *Store) Close() error {
