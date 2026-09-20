@@ -60,7 +60,15 @@ func (c *Config) withDefaults() Config {
 		out.Timeout = 60 * time.Second
 	}
 	if out.Client == nil {
-		out.Client = &http.Client{Timeout: out.Timeout}
+		out.Client = &http.Client{Timeout: out.Timeout, Transport: &http.Transport{
+			MaxIdleConns:        256,
+			MaxIdleConnsPerHost: 64,
+			IdleConnTimeout:     90 * time.Second,
+			// Byte-exact accounting below assumes the body arrives as
+			// sent; S3 parquet is never content-encoded, and transparent
+			// gzip would invalidate Content-Length/Content-Range math.
+			DisableCompression: true,
+		}}
 	}
 	return out
 }
@@ -143,7 +151,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) { p.mux.ServeH
 // LIST and other query-string operations pass through. The SDK telemetry
 // param (?x-id=…) is stripped from the key but still forwarded upstream.
 func objectKey(r *http.Request) (string, bool) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return "", false
 	}
 	q, err := url.ParseQuery(r.URL.RawQuery)
@@ -534,6 +542,18 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 	case http.MethodHead:
+		// Recurring HEADs (existence/size probes per file open) are
+		// answered from learned lengths: zero RTT once touched.
+		// Snapshots are immutable, so lengths never change.
+		if obj, ok := objectKey(r); ok {
+			if length, known := p.cachedTotal(obj); known && length >= 0 {
+				w.Header().Set("Accept-Ranges", "bytes")
+				w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
 		p.passthrough(w, r)
 		return
 	default:
@@ -582,9 +602,23 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 // ensureSlices fetches [start,end]'s slices in parallel, bounded by the
-// global FETCHERS semaphore; the first error cancels the rest.
-func (p *Proxy) ensureSlices(ctx context.Context, obj, path string, start, end int64) error {
+// global FETCHERS semaphore; the first error cancels the rest. It
+// reports whether every slice was already cached: callers prefetch only
+// on full hits, so read-ahead never amplifies eviction churn on cold or
+// oversized working sets.
+func (p *Proxy) ensureSlices(ctx context.Context, obj, path string, start, end int64) (bool, error) {
 	sz := p.cfg.SliceBytes
+	var missing []int64
+	for i := start / sz; i <= end/sz; i++ {
+		if f, _, ok := p.get(sliceKey(obj, i)); ok {
+			f.Close()
+		} else {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) == 0 {
+		return true, nil
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
@@ -607,7 +641,7 @@ func (p *Proxy) ensureSlices(ctx context.Context, obj, path string, start, end i
 			}
 		}()
 	}
-	for i := start / sz; i <= end/sz; i++ {
+	for _, i := range missing {
 		select {
 		case work <- i:
 		case <-ctx.Done():
@@ -615,7 +649,7 @@ func (p *Proxy) ensureSlices(ctx context.Context, obj, path string, start, end i
 	}
 	close(work)
 	wg.Wait()
-	return firstErr
+	return false, firstErr
 }
 
 func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj, path string, length int64) {
@@ -625,7 +659,8 @@ func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj, path stri
 		w.Header().Set("Content-Type", "application/octet-stream")
 		return
 	}
-	if err := p.ensureSlices(r.Context(), obj, path, 0, length-1); err != nil {
+	allHit, err := p.ensureSlices(r.Context(), obj, path, 0, length-1)
+	if err != nil {
 		p.passthrough(w, r)
 		return
 	}
@@ -639,11 +674,14 @@ func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj, path stri
 	p.hits++
 	p.hitBytes += uint64(length)
 	p.metricsMu.Unlock()
-	go p.readAhead(obj, path, length-1)
+	if allHit {
+		go p.readAhead(obj, path, length-1)
+	}
 }
 
 func (p *Proxy) serveRange(w http.ResponseWriter, r *http.Request, obj, path string, length, start, end int64) {
-	if err := p.ensureSlices(r.Context(), obj, path, start, end); err != nil {
+	allHit, err := p.ensureSlices(r.Context(), obj, path, start, end)
+	if err != nil {
 		p.passthrough(w, r)
 		return
 	}
@@ -659,13 +697,17 @@ func (p *Proxy) serveRange(w http.ResponseWriter, r *http.Request, obj, path str
 	p.hits++
 	p.hitBytes += uint64(end - start + 1)
 	p.metricsMu.Unlock()
-	go p.readAhead(obj, path, end)
+	if allHit {
+		go p.readAhead(obj, path, end)
+	}
 }
 
-// readAhead prefetches the next slices of an object after a served
-// range, off the serving path and bounded by the READAHEAD lane.
-// Parquet reads are largely sequential within a file, so this converts
-// serial row-group latency into pipelined fetches.
+// readAhead prefetches the next slices of an object after a fully
+// cached range is served, off the serving path and bounded by the
+// READAHEAD lane. Callers gate on full hits, so prefetch only fires on
+// hot working sets — never amplifying eviction churn on cold or
+// oversized scans. Parquet reads are largely sequential within a file,
+// so this converts serial row-group latency into pipelined fetches.
 func (p *Proxy) readAhead(obj, path string, end int64) {
 	if p.prefetch == nil {
 		return
@@ -693,6 +735,13 @@ func (p *Proxy) readAhead(obj, path string, end int64) {
 		}
 	}
 }
+
+// copyBufs pools 1 MiB transfer buffers so serving a slice costs one
+// disk read + one socket write instead of 32 KiB-chunked syscall pairs.
+var copyBufs = sync.Pool{New: func() any {
+	b := make([]byte, 1<<20)
+	return &b
+}}
 
 // copySlices streams bytes [start,end] from slice files without
 // materializing the range in memory. Slices evicted mid-serve (object
@@ -728,7 +777,9 @@ func (p *Proxy) copySlices(w http.ResponseWriter, r *http.Request, obj, path str
 		}
 		_, err := f.Seek(lo, io.SeekStart)
 		if err == nil {
-			_, err = io.CopyN(w, f, hi-lo+1)
+			buf := copyBufs.Get().(*[]byte)
+			_, err = io.CopyBuffer(w, io.LimitReader(f, hi-lo+1), *buf)
+			copyBufs.Put(buf)
 		}
 		f.Close()
 		if err != nil {

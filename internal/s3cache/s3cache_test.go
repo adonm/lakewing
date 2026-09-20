@@ -250,21 +250,27 @@ func TestParallelSliceFetch(t *testing.T) {
 }
 
 // Read-ahead: after serving a range, the next slices of the same object
-// are prefetched off the serving path.
+// are prefetched off the serving path — but only when the served range
+// was a full hit, so cold scans and churn never pay prefetch amplification.
 func TestReadAheadPrefetches(t *testing.T) {
 	o := newOrigin(8192)
-	proxy, front := testProxy(t, o, 1<<20, func(c *Config) { c.ReadAhead = 2 })
+	_, front := testProxy(t, o, 1<<20, func(c *Config) { c.ReadAhead = 2 })
 	if code, _ := get(t, front+"/b/f.parquet", "bytes=0-1023", "sig"); code != 206 {
-		t.Fatal("range failed")
+		t.Fatal("cold range failed")
+	}
+	if n := o.gets.Load(); n != 1 {
+		t.Fatalf("cold range fetched %d slices, want 1 (no prefetch on miss)", n)
+	}
+	if code, _ := get(t, front+"/b/f.parquet", "bytes=0-1023", "sig"); code != 206 {
+		t.Fatal("warm range failed")
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for o.gets.Load() < 3 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if n := o.gets.Load(); n != 3 { // slice 0 (probe) + slices 1,2
-		t.Fatalf("read-ahead did not prefetch: origin GETs=%d", n)
+	if n := o.gets.Load(); n != 3 { // slice 0 + prefetched slices 1,2
+		t.Fatalf("read-ahead did not prefetch on full hit: origin GETs=%d", n)
 	}
-	_ = proxy
 }
 
 func TestEvictionBounded(t *testing.T) {
@@ -341,6 +347,29 @@ func TestRestartServesFromDisk(t *testing.T) {
 	// Evicted objects must not resurrect: a fresh object still fetches.
 	if code, _ := get(t, url2+"/b/g.parquet", "bytes=0-99", "x"); code != 206 {
 		t.Fatal("new object failed")
+	}
+}
+
+// Recurring HEADs are served from learned lengths: after one GET, a
+// HEAD on the same object costs zero origin trips.
+func TestHeadServedFromTotals(t *testing.T) {
+	o := newOrigin(3000)
+	_, front := testProxy(t, o, 1<<20, func(c *Config) { c.ReadAhead = 0 })
+	if code, _ := get(t, front+"/b/f.parquet", "bytes=0-99", "x"); code != 206 {
+		t.Fatal("range failed")
+	}
+	headsBefore, getsBefore := o.heads.Load(), o.gets.Load()
+	req, _ := http.NewRequest(http.MethodHead, front+"/b/f.parquet", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Length") != "3000" {
+		t.Fatalf("HEAD: status=%d length=%q", resp.StatusCode, resp.Header.Get("Content-Length"))
+	}
+	if o.heads.Load() != headsBefore || o.gets.Load() != getsBefore {
+		t.Fatal("cached HEAD hit the origin")
 	}
 }
 
