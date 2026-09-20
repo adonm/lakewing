@@ -266,7 +266,7 @@ class Rig:
         output = self.root / ("run-" + stamp)
         output.mkdir(parents=True)
         self.run_name = output.name
-        config = {"cluster": self.args.cluster, "cache_mib": self.args.cache_mib, "threads": self.args.threads, "memory": self.args.memory, "repeats": self.args.repeats, "s3_latency_ms": self.args.s3_latency_ms, "s3_latency_jitter_ms": self.args.s3_latency_jitter_ms, "backing": json.loads((self.root / "backing.json").read_text()), "dataset_bytes": sum(p.stat().st_size for p in (ROOT / "fixtures/nw-europe.files").rglob("*.parquet")), "catalog_sha256": hashlib.sha256((ROOT / "fixtures/nw-europe.ducklake").read_bytes()).hexdigest(), "git_revision": command('git', '-C', str(ROOT), 'rev-parse', 'HEAD', capture=True).strip(), "image": json.loads(command('docker', 'inspect', IMAGE, capture=True))[0]['Id'], "start": time.time()}
+        config = {"cluster": self.args.cluster, "cache_mib": self.args.cache_mib, "threads": self.args.threads, "memory": self.args.memory, "repeats": self.args.repeats, "queries": self.args.queries, "s3_latency_ms": self.args.s3_latency_ms, "s3_latency_jitter_ms": self.args.s3_latency_jitter_ms, "backing": json.loads((self.root / "backing.json").read_text()), "dataset_bytes": sum(p.stat().st_size for p in (ROOT / "fixtures/nw-europe.files").rglob("*.parquet")), "catalog_sha256": hashlib.sha256((ROOT / "fixtures/nw-europe.ducklake").read_bytes()).hexdigest(), "git_revision": command('git', '-C', str(ROOT), 'rev-parse', 'HEAD', capture=True).strip(), "image": json.loads(command('docker', 'inspect', IMAGE, capture=True))[0]['Id'], "start": time.time()}
         if config["dataset_bytes"] <= self.args.cache_mib * 1024**2:
             raise RuntimeError("dataset must exceed the cache budget")
         (output / "config.json").write_text(json.dumps(config, indent=2))
@@ -310,7 +310,7 @@ class Rig:
                     observed(a, "/open", "cold-attach")
                     perf_dir = f'/nvme/results/{self.run_name}/{backend}/perf'
                     self.node('start', perf_dir)
-                    for query in ("CITY", "BROAD", "FULL", "DEEP"):
+                    for query in self.args.queries.split(","):
                         observed(a, f"/query?name={query}&phase=first", "first")
                         for _ in range(self.args.repeats):
                             observed(a, f"/query?name={query}&phase=warm", "warm")
@@ -423,13 +423,15 @@ def main():
     parser.add_argument("--memory", default="1GB")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--backends", default="direct,proxy")
+    parser.add_argument("--queries", default="CITY,BROAD,FULL,DEEP",
+                        help="subset of DuckLake query shapes (SCAN pollution phase always runs)")
     parser.add_argument("--s3-latency-ms", type=int, default=25)
     parser.add_argument("--s3-latency-jitter-ms", type=int, default=5)
     parser.add_argument("--slice-bytes", type=int, default=1048576)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
-    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or args.s3_latency_ms < 0 or args.s3_latency_jitter_ms < 0 or args.slice_bytes < 65536 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")):
-        parser.error("positive repeats, 1..1024 MiB cache, non-negative latency, slice >= 64KiB, and known backends required")
+    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or args.s3_latency_ms < 0 or args.s3_latency_jitter_ms < 0 or args.slice_bytes < 65536 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")) or any(q not in {"CITY", "BROAD", "FULL", "DEEP"} for q in args.queries.split(",")):
+        parser.error("positive repeats, 1..1024 MiB cache, non-negative latency, slice >= 64KiB, known backends and queries required")
     rig = Rig(args)
     if args.action in ("up", "all"):
         rig.up()
