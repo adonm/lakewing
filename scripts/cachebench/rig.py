@@ -252,7 +252,12 @@ class Rig:
                 envs["S3_ENDPOINT"] = "httpcache-proxy.lake-bench.svc.cluster.local:8080"
             volumes += [{"name": "temp", "emptyDir": {"sizeLimit": "4Gi"}}, {"name": "results", "hostPath": {"path": f"/nvme/results/{self.run_name}/{backend}/{slot}", "type": "DirectoryOrCreate"}}]
             mounts += [{"name": "temp", "mountPath": "/duckdb-temp"}, {"name": "results", "mountPath": "/results"}]
-            pod = self.pod(name, {"name": "duckdb-" + backend, "image": IMAGE, "env": [{"name": k, "value": v} for k, v in envs.items()], "envFrom": [{"secretRef": {"name": "s3"}}], "ports": [{"name": "metrics", "containerPort": 8080}], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": str(self.args.threads), "memory": "6Gi"}}, "volumeMounts": mounts, "readinessProbe": {"httpGet": {"port": 8080, "path": "/healthz"}, "periodSeconds": 2}}, volumes)
+            # Direct readers sign origin requests themselves and need real
+            # credentials. Proxy readers stay credential-free (anonymous to
+            # the proxy, which is the sole signer): DuckDB then skips
+            # per-request SigV4 entirely.
+            creds = [{"secretRef": {"name": "s3"}}] if backend == "direct" else []
+            pod = self.pod(name, {"name": "duckdb-" + backend, "image": IMAGE, "env": [{"name": k, "value": v} for k, v in envs.items()], "envFrom": creds, "ports": [{"name": "metrics", "containerPort": 8080}], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": str(self.args.threads), "memory": "6Gi"}}, "volumeMounts": mounts, "readinessProbe": {"httpGet": {"port": 8080, "path": "/healthz"}, "periodSeconds": 2}}, volumes)
             self.apply(pod)
             self.ready(name)
 
