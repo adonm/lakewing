@@ -151,10 +151,21 @@ class Rig:
         pod["metadata"]["labels"] = {"app": "seaweed"}
         self.apply(pod, self.service("seaweed", "seaweed", 8333))
         self.ready("seaweed")
-        meter = self.pod("s3-meter", {"name": "s3-meter", "image": IMAGE, "args": ["meter"], "ports": [{"name": "metrics", "containerPort": 8080}], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}, node=self.control)
+        meter = self.pod("s3-meter", {"name": "s3-meter", "image": IMAGE, "args": ["meter"], "env": [{"name": "UPSTREAM", "value": "http://s3-delay.lake-bench.svc.cluster.local:8080"}], "ports": [{"name": "metrics", "containerPort": 8080}], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}, node=self.control)
         meter["metadata"]["labels"] = {"app": "s3-meter"}
         self.apply(meter, self.service("s3-meter", "s3-meter"), *(self.service(b + "-s3", "s3-meter") for b in ("direct", "httpcache")))
         self.ready("s3-meter")
+        # Origin-latency injector: every metered S3 byte passes through
+        # here on its way to SeaweedFS, so all backends share one RTT.
+        # Seed traffic addresses seaweed directly and stays un delayed.
+        delay = self.pod("s3-delay", {"name": "s3-delay", "image": IMAGE, "args": ["delay"], "env": [
+            {"name": "UPSTREAM", "value": "http://seaweed:8333"},
+            {"name": "LATENCY_MS", "value": str(self.args.s3_latency_ms)},
+            {"name": "JITTER_MS", "value": str(self.args.s3_latency_jitter_ms)},
+        ], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}, node=self.control)
+        delay["metadata"]["labels"] = {"app": "s3-delay"}
+        self.apply(delay, self.service("s3-delay", "s3-delay"))
+        self.ready("s3-delay")
         self.kube("-n", NS, "delete", "pod", "seed", "--ignore-not-found", "--wait=true")
         seed = self.pod("seed", {"name": "seed", "image": IMAGE, "command": ["sh", "-ec", "rclone copy /fixtures/nw-europe.files lake:lake/nw/data\nrclone copyto /fixtures/nw-europe.ducklake lake:lake/nw/catalogs/nw-europe.ducklake"], "env": self.rclone_env("http://seaweed:8333"), "envFrom": [{"secretRef": {"name": "s3"}}], "volumeMounts": [{"name": "fixtures", "mountPath": "/fixtures", "readOnly": True}]}, [{"name": "fixtures", "hostPath": {"path": "/fixtures"}}], self.control)
         self.apply(seed)
@@ -242,7 +253,7 @@ class Rig:
         output = self.root / ("run-" + stamp)
         output.mkdir(parents=True)
         self.run_name = output.name
-        config = {"cluster": self.args.cluster, "cache_mib": self.args.cache_mib, "threads": self.args.threads, "memory": self.args.memory, "repeats": self.args.repeats, "backing": json.loads((self.root / "backing.json").read_text()), "dataset_bytes": sum(p.stat().st_size for p in (ROOT / "fixtures/nw-europe.files").rglob("*.parquet")), "catalog_sha256": hashlib.sha256((ROOT / "fixtures/nw-europe.ducklake").read_bytes()).hexdigest(), "git_revision": command('git', '-C', str(ROOT), 'rev-parse', 'HEAD', capture=True).strip(), "image": json.loads(command('docker', 'inspect', IMAGE, capture=True))[0]['Id'], "start": time.time()}
+        config = {"cluster": self.args.cluster, "cache_mib": self.args.cache_mib, "threads": self.args.threads, "memory": self.args.memory, "repeats": self.args.repeats, "s3_latency_ms": self.args.s3_latency_ms, "s3_latency_jitter_ms": self.args.s3_latency_jitter_ms, "backing": json.loads((self.root / "backing.json").read_text()), "dataset_bytes": sum(p.stat().st_size for p in (ROOT / "fixtures/nw-europe.files").rglob("*.parquet")), "catalog_sha256": hashlib.sha256((ROOT / "fixtures/nw-europe.ducklake").read_bytes()).hexdigest(), "git_revision": command('git', '-C', str(ROOT), 'rev-parse', 'HEAD', capture=True).strip(), "image": json.loads(command('docker', 'inspect', IMAGE, capture=True))[0]['Id'], "start": time.time()}
         if config["dataset_bytes"] <= self.args.cache_mib * 1024**2:
             raise RuntimeError("dataset must exceed the cache budget")
         (output / "config.json").write_text(json.dumps(config, indent=2))
@@ -376,7 +387,7 @@ def delta(before, after, backend):
 
 
 def summary(samples, config):
-    lines = ["# Bounded-cache DuckLake benchmark", "", f"Dataset: {config['dataset_bytes']:,} bytes; disk cache: {config['cache_mib']} MiB; DuckDB: {config['threads']} threads / {config['memory']}.", "", "All query rows are consumed and SHA-256 compared across backends and repetitions.", "First touches are ordered within a session, not independently cold queries. Peer uses a second pod. SCAN reads every geometry/property payload.", "", "| Backend | Query | Phase | n | Median ms | S3 GETs (total) | S3 body MiB (total) |", "|---|---|---|---:|---:|---:|---:|"]
+    lines = ["# Bounded-cache DuckLake benchmark", "", f"Dataset: {config['dataset_bytes']:,} bytes; disk cache: {config['cache_mib']} MiB; DuckDB: {config['threads']} threads / {config['memory']}; S3 latency: {config.get('s3_latency_ms', 0)}ms + {config.get('s3_latency_jitter_ms', 0)}ms jitter.", "", "All query rows are consumed and SHA-256 compared across backends and repetitions.", "First touches are ordered within a session, not independently cold queries. Peer uses a second pod. SCAN reads every geometry/property payload.", "", "| Backend | Query | Phase | n | Median ms | S3 GETs (total) | S3 body MiB (total) |", "|---|---|---|---:|---:|---:|---:|"]
     groups = {}
     for sample in samples:
         if "query" in sample:
@@ -398,10 +409,12 @@ def main():
     parser.add_argument("--memory", default="1GB")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--backends", default="direct,proxy")
+    parser.add_argument("--s3-latency-ms", type=int, default=25)
+    parser.add_argument("--s3-latency-jitter-ms", type=int, default=5)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
-    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")):
-        parser.error("positive repeats, 1..1024 MiB cache, and known backends required")
+    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or args.s3_latency_ms < 0 or args.s3_latency_jitter_ms < 0 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")):
+        parser.error("positive repeats, 1..1024 MiB cache, non-negative latency, and known backends required")
     rig = Rig(args)
     if args.action in ("up", "all"):
         rig.up()

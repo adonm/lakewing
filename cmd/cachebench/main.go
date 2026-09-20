@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand" // unseeded: reproducible bench jitter only
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -338,6 +339,38 @@ func (s *worker) handler() http.Handler {
 	return mux
 }
 
+// delayHandler is a transparent reverse proxy that sleeps before
+// forwarding, simulating real-S3 RTT inside kind. Same transport shape
+// as the meter (Host-preserving, so SigV4 validates through it).
+func delayHandler(target *url.URL) http.Handler {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 128}
+	base, err := strconv.Atoi(env("LATENCY_MS", "25"))
+	if err != nil || base < 0 {
+		log.Fatal("invalid LATENCY_MS")
+	}
+	jitter, err := strconv.Atoi(env("JITTER_MS", "5"))
+	if err != nil || jitter < 0 {
+		log.Fatal("invalid JITTER_MS")
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sleep := time.Duration(base) * time.Millisecond
+		if jitter > 0 {
+			// math/rand is intentionally unseeded: the jitter sequence
+			// is identical every run, keeping benches reproducible.
+			sleep += time.Duration(mrand.Intn(jitter)) * time.Millisecond
+		}
+		if sleep > 0 {
+			select {
+			case <-time.After(sleep):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	var handler http.Handler
 	if len(os.Args) > 1 && os.Args[1] == "meter" {
@@ -346,6 +379,12 @@ func main() {
 			log.Fatal(err)
 		}
 		handler = (&meter{counts: map[string]counter{}}).handler(target)
+	} else if len(os.Args) > 1 && os.Args[1] == "delay" {
+		target, err := url.Parse(env("UPSTREAM", "http://seaweed:8333"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		handler = delayHandler(target)
 	} else {
 		if err := os.MkdirAll("/results", 0755); err != nil {
 			log.Fatal(err)
