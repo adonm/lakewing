@@ -9,3 +9,5 @@
 /workloads
 __pycache__/
 charts/*/charts/
+
+duckdb_temp_*

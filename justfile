@@ -7,6 +7,9 @@ export CGO_LDFLAGS := "-L" + DUCKDB_DIR
 export LD_LIBRARY_PATH := DUCKDB_DIR
 export DYLD_LIBRARY_PATH := DUCKDB_DIR
 export GOFLAGS := "-tags=duckdb_use_lib,duckdb_arrow"
+# DuckDB spills temp files under the working directory on memory pressure;
+# keep them out of the repo.
+export TMPDIR := "/tmp/opencode"
 
 default: check
 
