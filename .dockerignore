@@ -1,9 +1,0 @@
-# NOTE: docs/ must stay in context (openapi.json/api.html embed in binary).
-target/
-fixtures/
-.git/
-.tmp/
-charts/
-workloads/
-README.md
-*.log

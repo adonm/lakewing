@@ -1,0 +1,25 @@
+[package]
+name = "lakewing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lance = { workspace = true }
+lance-io = { workspace = true }
+lance-namespace = { workspace = true }
+lance-namespace-impls = { workspace = true }
+object_store = { workspace = true }
+arrow = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+poem = { workspace = true }
+duckdb = { workspace = true }
+foyer = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

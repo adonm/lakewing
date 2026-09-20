@@ -1,15 +1,14 @@
 # lakewing
 
-> **Rename + rewrite note:** this repo was `iron-feather` (Rust, poem + tonic,
-> Cachey HTTP reads). It is now `lakewing` (Go, Huma OGC + Arrow Flight,
-> S3_DIRECT reads through the node-local s3cache proxy, direct-S3 writes,
-> SeaweedFS local rig). `build`,
-> `index` and `serve` (OGC + tiles + Flight) are wired against DuckDB 2.0
-> (`v2.0.0-alpha42069` via `-tags=duckdb_use_lib,duckdb_arrow`; the preview
-> binding's bundled engine is 1.5.x and cannot open 2.0 catalogs, and its
-> Arrow export is the zero-copy-ish path Flight streams through). Remaining
-> deltas from the old stack: Flight load-benchmarks, refreshed OpenAPI
-> snapshot.
+> **Rust rewrite (current):** poem OGC API over a Lance-namespace-cataloged,
+> tag-pinned Lance dataset (lance 12 release train) with DuckDB for exact
+> predicates/rendering and a foyer NVMe range cache under Lance's object
+> store. See `docs/rust-architecture.md`.
+>
+> **Go archive:** the previous Go/DuckLake/s3cache implementation lives on
+> the `go-legacy` branch (tag `go-archive-v1`), including its benchmarks
+> and the kind cachebench rig. The experiment history that motivated the
+> rewrite is in `docs/lance-experiment.md`.
 
 **Build a DuckLake snapshot on S3, then serve it through OGC REST and Arrow Flight.**
 
