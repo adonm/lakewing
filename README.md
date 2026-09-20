@@ -208,13 +208,19 @@ queries (default: the pool size, i.e. uncapped); lower it to reserve
 connections for interactive OGC under bulk load. Heavy HTTP pages
 (`limit > 100`, `offset >= 1000`, or broad region slices) share the same bulk
 lane. `--threads` sets shared DuckDB threads for the whole process
-(default 1; keep at 1 for many small concurrent queries, raise only with
-fewer connections for bulk) and `--memory-mb` caps shared DuckDB memory in
+(default 0 = one per CPU; measured 3-5x faster than 1 on heavy pages with
+no throughput loss under concurrency — pass an explicit small value only
+to cap CPU on shared boxes) and `--memory-mb` caps shared DuckDB memory in
 MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
-DuckDB's unbounded default). Repeated Parquet block reads are absorbed by
+DuckDB's unbounded default). Size memory with threads: many threads sorting
+huge match sets can OOM a small budget (fails loud as 500, never wrong
+rows) — the full-region sort needs ~4 GB at 8+ threads on the 25M-row
+shard. Repeated Parquet block reads are absorbed by
 the mountpoint local disk cache on each node, not by in-DuckDB tuning:
 there are no storage-tuning flags by design (see
-[`docs/mount-lake.md`](docs/mount-lake.md)).
+[`docs/mount-lake.md`](docs/mount-lake.md)). Deep `offset` pages (≥ 1000)
+run ids-first two-phase (narrow sort, join back payloads) instead of
+sorting fat rows; byte-identical to the single-phase plan.
 `--query-timeout-ms` bounds HTTP and Flight queries past their deadline
 (default 30000; 0 disables): over-deadline requests fail fast with 500 and
 the connection returns to the pool healthy. Unlike the old stack there is

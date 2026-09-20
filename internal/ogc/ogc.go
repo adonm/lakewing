@@ -536,6 +536,12 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 	fetch := store.Predicate(collection, bounds, sources)
 	pageWhere, pageTail := plan.PageParts(fetch, uint32(limit), pagination)
 	query := plan.ItemsSQL(req, pageWhere+" "+pageTail, from)
+	// Two-phase only for deep offsets: OFFSET forces a total sort, where
+	// narrow-id sort + join-back wins. Cursor/limit pages use top-N
+	// heapsort and a second scan would only add probe overhead.
+	if pagination.Cursor == nil && pagination.Offset >= 1000 {
+		query = plan.HeavyItemsSQL(from, pageWhere, pageTail)
+	}
 
 	type row struct{ id, geom, props string }
 	var rows []row

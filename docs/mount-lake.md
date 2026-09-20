@@ -88,6 +88,24 @@ should set indefinite metadata TTL (see the `csi.mountOptions` note in
 `charts/lakewing/values.yaml`). That plus the disk cache makes warmed
 readers S3-outage-proof for cached data.
 
+## Warm-optimal recipe
+
+Measured on the 25M-row NW-Europe lake (local disk, then loopback
+SeaweedFS mount — same shape, 1.5-3x FUSE tax on top):
+
+- `--threads 0` (NumCPU): 3-5x on heavy pages vs 1, no concurrency loss.
+- Deep offsets (≥ 1000) run ids-first two-phase: 30 s timeout → 2.5 s.
+- Row-group 8192 beats 65536 warm on the mount (selectivity beats
+  FUSE-op-count; byte-identical results).
+- Disk cache ≥ dataset, `--metadata-ttl indefinite`, zone-map pruning via
+  the serving index + explicit bbox columns (11/389 row groups on a city
+  window).
+
+Heaviest shapes warm: deep offset (2.5 s) > low-zoom land tiles (2.8 s) >
+full-region pages (2.5 s) > broad quarters (0.5 s) > city windows (0.04 s).
+Low-zoom tiles are MVT-encode bound (5000 features); full-region pages sort
+25M ids. `scripts/bench_heavy.py` reproduces the battery.
+
 > Host note: this dev host denies FUSE mounts (`fusermount3: Operation not
 > permitted`), so the test mounts inside a throwaway `--privileged`
 > container running the same `mount-s3` binary against the same SeaweedFS.

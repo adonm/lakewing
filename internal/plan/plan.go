@@ -101,6 +101,17 @@ func ItemsSQL(_ ItemsRequest, pageWhere, from string) string {
 		"ORDER BY id"
 }
 
+// HeavyItemsSQL is the ids-first two-phase variant for OFFSET-driven total
+// sorts: OFFSET defeats DuckDB's top-N heapsort, forcing a full sort, so
+// sorting narrow ids then joining back payloads wins big. Cursor/limit
+// pages keep top-N heapsort and stay single-phase. ids are unique per
+// snapshot (type:id), so the join preserves rows exactly.
+func HeavyItemsSQL(from, where, tail string) string {
+	return "WITH page_ids AS (SELECT id FROM " + from + " WHERE " + where + " " + tail + ") " +
+		"SELECT p.id, ST_AsGeoJSON(f.geom), f.properties::VARCHAR FROM page_ids p " +
+		"JOIN " + from + " f ON f.id = p.id ORDER BY p.id"
+}
+
 // PageParts mirrors plan::page_parts.
 func PageParts(base string, limit uint32, p Pagination) (string, string) {
 	if p.Cursor != nil {
