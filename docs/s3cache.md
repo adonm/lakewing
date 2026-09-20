@@ -76,9 +76,11 @@ The proxy is the **sole SigV4 signer**:
   synthesis. Multipart ranges fall back to full-body `200`.
 - Client conditionals/auth are dropped at the proxy by design; if the
   origin needs per-pod identity, this cache is the wrong layer.
-- The benchmark harness comparison (proxy vs direct vs CSI through
-  DuckLake phases) is the remaining validation step before trusting
-  past SeaweedFS; add a `proxy` backend to `scripts/cachebench/rig.py`.
+- The benchmark harness comparison is done: `proxy` backend in
+  `scripts/cachebench/rig.py`, run `run-20260920T045933Z` (45 samples,
+  all SHA-256 match direct/mountpoint). CITY warm ~0 S3, FULL/DEEP/SCAN
+  within +25% of direct, restart-first 161 ms / 10 MiB via index
+  recovery. See `docs/cache-options.md` for the full side-by-side.
 
 ## Validate
 

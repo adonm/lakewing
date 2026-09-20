@@ -19,6 +19,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[2]
 NS = "lake-bench"
 IMAGE = "lakewing-cachebench:dev"
+PROXY_IMAGE = "lakewing-s3cache:dev"
 
 
 def command(*args, capture=False, data=None):
@@ -127,7 +128,9 @@ class Rig:
         self.kube("-n", "monitoring", "rollout", "status", "daemonset/cachebench-alloy", "--timeout=300s")
         if not self.args.skip_build:
             command("docker", "build", "-f", str(ROOT / "scripts/cachebench/Dockerfile"), "-t", IMAGE, str(ROOT))
+            command("docker", "build", "-f", str(ROOT / "scripts/s3cache/Dockerfile"), "-t", PROXY_IMAGE, str(ROOT))
         command("kind", "load", "docker-image", IMAGE, "--name", self.args.cluster)
+        command("kind", "load", "docker-image", PROXY_IMAGE, "--name", self.args.cluster)
         self.storage(credentials)
         self.node_tools()
 
@@ -195,6 +198,7 @@ class Rig:
     def cleanup(self):
         self.kube("-n", NS, "delete", "pod", "reader-a", "reader-b", "--ignore-not-found", "--wait=true")
         self.kube("-n", NS, "delete", "pod", "rclone-mount", "--ignore-not-found", "--wait=true")
+        self.kube("-n", NS, "delete", "pod", "s3cache", "--ignore-not-found", "--wait=true")
         pods = json.loads(self.kube("-n", "mount-s3", "get", "pods", "-o", "json", capture=True))["items"]
         for pod in pods:
             self.kube("-n", "mount-s3", "wait", "--for=delete", "pod/" + pod["metadata"]["name"], "--timeout=90s")
@@ -206,11 +210,33 @@ class Rig:
             self.kube("-n", claim['namespace'], "wait", "--for=delete", "pvc/" + claim['name'], "--timeout=60s")
             self.kube("patch", "pv", "cachebench-nvme", "--type=merge", "-p", '{"spec":{"claimRef":null}}')
 
+    def proxy(self):
+        """(Re)create the node-local s3cache pod. Its origin traffic flows
+        through the meter as httpcache-s3, so S3 deltas stay comparable;
+        the /nvme/s3cache dir survives pod recreation (restart phase)."""
+        self.kube("-n", NS, "delete", "pod", "s3cache", "--ignore-not-found", "--wait=true")
+        pod = self.pod("s3cache", {"name": "s3cache", "image": PROXY_IMAGE, "env": [
+            {"name": "UPSTREAM", "value": "http://httpcache-s3.lake-bench.svc.cluster.local:8080"},
+            {"name": "LISTEN", "value": ":8080"},
+            {"name": "CACHE_DIR", "value": "/cache"},
+            {"name": "CACHE_BYTES", "value": str(self.args.cache_mib * 1024**2)},
+            {"name": "SLICE_BYTES", "value": "1048576"},
+            {"name": "READAHEAD", "value": "4"},
+            {"name": "S3_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "s3", "key": "AWS_ACCESS_KEY_ID"}}},
+            {"name": "S3_SECRET", "valueFrom": {"secretKeyRef": {"name": "s3", "key": "AWS_SECRET_ACCESS_KEY"}}},
+            {"name": "S3_REGION", "value": "us-east-1"},
+        ], "ports": [{"name": "metrics", "containerPort": 8080}], "volumeMounts": [{"name": "cache", "mountPath": "/cache"}],
+            "readinessProbe": {"httpGet": {"port": 8080, "path": "/healthz"}, "periodSeconds": 2}},
+            [{"name": "cache", "hostPath": {"path": "/nvme/s3cache", "type": "DirectoryOrCreate"}}])
+        pod["metadata"]["labels"] = {"app": "s3cache"}
+        self.apply(pod, self.service("httpcache-proxy", "s3cache"))
+        self.ready("s3cache")
+
     def readers(self, backend, reset=False):
         if reset:
             self.cleanup()
             # Only stopped benchmark mounts may have their data caches removed.
-            for name in ('mountpoint', 'rclone/cache'):
+            for name in ('mountpoint', 'rclone/cache', 's3cache'):
                 self.kube('-n', NS, 'exec', 'node-tools', '--', 'python3', '-c',
                           'import shutil, pathlib; p=pathlib.Path("/nvme") / ' + repr(name) + '; shutil.rmtree(p, ignore_errors=True); p.mkdir(parents=True)')
         if backend == "rclone":
@@ -219,6 +245,8 @@ class Rig:
             mount = self.pod("rclone-mount", {"name": "rclone-mount", "image": IMAGE, "command": ["rclone", "mount", "lake:lake/nw", "/node/mount", "--read-only", "--allow-other", "--allow-non-empty", "--vfs-cache-mode=full", "--cache-dir=/node/cache", f"--vfs-cache-max-size={self.args.cache_mib}M", "--vfs-cache-max-age=24h", "--vfs-cache-poll-interval=1s", "--dir-cache-time=24h", "--no-modtime", "--buffer-size=0", "--vfs-read-ahead=0", "--vfs-read-chunk-size=4M", "--vfs-read-chunk-size-limit=4M", "--vfs-read-chunk-streams=4"], "env": self.rclone_env("http://rclone-s3.lake-bench.svc.cluster.local:8080"), "envFrom": [{"secretRef": {"name": "s3"}}], "securityContext": {"privileged": True}, "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "2", "memory": "3Gi"}}, "volumeMounts": [{"name": "node", "mountPath": "/node", "mountPropagation": "Bidirectional"}], "readinessProbe": {"exec": {"command": ["mountpoint", "-q", "/node/mount"]}, "periodSeconds": 2}}, [{"name": "node", "hostPath": {"path": "/nvme/rclone"}}])
             self.apply(mount)
             self.ready("rclone-mount")
+        if backend == "proxy":
+            self.proxy()
         for slot in ("a", "b"):
             self.reader(backend, slot)
 
@@ -227,13 +255,15 @@ class Rig:
             self.kube("-n", NS, "delete", "pod", name, "--ignore-not-found", "--wait=true")
             volumes, mounts = self.mounts(backend)
             catalog, data = "/lake/catalogs/nw-europe.ducklake", "/lake/data/"
-            if backend == "direct":
+            if backend in ("direct", "proxy"):
                 catalog, data = "s3://lake/nw/catalogs/nw-europe.ducklake", "s3://lake/nw/data/"
             elif backend == "local":
                 catalog, data = "/fixtures/nw-europe.ducklake", "/fixtures/nw-europe.files/"
             envs = {"BACKEND": backend, "CATALOG": catalog, "DATA_ROOT": data, "THREADS": str(self.args.threads), "MEMORY_LIMIT": self.args.memory, "OTLP_ENDPOINT": "http://lgtm.monitoring:4318"}
             if backend == "direct":
                 envs["S3_ENDPOINT"] = "direct-s3.lake-bench.svc.cluster.local:8080"
+            elif backend == "proxy":
+                envs["S3_ENDPOINT"] = "httpcache-proxy.lake-bench.svc.cluster.local:8080"
             volumes += [{"name": "temp", "emptyDir": {"sizeLimit": "4Gi"}}, {"name": "results", "hostPath": {"path": f"/nvme/results/{self.run_name}/{backend}/{slot}", "type": "DirectoryOrCreate"}}]
             mounts += [{"name": "temp", "mountPath": "/duckdb-temp"}, {"name": "results", "mountPath": "/results"}]
             pod = self.pod(name, {"name": "duckdb-" + backend, "image": IMAGE, "env": [{"name": k, "value": v} for k, v in envs.items()], "envFrom": [{"secretRef": {"name": "s3"}}], "ports": [{"name": "metrics", "containerPort": 8080}], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": str(self.args.threads), "memory": "3Gi"}}, "volumeMounts": mounts, "readinessProbe": {"httpGet": {"port": 8080, "path": "/healthz"}, "periodSeconds": 2}}, volumes)
@@ -377,9 +407,11 @@ def settled_stats(base, timeout=60):
 
 
 def delta(before, after, backend):
+    # The proxy's origin traffic is metered under httpcache-s3.
+    prefix = {"proxy": "httpcache-s3"}.get(backend, backend + "-s3")
     result = {}
     for key, count in after.items():
-        if key.split("/")[0] != backend + "-s3":
+        if key.split("/")[0] != prefix:
             continue
         old = before.get(key, {"requests": 0, "bytes": 0})
         difference = {field: count[field] - old[field] for field in ("requests", "bytes")}
@@ -413,7 +445,7 @@ def main():
     parser.add_argument("--backends", default="direct,mountpoint,rclone")
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
-    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or any(b not in {"direct", "mountpoint", "rclone", "local"} for b in args.backends.split(",")):
+    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or any(b not in {"direct", "mountpoint", "rclone", "local", "proxy"} for b in args.backends.split(",")):
         parser.error("positive repeats, 1..1024 MiB cache, and known backends required")
     rig = Rig(args)
     if args.action in ("up", "all"):

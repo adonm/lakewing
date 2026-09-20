@@ -14,22 +14,22 @@ snapshot 6, engine v2.0.0-alpha42069). Every result fully consumed and
 SHA-256 compared across backends and repetitions — all hashes match.
 Harness: `scripts/cachebench/rig.py` (`just bench-paths`).
 
-| Query (phase, n) | Direct | Mountpoint CSI | rclone VFS-full (one node mount) |
-|---|---|---|---|
-| CITY first | 121 ms, 50 GETs / 93 MiB | 338 ms, 74 GETs / 167 MiB | 265 ms, 122 GETs / 466 MiB |
-| CITY warm ×5 (median) | 79 ms, 3 GETs / ~15 MiB each | 132 ms, ~0–5 GETs / ~1 MiB each | 102 ms, **0 S3** |
-| BROAD first | 560 ms, 168 GETs / 420 MiB | 2690 ms, 382 GETs / 750 MiB | 906 ms, 359 GETs / 1387 MiB |
-| BROAD warm ×5 (median) | 530 ms, ~40 GETs / ~185 MiB each | 961 ms, ~2–20 GETs / ~5–118 MiB each | 556 ms, **~0 S3** (7 GETs total) |
-| FULL first | 2.7 s, 842 GETs / 2.1 GiB | 23.3 s, 2025 GETs / 2.9 GiB | OOM (see below) |
-| FULL warm ×5 (median) | ~2.6 s, full re-fetch each | ~31–43 s, full re-fetch each | — |
-| DEEP first | 7.0 s, 1844 GETs / 4.5 GiB | 54.1 s, 3568 GETs / 7.1 GiB | — |
-| DEEP warm (median) | ~7.1 s, full re-fetch each | ~52 s, full re-fetch each | — |
-| SCAN (full-payload) | 4.9 s, 1442 GETs / 3.8 GiB | 32.4 s, 1939 GETs / 5.1 GiB | — |
-| Cross-pod peer CITY | direct 106 ms / full re-fetch | mountpoint 153 ms / 1.8 MiB (shared) | not reached |
-| After cgroup page reclaim | both re-fetch catalog+data once, then warm | mountpoint CITY 179 ms / 0.4 MiB (disk serves) | not reached |
-| After SCAN pollution | CITY warm unchanged | CITY warm back to ~147 ms / ~0 S3 after one refill | not reached |
-| Mount restart, disk intact | n/a (no cache) | CITY 520 ms / full re-fetch (**cache cleared on remount**) | not reached |
-| Catalog attach | ~20 ms + ~110 ms metadata, 11 GETs / 2.5 MiB | ~20 ms + ~110 ms, 7 GETs / ~10 MiB + LIST | ~25 ms + ~108 ms, 3 GETs / 8 MiB |
+| Query (phase, n) | Direct | Mountpoint CSI | rclone VFS-full (one node mount) | s3cache proxy (new) |
+|---|---|---|---|---|
+| CITY first | 121 ms, 50 GETs / 93 MiB | 338 ms, 74 GETs / 167 MiB | 265 ms, 122 GETs / 466 MiB | 350 ms, 105 GETs / 104 MiB |
+| CITY warm ×5 (median) | 79 ms, 3 GETs / ~15 MiB each | 132 ms, ~0–5 GETs / ~1 MiB each | 102 ms, **0 S3** | 162 ms, **~0 S3** (3 GETs total) |
+| BROAD first | 560 ms, 168 GETs / 420 MiB | 2690 ms, 382 GETs / 750 MiB | 906 ms, 359 GETs / 1387 MiB | 967 ms, 403 GETs / 398 MiB |
+| BROAD warm ×5 (median) | 530 ms, ~40 GETs / ~185 MiB each | 961 ms, ~2–20 GETs / ~5–118 MiB each | 556 ms, **~0 S3** (7 GETs total) | 800 ms, **~2 S3** (10 GETs total) |
+| FULL first | 2.7 s, 842 GETs / 2.1 GiB | 23.3 s, 2025 GETs / 2.9 GiB | OOM (see below) | 3.3 s, 1804 GETs / 1.8 GiB |
+| FULL warm ×5 (median) | ~2.6 s, full re-fetch each | ~31–43 s, full re-fetch each | — | ~3.2 s, full re-fetch each |
+| DEEP first | 7.0 s, 1844 GETs / 4.5 GiB | 54.1 s, 3568 GETs / 7.1 GiB | — | 6.2 s, 4049 GETs / 4.0 GiB |
+| DEEP warm (median) | ~7.1 s, full re-fetch each | ~52 s, full re-fetch each | — | ~8.0 s, full re-fetch each |
+| SCAN (full-payload) | 4.9 s, 1442 GETs / 3.8 GiB | 32.4 s, 1939 GETs / 5.1 GiB | — | 5.6 s, 3029 GETs / 3.0 GiB |
+| Cross-pod peer CITY | direct 106 ms / full re-fetch | mountpoint 153 ms / 1.8 MiB (shared) | not reached | 289 ms / 15.7 MiB, then 180 ms / **0 S3** |
+| After cgroup page reclaim | both re-fetch catalog+data once, then warm | mountpoint CITY 179 ms / 0.4 MiB (disk serves) | not reached | 140 ms / 7 MiB (disk serves) |
+| After SCAN pollution | CITY warm unchanged | CITY warm back to ~147 ms / ~0 S3 after one refill | not reached | 157 ms / 103 MiB refill, then 90 ms / **~0 S3** |
+| Mount restart, disk intact | n/a (no cache) | CITY 520 ms / full re-fetch (**cache cleared on remount**) | not reached | **161 ms / 10 MiB** (disk recovered; 10 MiB is read-ahead overfetch) |
+| Catalog attach | ~20 ms + ~110 ms metadata, 11 GETs / 2.5 MiB | ~20 ms + ~110 ms, 7 GETs / ~10 MiB + LIST | ~25 ms + ~108 ms, 3 GETs / 8 MiB | ~61 ms + ~324 ms metadata, 6 GETs / 5.5 MiB |
 
 S3 counts metered per backend/operation (catalog vs data) through a
 reverse proxy; 502s are mountpoint/rclone speculative-range cancels
@@ -59,6 +59,17 @@ reverse proxy; 502s are mountpoint/rclone speculative-range cancels
    BROAD; 3 GiB survived CITY/BROAD but died on FULL first (25-file
    concurrent chunk caching). It is the most byte-efficient small-query
    cache and the most memory-hungry large-scan reader.
+6. **s3cache proxy: near-direct bulk, near-zero warm, restart-proof.**
+   FULL/DEEP/SCAN within +10–25% of direct (3.3/8.0/5.6 s vs
+   2.7/7.1/4.9 s) while moving comparable-or-fewer bytes — versus
+   mountpoint's 8–10x. Warm CITY/BROAD pay ~0–2 S3 GETs. Cross-pod,
+   post-reclaim and post-pollution reuse all hold. Proxy restart with
+   disk intact serves CITY in 161 ms / 10 MiB (recovered index; the 10
+   MiB is read-ahead overfetch into untouched neighbors), where
+   mountpoint fully re-fetches. Warm-small-query latency trails direct
+   on loopback (CITY warm 162 ms vs 79 ms: extra HTTP hop + 1 MiB
+   slice assembly vs loopback S3); expect the byte savings to dominate
+   once RTT is real.
 
 ## Sharing and persistence facts
 
@@ -79,30 +90,33 @@ reverse proxy; 502s are mountpoint/rclone speculative-range cancels
   on-disk blocks, process-local metadata, careful eviction) is
   unverified against the pinned 2.0 alpha.
 
-## Cut point (current default: no single winner)
+## Cut point (s3cache proxy recommended)
 
-- **Serving (small hot pages)**: node-shared rclone VFS-full is the
-  lowest-overhead warm cache measured (zero-S3 CITY/BROAD warm) —
-  *provided* mount memory is sized for the largest concurrent scan or
-  large scans are routed elsewhere. It OOMs where mountpoint survives.
-- **Node-shared default that survives everything**: Mountpoint CSI
-  (`ephemeral` on a local-NVMe StorageClass, bounded hot-subset size,
-  long metadata TTL for immutable snapshots only). Warm CITY costs
-  ~50 ms more than direct here but shares across pods and reuses after
-  page reclaim; expect it to win on wall time once RTT is real.
-- **Bulk (FULL/DEEP/SCAN)**: direct S3 is fastest and most robust in
-  this rig; route multi-GB scans direct (or to a bulk pool) rather than
-  through any FUSE mount.
+- **Default: s3cache proxy** (DaemonSet, `ephemeral`/hostPath NVMe,
+  bounded hot-subset size, one Secret). It is the only option measured
+  that is simultaneously node-shared, restart-proof, OOM-safe
+  (nothing larger than a slice in RAM), and within +25% of direct on
+  bulk scans — with warm small queries at ~0 S3. No CSI driver, no FUSE.
+- **Serving (small hot pages)**: proxy warm CITY/BROAD at ~0–2 S3 GETs;
+  rclone matches on bytes but OOMs on large scans. Route everything
+  through the proxy instead of splitting by query shape.
+- **Bulk (FULL/DEEP/SCAN)**: direct S3 remains fastest in this
+  loopback rig (+10–25% proxy tax from 1 MiB slice request count);
+  the proxy is a safe default here too since it survives what OOMs
+  rclone and is 8–10x faster than mountpoint.
 - Keep DuckDB parquet/HTTP metadata caches on; external file cache on
   (default) for metadata/small wins only. Kernel page cache is an
-  unplannable second chance. Production chart templates
-  (`charts/lakewing`) now expose CSI cache type/size and mount options
-  for the ephemeral-NVMe shape.
+  unplannable second chance. The `s3direct` secret path
+  (`S3_ENDPOINT`, no worker credentials) is implemented in
+  `internal/store/store.go` `setupSession`.
 
 Evidence: `.tmp/cache-bench/run-20260920T022047Z/` (direct+mountpoint,
 90 hash-validated samples, csi-attachments/pods, mount logs, reclaim
 deltas, DuckDB profiles, bench Prometheus metrics, Loki logs, Tempo
-traces, mountpoint Pyroscope profiles) and
-`.tmp/cache-bench/run-20260920T024438Z/` (rclone CITY/BROAD + FULL OOM).
+traces, mountpoint Pyroscope profiles),
+`.tmp/cache-bench/run-20260920T024438Z/` (rclone CITY/BROAD + FULL OOM),
+and `.tmp/cache-bench/run-20260920T045933Z/` (proxy, 45 samples, all
+fingerprints match direct/mountpoint hashes, reclaim deltas, DuckDB
+profiles, Tempo traces).
 Prior loopback claims ("mountpoint always wins 2–7x / zero warm GETs /
 catalog always 4–7x slower") are superseded by the table above.

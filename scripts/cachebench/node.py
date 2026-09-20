@@ -27,6 +27,8 @@ def processes():
                 label = 'rclone-mount'
             elif name in ('mount-s3', 'aws-s3-csi-mounter'):
                 label = 'mountpoint-mount'
+            elif name == 's3cache':
+                label = 'proxy-s3cache'
             else:
                 continue
             group = path.joinpath('cgroup').read_text().strip().split('::', 1)[1]

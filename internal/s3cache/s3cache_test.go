@@ -303,6 +303,47 @@ func TestListPassthroughAndPutForbidden(t *testing.T) {
 	}
 }
 
+// A restarted proxy (new process, same cache dir) must keep serving
+// from disk: slice files are re-indexed and object lengths reload from
+// objects.log. This is the bench's restart phase.
+func TestRestartServesFromDisk(t *testing.T) {
+	o := newOrigin(3000)
+	dir := t.TempDir()
+	serve := func(fresh func(*Config)) string {
+		t.Helper()
+		srv := httptest.NewServer(o.handler())
+		t.Cleanup(srv.Close)
+		target, _ := url.Parse(srv.URL)
+		cfg := Config{Upstream: target, CacheDir: dir, MaxBytes: 1 << 20, SliceBytes: 1024, Fetchers: 4, KeyID: "k", Secret: "s"}
+		if fresh != nil {
+			fresh(&cfg)
+		}
+		proxy, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		front := httptest.NewServer(proxy)
+		t.Cleanup(front.Close)
+		return front.URL
+	}
+	url1 := serve(func(c *Config) { c.ReadAhead = 0 })
+	if code, body := get(t, url1+"/b/f.parquet", "bytes=0-2047", "x"); code != 206 || len(body) != 2048 {
+		t.Fatalf("cold range: code=%d len=%d", code, len(body))
+	}
+	before := o.gets.Load()
+	url2 := serve(func(c *Config) { c.ReadAhead = 0 })
+	if code, body := get(t, url2+"/b/f.parquet", "bytes=100-999", "x"); code != 206 || string(body) != string(o.data[100:1000]) {
+		t.Fatalf("restarted range: code=%d", code)
+	}
+	if o.gets.Load() != before {
+		t.Fatalf("restart refetched from origin: %d -> %d", before, o.gets.Load())
+	}
+	// Evicted objects must not resurrect: a fresh object still fetches.
+	if code, _ := get(t, url2+"/b/g.parquet", "bytes=0-99", "x"); code != 206 {
+		t.Fatal("new object failed")
+	}
+}
+
 func TestUnsatisfiableRange(t *testing.T) {
 	o := newOrigin(100)
 	_, front := testProxy(t, o, 1<<20, func(c *Config) { c.ReadAhead = 0 })
