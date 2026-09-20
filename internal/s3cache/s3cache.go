@@ -88,10 +88,22 @@ type Proxy struct {
 	mux    *http.ServeMux
 	signer *signer
 
-	mu    sync.Mutex
-	lru   *list.List
-	index map[string]*list.Element
-	used  int64
+	// Lock discipline: mu is the ONLY index/metrics lock. A second lock
+	// once deadlocked serveMetrics against insert's eviction path under
+	// churn (ABBA); never reintroduce one around index or counters.
+	// Nothing that can block (network, disk data I/O) runs under it:
+	// eviction unlinks happen after unlock.
+	mu        sync.Mutex
+	lru       *list.List
+	index     map[string]*list.Element
+	used      int64
+	hits      uint64
+	hitBytes  uint64
+	misses    uint64 // upstream slice fetches
+	missBytes uint64
+	fetchSecs float64 // total origin fetch latency (avg = fetchSecs/misses)
+	evictions uint64
+	originErr uint64
 
 	flightsMu sync.Mutex
 	flights   map[string]*flight
@@ -100,15 +112,6 @@ type Proxy struct {
 
 	totalsMu sync.Mutex
 	totals   map[string]int64 // object key -> length from Content-Range
-
-	metricsMu sync.Mutex
-	hits      uint64
-	hitBytes  uint64
-	misses    uint64 // upstream slice fetches
-	missBytes uint64
-	fetchSecs float64 // total origin fetch latency (avg = fetchSecs/misses)
-	evictions uint64
-	originErr uint64
 }
 
 type flight struct {
@@ -290,6 +293,7 @@ func (p *Proxy) insert(key, path string, size int64) {
 	}
 	p.index[key] = p.lru.PushFront(&entry{key: key, path: path, size: size})
 	p.used += size
+	var evicted []string
 	for p.used > p.cfg.MaxBytes {
 		back := p.lru.Back()
 		if back == nil {
@@ -299,10 +303,14 @@ func (p *Proxy) insert(key, path string, size int64) {
 		delete(p.index, ent.key)
 		p.lru.Remove(back)
 		p.used -= ent.size
-		p.metricsMu.Lock()
 		p.evictions++
-		p.metricsMu.Unlock()
-		_ = os.Remove(ent.path)
+		evicted = append(evicted, ent.path)
+	}
+	// Unlink outside the lock: nothing here may ever block while held.
+	// (Lock discipline: mu is the ONLY index/metrics lock. A second
+	// lock once deadlocked serveMetrics against insert under churn.)
+	for _, path := range evicted {
+		_ = os.Remove(path)
 	}
 }
 
@@ -417,11 +425,11 @@ func (p *Proxy) downloadSlice(ctx context.Context, obj, path string, i int64) er
 	if total >= 0 {
 		p.rememberTotal(obj, total)
 	}
-	p.metricsMu.Lock()
+	p.mu.Lock()
 	p.misses++
 	p.missBytes += uint64(size)
 	p.fetchSecs += time.Since(fetchStart).Seconds()
-	p.metricsMu.Unlock()
+	p.mu.Unlock()
 	return nil
 }
 
@@ -453,9 +461,9 @@ func parseContentRange(cr string) (int64, int64, int64, error) {
 }
 
 func (p *Proxy) bumpOriginErr() {
-	p.metricsMu.Lock()
+	p.mu.Lock()
 	p.originErr++
-	p.metricsMu.Unlock()
+	p.mu.Unlock()
 }
 
 // rememberTotal caches object length learned from Content-Range. Bounded:
@@ -675,10 +683,10 @@ func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj, path stri
 	if err := p.copySlices(w, r, obj, path, 0, length-1); err != nil {
 		return
 	}
-	p.metricsMu.Lock()
+	p.mu.Lock()
 	p.hits++
 	p.hitBytes += uint64(length)
-	p.metricsMu.Unlock()
+	p.mu.Unlock()
 	if allHit {
 		go p.readAhead(obj, path, length-1)
 	}
@@ -698,10 +706,10 @@ func (p *Proxy) serveRange(w http.ResponseWriter, r *http.Request, obj, path str
 	if err := p.copySlices(w, r, obj, path, start, end); err != nil {
 		return
 	}
-	p.metricsMu.Lock()
+	p.mu.Lock()
 	p.hits++
 	p.hitBytes += uint64(end - start + 1)
-	p.metricsMu.Unlock()
+	p.mu.Unlock()
 	if allHit {
 		go p.readAhead(obj, path, end)
 	}
@@ -823,12 +831,14 @@ func (p *Proxy) passthrough(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) serveMetrics(w http.ResponseWriter, _ *http.Request) {
-	p.metricsMu.Lock()
-	defer p.metricsMu.Unlock()
+	// Snapshot under the lock, format after it: a slow scraper must
+	// never hold the index lock.
 	p.mu.Lock()
-	used := p.used
+	hits, hitBytes := p.hits, p.hitBytes
+	misses, missBytes, fetchSecs := p.misses, p.missBytes, p.fetchSecs
+	evictions, originErr, used := p.evictions, p.originErr, p.used
 	p.mu.Unlock()
 	fmt.Fprintln(w, "# TYPE s3cache_hits_total counter\n# TYPE s3cache_hit_bytes_total counter\n# TYPE s3cache_origin_fetches_total counter\n# TYPE s3cache_origin_bytes_total counter\n# TYPE s3cache_origin_fetch_seconds_total counter\n# TYPE s3cache_evictions_total counter\n# TYPE s3cache_origin_errors_total counter\n# TYPE s3cache_disk_used_bytes gauge")
 	fmt.Fprintf(w, "s3cache_hits_total %d\ns3cache_hit_bytes_total %d\ns3cache_origin_fetches_total %d\ns3cache_origin_bytes_total %d\ns3cache_origin_fetch_seconds_total %f\ns3cache_evictions_total %d\ns3cache_origin_errors_total %d\ns3cache_disk_used_bytes %d\n",
-		p.hits, p.hitBytes, p.misses, p.missBytes, p.fetchSecs, p.evictions, p.originErr, used)
+		hits, hitBytes, misses, missBytes, fetchSecs, evictions, originErr, used)
 }

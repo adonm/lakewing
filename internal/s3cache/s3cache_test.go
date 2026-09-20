@@ -373,6 +373,34 @@ func TestHeadServedFromTotals(t *testing.T) {
 	}
 }
 
+// Regression: serveMetrics once deadlocked against insert's eviction
+// path (ABBA under churn + scrapes). Hammer small-cache ranges while
+// scraping /metrics; with any lock-ordering bug this hangs past the
+// test timeout instead of failing cleanly.
+func TestMetricsUnderChurn(t *testing.T) {
+	o := newOrigin(1 << 16)
+	_, front := testProxy(t, o, 4<<10, func(c *Config) { c.ReadAhead = 0; c.Fetchers = 8 })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			get(t, front+"/b/f.parquet", fmt.Sprintf("bytes=%d-%d", i*512, i*512+511), "x")
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		resp, err := http.Get(front + "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("metrics status=%d", resp.StatusCode)
+		}
+	}
+	<-done
+}
+
 func TestUnsatisfiableRange(t *testing.T) {
 	o := newOrigin(100)
 	_, front := testProxy(t, o, 1<<20, func(c *Config) { c.ReadAhead = 0 })
