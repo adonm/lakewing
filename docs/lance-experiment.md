@@ -103,7 +103,72 @@ Remaining blockers are operational, not performance:
 3. GeoArrow generation currently round-trips through WKB in the harness; a
    real builder would write GeoArrow directly.
 
+## Follow-up experiments (2026-09-20, evening)
+
+### Compression (answered: defaults already compress; overrides hurt)
+
+Probed `lance-encoding:compression` field metadata on the sample (318 k rows,
+same writer settings):
+
+| variant | dataset bytes |
+| --- | --- |
+| 2.2 defaults | 96.3 MB |
+| explicit `none` | 219.6 MB |
+| `zstd` level 3 | 138.0 MB |
+| `zstd` level 9 | 135.9 MB |
+
+The 2.2 defaults (structural encodings + auto LZ4/FSST) deliver 2.3× over
+uncompressed, and forcing general compression *replaces* better-suited
+structural encodings. Our 2.6–2.8× vs Parquet-zstd **is** the compressed
+state; there is no configuration knob that closes the gap on this workload.
+(`geo_zstd` backend added to the harness for reproduction.)
+
+### Table tags (answered: direct replacement for lake_ref)
+
+On `pylance 12.0.0`: `ds.tags.create(name, version)` 4.5 ms, ref resolution
+(`tags.get_version`) 0.17 ms, version-pinned open 1.3 ms warm, `tags.update`
+moves the ref and previously-pinned handles stay isolated. Publish model
+becomes append + tag move; GC becomes version cleanup (tags exempt versions).
+The `lance-duckdb` directory namespace (`ATTACH … (TYPE LANCE)`) covers
+multi-table listing; no catalog service needed.
+
+### Go surface (answered: not viable for geo)
+
+`lancedb-go` exposes a Query builder (`Filter`/`Limit`/`Offset`/`Columns`)
+and scalar index DDL (BTree/Bitmap/LabelList) with **no SQL surface, no
+RTREE, no GeoArrow** — the spatial predicate path exists only in the
+Rust/Python SDKs. Go can drive ids-first pagination via the BTREE but not
+bbox pruning.
+
+### Extension build gate (verdict: architecture viable, nightly fork is a treadmill)
+
+Cloned `lance-duckdb@1b4ef68` (C++ shell + Rust `lance_duckdb_ffi`
+staticlib over a C ABI), pointed its DuckDB submodule at our pinned
+`v2.0.0-alpha42069` (`de9bb21a23`, 6.5 months of drift past the extension's
+pin), and ported: `protoc` for the Rust build, the `Identifier` API
+(secrets, bind signatures), and the member→accessor pass
+(`GetChildren`/`Binding`/`Child`/`Left`/`Right`/`GetValue`/`Index`/
+`GetExpressionClass`, `TableFilterSet` iteration, RTREE added to
+`rust/ffi/index.rs`). DuckDB core and the Rust staticlib build clean.
+
+Stopped after four fix passes with ~500 extension errors remaining. The
+dominant blocker is semantic, not mechanical: the alpha redesigned the
+bound-expression model — casts and comparisons are now scalar *function
+expressions* (`__cast`), with `BoundCastExpression`/`BoundComparisonExpression`
+reduced to static helpers over `BoundFunctionExpression` — so the filter-IR
+encoder (the exact layer that would carry the `ST_Intersects` → RTREE
+pushdown) needs a rewrite, not substitutions.
+
+Implication: Path A (private fork on the pinned nightly) buys the
+consolidated-extension architecture at permanent churn cost. Path B — serve
+on a DuckDB version upstream `lance-duckdb` supports, contribute RTREE +
+pushdown upstream — is strictly better: upstream faces this same 2.0 port
+regardless, and our port work maps onto it. Work preserved on branch
+`lakewing-alpha42069-port` in `.tmp/ref/lance-duckdb` (commits `318337e`,
+`f31ce1e`).
+
 Reproduce: `just bench-lance --full --queries ID,CITY,FULL,DEEP --backends
-ducklake,wkb_ids,geo_ids --repeats 3`; summarize with
+ducklake,geo_ids,geo_zstd --repeats 3`; summarize with
 `python3 scripts/lancebench/summarize.py <run-dir>`. Artifacts are gitignored
 under `.tmp/cache-bench/reader/lancebench/`.
+

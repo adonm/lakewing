@@ -42,19 +42,34 @@ def inventory(path):
             "data_files": len([p for p in files if p.suffix in (".lance", ".parquet") and "_indices" not in p.parts])}
 
 
-def geo_batches(source):
+COMPRESSION_META = {"lance-encoding:compression": "zstd", "lance-encoding:compression-level": "3"}
+
+
+def geo_batches(source, compression=False):
+    meta = {k.encode(): v.encode() for k, v in COMPRESSION_META.items()} if compression else {}
     for batch in pq.ParquetFile(source).iter_batches(batch_size=65536):
         table = pa.Table.from_batches([batch])
         raw = table["geom"]
         # The sample gate validates that all input is 2D Polygon/MultiPolygon.
         # Keep one bit to restore Polygon after homogeneous MultiPolygon storage.
         types = ga.as_geoarrow(ga.as_wkb(raw), promote_multi=True)
-        field = pa.field("geom", types.type.storage_type, metadata={
+        geom_meta = {
             b"ARROW:extension:name": types.type.extension_name.encode(),
             b"ARROW:extension:metadata": types.type.__arrow_ext_serialize__(),
-        })
-        table = table.set_column(table.schema.get_field_index("geom"), field,
-                                 pa.chunked_array([chunk.storage for chunk in types.chunks]))
+        }
+        geom_meta.update(meta)
+        fields, arrays = [], []
+        for i, field in enumerate(table.schema):
+            merged = dict(field.metadata or {})
+            merged.update(meta)
+            if field.name == "geom":
+                fields.append(pa.field("geom", types.type.storage_type, metadata=geom_meta))
+                arrays.append(pa.chunked_array([chunk.storage for chunk in types.chunks]))
+            else:
+                fields.append(pa.field(field.name, field.type, nullable=field.nullable,
+                                       metadata=merged or None))
+                arrays.append(table.columns[i])
+        table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
         # WKB byte order is explicit; the OGC type word follows it.
         was_polygon = [int.from_bytes(wkb[1:5], "little" if wkb[0] else "big") == 3
                        for wkb in raw.to_pylist()]
@@ -148,7 +163,7 @@ class Bench:
         if not set(x[0] for x in types) <= {"POLYGON", "MULTIPOLYGON"}:
             raise ValueError(f"native conversion only supports Polygon/MultiPolygon: {types}")
         # Refuse overwrites: versions, orphaned fragments and old indexes affect size.
-        for name in ("parquet.ducklake", "parquet.files", "wkb.lance", "geo.lance"):
+        for name in ("parquet.ducklake", "parquet.files", "wkb.lance", "geo.lance", "geo_zstd.lance"):
             if (self.root / name).exists():
                 raise FileExistsError(self.root / name)
 
@@ -166,10 +181,10 @@ class Bench:
         self.timed("build", parquet, backend="ducklake")
         self.emit("size", backend="ducklake", **inventory(self.root / "parquet.files"),
                   catalog_bytes=(self.root / "parquet.ducklake").stat().st_size)
-        for backend in ("wkb", "geo"):
+        for backend in ("wkb", "geo", "geo_zstd"):
             def write():
-                if backend == "geo":
-                    batches = iter(geo_batches(source))
+                if backend.startswith("geo"):
+                    batches = iter(geo_batches(source, compression=backend == "geo_zstd"))
                     first = next(batches)
                     import itertools
                     reader = pa.RecordBatchReader.from_batches(first.schema, itertools.chain([first], batches))
@@ -181,7 +196,7 @@ class Bench:
             ds = self.timed("build", write, backend=backend)
             self.emit("size", backend=backend, stage="unindexed", **inventory(self.root / f"{backend}.lance"))
             self.timed("index", lambda: ds.create_scalar_index("id", "BTREE"), backend=backend, column="id")
-            if backend == "geo":
+            if backend.startswith("geo"):
                 self.timed("index", lambda: ds.create_scalar_index("geom", "RTREE"), backend=backend, column="geom")
             self.emit("size", backend=backend, stage="indexed", **inventory(self.root / f"{backend}.lance"))
         self.db.execute("SET memory_limit='1GB'")
@@ -306,13 +321,14 @@ class Bench:
         (self.root / (self.args.label + "-expected.json")).write_text(json.dumps(expected))
         verified = set()
         for backend in self.args.backends.split(","):
-            encoding = backend.removesuffix("_ids")
+            dataset = backend.removesuffix("_ids")
+            style = "geo" if dataset.startswith("geo") else "wkb"
             ds = None if backend == "ducklake" else self.timed("attach", lambda: lance.dataset(
-                prefix + f"/{encoding}.lance", storage_options=self.storage), backend=backend)
+                prefix + f"/{dataset}.lance", storage_options=self.storage), backend=backend)
             for name, spec in specs.items():
                 for repeat in range(self.args.repeats):
                     def query():
-                        rows = self.db.execute(self.sql("baseline", *spec)).fetchall() if ds is None else self.sdk(ds, encoding, spec, ids_first=backend.endswith("_ids") and name != "ID")
+                        rows = self.db.execute(self.sql("baseline", *spec)).fetchall() if ds is None else self.sdk(ds, style, spec, ids_first=backend.endswith("_ids") and name != "ID")
                         return canonical(rows)
                     profile = self.root / f"{self.args.label}-{backend}-{name}-{repeat}.profile.json"
                     self.db.execute(f"PRAGMA enable_profiling='json'; SET profiling_output={quote(profile)}")
@@ -323,23 +339,23 @@ class Bench:
                         raise AssertionError(f"full result mismatch: {backend}/{name}: {fingerprint(rows)} != {fingerprint(expected[name])}")
                     self.emit("equality", backend=backend, query=name, repeat=repeat,
                               rows=len(rows), sha256=fingerprint(rows), equal=True)
-            if encoding == "geo" and "CITY" in specs:
+            if style == "geo" and "CITY" in specs:
                 filt = self.predicate(*specs["CITY"][:2], native=True)
                 plan = ds.scanner(filter=filt).explain_plan()
-                (self.root / (self.args.label + "-rtree-plan.txt")).write_text(plan)
+                (self.root / f"{self.args.label}-{backend}-rtree-plan.txt").write_text(plan)
                 if "RTree" not in plan or "ScalarIndexQuery" not in plan:
                     raise AssertionError("R-tree is not used")
-                unindexed = self.timed("unindexed-control", lambda: canonical(self.sdk(ds, encoding, specs["CITY"], False)))
+                unindexed = self.timed("unindexed-control", lambda: canonical(self.sdk(ds, style, specs["CITY"], False)))
                 if unindexed != expected["CITY"]:
                     raise AssertionError("indexed/unindexed mismatch")
-            if not self.args.uri and encoding not in verified:
-                digest = self.timed("verify-dataset", lambda: self.verify_dataset(ds, encoding), backend=backend)
+            if not self.args.uri and dataset not in verified:
+                digest = self.timed("verify-dataset", lambda: self.verify_dataset(ds, style), backend=backend)
                 if backend == "ducklake":
                     baseline_digest = digest
                 elif digest != baseline_digest:
                     raise AssertionError(f"full dataset mismatch: {backend}: {digest} != {baseline_digest}")
                 self.emit("dataset-equality", backend=backend, equal=True, **digest)
-                verified.add(encoding)
+                verified.add(dataset)
         self.emit("complete", equality=True, queries=len(specs), repeats=self.args.repeats)
 
 
@@ -360,7 +376,7 @@ def main():
     args = parser.parse_args()
     if args.repeats < 1 or (args.build and not args.source):
         parser.error("positive --repeats and --source with --build are required")
-    if args.backends.split(",")[0] != "ducklake" or not set(args.backends.split(",")) <= {"ducklake", "wkb", "geo", "wkb_ids", "geo_ids"}:
+    if args.backends.split(",")[0] != "ducklake" or not set(args.backends.split(",")) <= {"ducklake", "wkb", "geo", "geo_zstd", "wkb_ids", "geo_ids", "geo_zstd_ids"}:
         parser.error("backends must start with ducklake and contain known variants")
     if not set(args.queries.split(",")) <= {"ID", "CITY", "BROAD", "FULL", "CURSOR", "DEEP"}:
         parser.error("unknown query")
