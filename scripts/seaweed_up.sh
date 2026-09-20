@@ -28,6 +28,7 @@ if ! docker ps --format '{{.Names}}' | grep -qx lake-seaweed; then
   docker rm -f lake-seaweed >/dev/null 2>&1 || true
   docker run -d --name lake-seaweed \
     -p "127.0.0.1:$S3_PORT:8333" -p "127.0.0.1:9333:9333" -p "127.0.0.1:19333:19333" \
+    -p "127.0.0.1:8888:8888" -p "127.0.0.1:18888:18888" \
     -v "$RIG/seaweed:/data" \
     -v "$RIG/seaweed-config/s3.json:/etc/seaweed/s3.json:ro" \
     "$SEAWEED_IMAGE" server -dir /data -s3 -s3.port=8333 -s3.config=/etc/seaweed/s3.json >/dev/null

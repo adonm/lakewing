@@ -59,3 +59,39 @@ per-process memory caches can't share. DuckDB-side caches stay on for
 metadata only. Production mounts: cache ≥ dataset, `--metadata-ttl
 indefinite` (immutable snapshots), serving index pruning so each query
 touches few files.
+
+## Alternative mounts (measured 2026-09-20, same rig + queries)
+
+Same 25-file lake, same DuckDB CLI, cold then warm. All byte-identical
+results (md5-verified across mounts):
+
+| Query | mountpoint cold / warm | mountpoint `--read-part-size 32M` cold / warm | rclone VFS-full cold / warm | weed native mount cold / warm |
+|---|---|---|---|---|
+| City page | 1233 / 291 ms | — | 267 / 173 ms | 354 / 203 ms |
+| Broad quarter | 8664 / 1698 ms | — | 822 / 620 ms | 1009 / 643 ms |
+| Full-region page | 32565 / 5790 ms | 10614 / 6958 ms | 2811 / 2222 ms | 2792 / 2082 ms |
+
+- **rclone mount** (`--vfs-cache-mode full`, sparse chunk cache,
+  `--vfs-read-chunk-size 16M`, `--dir-cache-time 9999h`, `--no-modtime`):
+  2-11x faster than mountpoint here. Bigger sequential chunks + read-ahead
+  + parallel streams fit DuckDB's row-group reads better than mountpoint's
+  on-demand parts. Caveats: one mount process + cache per pod (VFS cache
+  dirs are not safe to share between processes), no CSI driver — each pod
+  carries its own copy and its own FUSE process.
+- **weed native mount** (`-cacheCapacityMB`, filer protocol, no S3
+  translation): tied with rclone, the fastest option against SeaweedFS.
+  SeaweedFS-only (does not apply to AWS S3). Same per-mount cache caveat.
+- **mountpoint tuning**: `--read-part-size 32M` cut cold FULL 32.5 s →
+  10.6 s (3x); warm unchanged within noise. Worth setting; does not close
+  the gap to rclone/weed on this workload.
+- Disqualified without benchmarking: **s3fs-fuse** (slow, weak cache),
+  **goofys/geesefs** (fast streaming, no persistent disk cache — every
+  repeat pays S3), **JuiceFS/Alluxio** (own metadata/format and infra;
+  cannot adopt a plain-S3 lake layout).
+
+Recommendation stands: **mountpoint S3 CSI in AWS estates** — it is the
+only option with a truly node-shared cache (one Mountpoint pod per node
+when mount config is identical) and zero extra infrastructure, and warm
+issues ~zero S3 either way. Where per-pod caches are acceptable, rclone
+VFS-full is faster per mount; against SeaweedFS backends, weed native
+mount is fastest. Revisit if mountpoint's prefetch story improves.
