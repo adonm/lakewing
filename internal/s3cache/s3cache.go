@@ -34,7 +34,9 @@ type Config struct {
 	MaxBytes   int64
 	SliceBytes int64
 	// Fetchers bounds concurrent upstream slice fetches; slices within
-	// one request are fetched in parallel up to this limit.
+	// one request are fetched in parallel up to this limit. Sized for
+	// RTT-bound origins: 8-way at 25 ms RTT caps at ~320 slices/s,
+	// while a FULL scan needs ~1,700.
 	Fetchers int
 	// ReadAhead prefetches this many subsequent slices after a served
 	// range, off the serving path. 0 disables.
@@ -54,7 +56,7 @@ func (c *Config) withDefaults() Config {
 		out.SliceBytes = 1 << 20
 	}
 	if out.Fetchers <= 0 {
-		out.Fetchers = 8
+		out.Fetchers = 32
 	}
 	if out.Timeout <= 0 {
 		out.Timeout = 60 * time.Second
@@ -104,6 +106,7 @@ type Proxy struct {
 	hitBytes  uint64
 	misses    uint64 // upstream slice fetches
 	missBytes uint64
+	fetchSecs float64 // total origin fetch latency (avg = fetchSecs/misses)
 	evictions uint64
 	originErr uint64
 }
@@ -351,6 +354,7 @@ func (p *Proxy) downloadSlice(ctx context.Context, obj, path string, i int64) er
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", lo, hi))
 	p.signer.sign(req)
+	fetchStart := time.Now()
 	resp, err := p.cfg.Client.Do(req)
 	if err != nil {
 		p.bumpOriginErr()
@@ -416,6 +420,7 @@ func (p *Proxy) downloadSlice(ctx context.Context, obj, path string, i int64) er
 	p.metricsMu.Lock()
 	p.misses++
 	p.missBytes += uint64(size)
+	p.fetchSecs += time.Since(fetchStart).Seconds()
 	p.metricsMu.Unlock()
 	return nil
 }
@@ -823,7 +828,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter, _ *http.Request) {
 	p.mu.Lock()
 	used := p.used
 	p.mu.Unlock()
-	fmt.Fprintln(w, "# TYPE s3cache_hits_total counter\n# TYPE s3cache_hit_bytes_total counter\n# TYPE s3cache_origin_fetches_total counter\n# TYPE s3cache_origin_bytes_total counter\n# TYPE s3cache_evictions_total counter\n# TYPE s3cache_origin_errors_total counter\n# TYPE s3cache_disk_used_bytes gauge")
-	fmt.Fprintf(w, "s3cache_hits_total %d\ns3cache_hit_bytes_total %d\ns3cache_origin_fetches_total %d\ns3cache_origin_bytes_total %d\ns3cache_evictions_total %d\ns3cache_origin_errors_total %d\ns3cache_disk_used_bytes %d\n",
-		p.hits, p.hitBytes, p.misses, p.missBytes, p.evictions, p.originErr, used)
+	fmt.Fprintln(w, "# TYPE s3cache_hits_total counter\n# TYPE s3cache_hit_bytes_total counter\n# TYPE s3cache_origin_fetches_total counter\n# TYPE s3cache_origin_bytes_total counter\n# TYPE s3cache_origin_fetch_seconds_total counter\n# TYPE s3cache_evictions_total counter\n# TYPE s3cache_origin_errors_total counter\n# TYPE s3cache_disk_used_bytes gauge")
+	fmt.Fprintf(w, "s3cache_hits_total %d\ns3cache_hit_bytes_total %d\ns3cache_origin_fetches_total %d\ns3cache_origin_bytes_total %d\ns3cache_origin_fetch_seconds_total %f\ns3cache_evictions_total %d\ns3cache_origin_errors_total %d\ns3cache_disk_used_bytes %d\n",
+		p.hits, p.hitBytes, p.misses, p.missBytes, p.fetchSecs, p.evictions, p.originErr, used)
 }

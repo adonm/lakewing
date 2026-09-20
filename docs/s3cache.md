@@ -40,15 +40,23 @@ The proxy is the **sole SigV4 signer**:
 
 ## Speed design
 
-- **Parallel slice fetch** (`FETCHERS`, default 8): slices within one
+- **Origin connection pooling**: 256/64 idle conns with keepalive
+  (Go's default `MaxIdleConnsPerHost: 2` serialized 8 fetchers).
+  `DisableCompression` keeps Content-Length/Range math byte-exact.
+- **Cached HEADs**: recurring per-file-open probes serve from learned
+  lengths — zero RTT once touched (immutable snapshots).
+- **Parallel slice fetch** (`FETCHERS`, default 32): slices within one
   request fetch concurrently, bounded by one global semaphore; the
-  first error cancels the rest. Unit-tested via peak in-flight at the
-  origin.
-- **Read-ahead** (`READAHEAD`, default 4): after a served range, the
-  next slices of the same object prefetch off the serving path
+  first error cancels the rest. Sized for RTT-bound origins (8-way at
+  25 ms RTT caps at ~320 slices/s vs ~1,700 per FULL scan).
+  Unit-tested via peak in-flight at the origin.
+- **Read-ahead** (`READAHEAD`, default 4): after a **fully cached**
+  range is served, the next slices prefetch off the serving path
   (bounded lane, never blocks serving, bounded by object length).
-  Parquet reads are largely sequential within a file, so row-group
-  latency pipelines instead of serializing. `0` disables.
+  Gated on full hits deliberately: under churn, prefetch evicts slices
+  the active query still needs, cascading into multi-second stalls
+  (observed as a DuckDB HTTP timeout on DEEP under 25 ms RTT).
+  `0` disables.
 - **Slice granularity** (default 1 MiB): each `Range` splits into
   aligned slices keyed `method + path` (`?x-id` SDK telemetry stripped
   from the key, forwarded upstream verbatim). Length comes from the
@@ -58,6 +66,8 @@ The proxy is the **sole SigV4 signer**:
 - **Collapse + publish**: per-slice singleflight (the 600+ concurrent
   range GETs of FULL scans fetch each slice once), atomic
   `.tmp`→rename publish, fd-pinned serving safe against eviction.
+- **Serve path**: pooled 1 MiB copy buffers (one disk read + one
+  socket write per slice); per-slice flush streams progressively.
 - **Bounded**: synchronous LRU over `CACHE_BYTES` (hot subset for a PB
   lake); object-length map bounded at 64K entries; oversized objects
   stay correct via on-demand refetch.

@@ -213,7 +213,7 @@ class Rig:
             {"name": "LISTEN", "value": ":8080"},
             {"name": "CACHE_DIR", "value": "/cache"},
             {"name": "CACHE_BYTES", "value": str(self.args.cache_mib * 1024**2)},
-            {"name": "SLICE_BYTES", "value": "1048576"},
+            {"name": "SLICE_BYTES", "value": str(self.args.slice_bytes)},
             {"name": "READAHEAD", "value": "4"},
             {"name": "S3_KEY_ID", "valueFrom": {"secretKeyRef": {"name": "s3", "key": "AWS_ACCESS_KEY_ID"}}},
             {"name": "S3_SECRET", "valueFrom": {"secretKeyRef": {"name": "s3", "key": "AWS_SECRET_ACCESS_KEY"}}},
@@ -420,10 +420,11 @@ def main():
     parser.add_argument("--backends", default="direct,proxy")
     parser.add_argument("--s3-latency-ms", type=int, default=25)
     parser.add_argument("--s3-latency-jitter-ms", type=int, default=5)
+    parser.add_argument("--slice-bytes", type=int, default=1048576)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
-    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or args.s3_latency_ms < 0 or args.s3_latency_jitter_ms < 0 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")):
-        parser.error("positive repeats, 1..1024 MiB cache, non-negative latency, and known backends required")
+    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or args.s3_latency_ms < 0 or args.s3_latency_jitter_ms < 0 or args.slice_bytes < 65536 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")):
+        parser.error("positive repeats, 1..1024 MiB cache, non-negative latency, slice >= 64KiB, and known backends required")
     rig = Rig(args)
     if args.action in ("up", "all"):
         rig.up()
