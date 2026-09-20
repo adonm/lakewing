@@ -63,9 +63,9 @@ workloads-berlin dir="workloads/berlin":
     python3 scripts/make_berlin_workload.py --out-dir {{quote(dir)}}
 
 # --- SeaweedFS lake rig ------------------------------------------------------
-# Local rehearsal of the mount design (see docs/mount-lake.md): SeaweedFS
-# (S3) for direct writes + a mount-s3 mount with local disk cache for reads,
-# the local equivalent of mountpoint-S3-CSI.
+# Local S3 origin (see docs/s3cache.md): SeaweedFS for direct writes and
+# direct reads; the node-local s3cache proxy sits between readers and S3
+# in kind/prod. Writers always go direct to S3.
 
 # Start SeaweedFS (idempotent).
 seaweed-up:
@@ -75,16 +75,8 @@ seaweed-up:
 seaweed-down *args:
     bash scripts/seaweed_down.sh {{args}}
 
-# Mount the lake bucket locally (needs mount-s3 + seaweed-up).
-lake-mount mnt="/tmp/opencode/mnt/lake":
-    bash scripts/lake_mount.sh {{quote(mnt)}}
-
-# Validate mountpoint disk caching against real SeaweedFS over real FUSE:
-# cold / warm / cache-dropped scans, asserting zero warm S3 GETs.
-test-mount-cache *args:
-    bash scripts/mount_cache_test.sh {{args}}
-
-# Bounded node-NVMe cache comparison: DuckLake, actual CSI, LGTM + profiling.
+# Bounded node-NVMe cache comparison: DuckLake direct vs s3cache proxy
+# inside kind, with LGTM observability + profiling.
 # Default creates kind lake-cache; use `run` to reuse an initialized rig.
 bench-paths *args: setup-duckdb
     bash scripts/bench_paths.sh {{args}}
@@ -96,7 +88,7 @@ s3cache-build:
     docker build -f scripts/s3cache/Dockerfile -t lakewing-s3cache:dev .
 
 # Publish a new immutable snapshot, then move a ref at it. Writes go
-# direct to S3 (never via the mount); reads resolve mount paths.
+# direct to S3; reads go over S3_DIRECT through the node-local s3cache.
 # Uploads are additive only and catalog keys are never overwritten.
 # Example: just lake-publish sha_003 --bbox=13.38,52.50,13.42,52.54 --limit 20000
 lake-publish sha *args: seaweed-up
@@ -126,13 +118,15 @@ lake-publish sha *args: seaweed-up
 
 # Serve the catalog a ref points at (default: latest), resolved once at
 # startup; the reader stays pinned to that snapshot across later publishes.
-# Reads resolve mount paths (mount via just lake-mount first).
-lake-serve ref="latest" mnt="/tmp/opencode/mnt/lake" *args: seaweed-up
+# Reads go over S3_DIRECT (anonymous secret when no AWS env is set: point
+# S3_ENDPOINT at the node-local s3cache proxy, or direct at S3).
+# Example against the loopback rig: just lake-serve
+lake-serve ref="latest" endpoint="http://127.0.0.1:8333" *args: seaweed-up
     #!/usr/bin/env bash
     set -euo pipefail
     catalog=$(bash scripts/lake_ref.sh get {{quote(ref)}})
     [ -n "$catalog" ] || { echo "empty ref {{quote(ref)}}" >&2; exit 1; }
-    go run ./cmd/lakewing serve --shard "{{quote(mnt)}}/catalogs/$catalog" --data-root "{{quote(mnt)}}/data/" {{args}}
+    S3_ENDPOINT={{quote(endpoint)}} go run ./cmd/lakewing serve --shard "s3://lake/catalogs/$catalog" --data-root "s3://lake/data/" {{args}}
 
 # Smoke-check a running lake server (default: local :3000).
 lake-verify base="http://127.0.0.1:3000":
@@ -158,21 +152,22 @@ kind-up:
 kind-down:
     kind delete cluster --name lake
 
-# Build the serve image and load it into kind.
+# Build the serve + s3cache images and load them into kind.
 kind-image:
     docker build -t lakewing:kind .
-    kind load docker-image lakewing:kind --name lake
+    docker build -f scripts/s3cache/Dockerfile -t lakewing-s3cache:kind .
+    kind load docker-image lakewing:kind lakewing-s3cache:kind --name lake
 
-# Install/upgrade the whole stack (CSI-mounted read pool + bulk pool).
+# Install/upgrade the whole stack (S3_DIRECT read pool + s3cache DaemonSet).
 kind-install *args:
-    helm upgrade --install lake charts/lakewing --namespace lake --create-namespace -f k8s/kind-values.yaml --set image.tag=kind {{args}}
+    helm upgrade --install lake charts/lakewing --namespace lake --create-namespace -f k8s/kind-values.yaml --set image.tag=kind --set s3cache.image.tag=kind {{args}}
 
 kind-status:
     kubectl -n lake get pods,deployments,services 2>&1 | head -30
 
-# Seed the kind lake: build the Berlin snapshot and stage it onto the
-# az-a worker's /nvme hostPath (catalogs/ + data/ + sidecars), then
-# provision the hostPath PV/PVC the chart mounts with csi.enabled=false.
+# Seed the kind lake: build the Berlin snapshot and upload it to the
+# in-chart SeaweedFS origin (catalogs/ + data/ + sidecars), then create
+# the dev S3 secret the s3cache proxy and writer sidecars read.
 kind-seed:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -181,13 +176,22 @@ kind-seed:
       --out /tmp/opencode/kind-seed/sha_seed.ducklake \
       --data-dir /tmp/opencode/kind-seed/files \
       --data-url 's3://lake/data/'
-    dest=/tmp/opencode/kind-nvme-a/lake
-    mkdir -p "$dest/catalogs" "$dest/data"
-    cp /tmp/opencode/kind-seed/sha_seed.ducklake* "$dest/catalogs/"
-    cp -r /tmp/opencode/kind-seed/files/. "$dest/data/"
-    ls "$dest/catalogs"
     kubectl create namespace lake --dry-run=client -o yaml | kubectl apply -f -
-    kubectl apply -f k8s/kind-data.yaml
+    kubectl -n lake create secret generic lake-s3-dev \
+      --from-literal=key_id=dev --from-literal=secret=dev-local-only \
+      --from-literal=AWS_ACCESS_KEY_ID=dev --from-literal=AWS_SECRET_ACCESS_KEY=dev-local-only \
+      --dry-run=client -o yaml | kubectl apply -f -
+    kubectl -n lake port-forward svc/lake-seaweed 8333:8333 >/dev/null 2>&1 &
+    pf=$!; trap 'kill $pf' EXIT
+    sleep 2
+    export RCLONE_CONFIG_LAKE_TYPE=s3 RCLONE_CONFIG_LAKE_PROVIDER=Other
+    export RCLONE_CONFIG_LAKE_ENDPOINT=http://127.0.0.1:8333
+    export RCLONE_CONFIG_LAKE_ACCESS_KEY_ID=dev RCLONE_CONFIG_LAKE_SECRET_ACCESS_KEY=dev-local-only
+    export RCLONE_CONFIG_LAKE_REGION=us-east-1 RCLONE_CONFIG_LAKE_FORCE_PATH_STYLE=true
+    rclone copy /tmp/opencode/kind-seed/files lake:lake/data/
+    rclone copyto /tmp/opencode/kind-seed/sha_seed.ducklake lake:lake/catalogs/sha_seed.ducklake
+    rclone copyto /tmp/opencode/kind-seed/sha_seed.ducklake.serving.json lake:lake/catalogs/sha_seed.ducklake.serving.json
+    rclone lsf lake:lake/catalogs/
 
 # Berlin benchmark against a port-forwarded read pool.
 kind-bench base="http://127.0.0.1:3000" workload="workloads/berlin/mixed.txt": workloads-berlin

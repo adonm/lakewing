@@ -1,11 +1,11 @@
-{{- /* Dedicated bulk pool: same catalog and CSI mount as the interactive
-     pool, but uncapped bulk concurrency and its own replicas/resources so
-     broad scans and Flight exports never starve small pages. Exposes HTTP
-     and Flight. Disabled by default (see values.bulk). */ -}}
+{{- /* Dedicated bulk pool: same catalog and node-local s3cache proxy as the
+     interactive pool, but uncapped bulk concurrency and its own
+     replicas/resources so broad scans and Flight exports never starve
+     small pages. Exposes HTTP and Flight. Disabled by default
+     (see values.bulk). */ -}}
 {{- if .Values.bulk.enabled }}
-{{- $mount := .Values.csi.mountPath }}
-{{- $shard := printf "%s/catalogs/%s" $mount .Values.catalog }}
-{{- $data := printf "%s/%s/" (trimSuffix "/" $mount) .Values.dataPrefix }}
+{{- $shard := printf "s3://%s/catalogs/%s" .Values.s3.bucket .Values.s3.catalog }}
+{{- $data := printf "s3://%s/%s/" .Values.s3.bucket .Values.s3.dataPrefix }}
 {{- range $zone := .Values.zones }}
 ---
 apiVersion: apps/v1
@@ -45,17 +45,18 @@ spec:
               containerPort: 3000
             - name: flight
               containerPort: 50051
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: S3_ENDPOINT
+              value: http://$(NODE_IP):{{ $.Values.s3cache.port }}
           volumeMounts:
-            - name: lake
-              mountPath: {{ $mount }}
-              readOnly: true
             - name: duckdb-temp
               mountPath: /duckdb-temp
           resources: {{ toYaml $.Values.bulk.resources | nindent 12 }}
       volumes:
-        - name: lake
-          persistentVolumeClaim:
-            claimName: {{ include "lakewing.fullname" $ }}-lake
         - name: duckdb-temp
           emptyDir:
             sizeLimit: {{ $.Values.temp.sizeLimit }}

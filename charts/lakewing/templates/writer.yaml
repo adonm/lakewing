@@ -2,13 +2,15 @@
 {{- /* Optional single writer (the only component allowed to mutate refs):
      hourly build of a new immutable snapshot into scratch, upload of data
      + catalog to S3, then the ref move. Disabled by default.
-     The build stores a zone-independent s3:// DATA_PATH; readers mount the
-     bucket and pass it as --data-root, so every zone reads local paths.
+     The build stores a zone-independent s3:// DATA_PATH; readers serve it
+     over S3_DIRECT through their node's s3cache proxy.
      Uploads are additive (copy, never sync/delete); catalog keys
      are never overwritten (the job fails if the key exists). */ -}}
 {{- $wzone := .Values.zones | first }}
-{{- $endpoint := .Values.s3endpoint | default "http://seaweedfs:8333" }}
-{{- $secret := .Values.s3secret | default "lake-s3" }}
+{{- $endpoint := .Values.s3.origin | default .Values.s3endpoint }}
+{{- if and (not $endpoint) .Values.seaweed.enabled }}{{ $endpoint = printf "http://%s-seaweed:8333" (include "lakewing.fullname" .) }}{{ end }}
+{{- $endpoint = $endpoint | default "http://seaweedfs:8333" }}
+{{- $secret := .Values.s3.authSecretName | default .Values.s3secret | default "lake-s3" }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -46,7 +48,7 @@ spec:
                     --content-address \
                     --out "/stage/$sha.ducklake" \
                     --data-dir /stage/files \
-                    --data-url 's3://{{ .Values.s3bucket }}/{{ .Values.dataPrefix }}/'
+                    --data-url 's3://{{ .Values.s3.bucket }}/{{ .Values.s3.dataPrefix }}/'
               volumeMounts:
                 - name: stage
                   mountPath: /stage
@@ -59,17 +61,17 @@ spec:
                 - |
                   set -eu
                   name=$(cat /stage/catalog-name)
-                  if rclone lsf "lake:{{ .Values.s3bucket }}/catalogs/" 2>/dev/null | grep -qx "$name"; then
+                  if rclone lsf "lake:{{ .Values.s3.bucket }}/catalogs/" 2>/dev/null | grep -qx "$name"; then
                     echo "catalog key $name already published; refusing to overwrite" >&2
                     exit 1
                   fi
                   # Additive only: never delete data another snapshot references.
                   # Content-addressed names make unchanged snapshots upload
                   # nothing new (rclone skips existing keys).
-                  rclone copy /stage/files "lake:{{ .Values.s3bucket }}/{{ .Values.dataPrefix }}/"
-                  rclone copyto "/stage/$name" "lake:{{ .Values.s3bucket }}/catalogs/$name"
-                  rclone copyto "/stage/$name.serving.json" "lake:{{ .Values.s3bucket }}/catalogs/$name.serving.json"
-                  rclone rcat "lake:{{ .Values.s3bucket }}/refs/latest" < /stage/catalog-name
+                  rclone copy /stage/files "lake:{{ .Values.s3.bucket }}/{{ .Values.s3.dataPrefix }}/"
+                  rclone copyto "/stage/$name" "lake:{{ .Values.s3.bucket }}/catalogs/$name"
+                  rclone copyto "/stage/$name.serving.json" "lake:{{ .Values.s3.bucket }}/catalogs/$name.serving.json"
+                  rclone rcat "lake:{{ .Values.s3.bucket }}/refs/latest" < /stage/catalog-name
                   echo "published $name"
               env:
                 - name: RCLONE_CONFIG_LAKE_TYPE

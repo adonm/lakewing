@@ -1,21 +1,13 @@
-# Read pool over the CSI-mounted lake. Readers are plain POSIX clients of
-# their node's mountpoint-S3-CSI mount: no Cachey, no HTTP range secrets,
-# no --data-base sharding. Writes (build/publish) go direct to S3.
+# Read pool over S3 via the node-local s3cache proxy. Readers hold no S3
+# credentials: the proxy is the sole SigV4 signer. Writes
+# (build/publish) go direct to S3.
 image:
   repository: lakewing
   tag: latest
   pullPolicy: IfNotPresent
 
-# S3 bucket holding catalogs/, data/ and refs/. Only the writer talks to
-# S3 over the API; readers only ever open mount paths.
-s3bucket: lake
-
-# Concrete published catalog readers pin to (restart/rollout to move).
-# Written by the seed job or the writer; see refs/ in S3 for history.
-catalog: sha_berlin.ducklake
-
-# One Deployment per zone; each pod mounts the bucket via the
-# mountpoint-S3-CSI driver. CSI v2 shares mounts for matching PV/options/identity.
+# One Deployment per zone behind a shared Service; each pod serves the
+# pinned catalog over S3_DIRECT through its node's s3cache proxy.
 replicasPerZone: 1
 zones:
   - az-a
@@ -28,40 +20,47 @@ resources: {}
 service:
   port: 3000
 
-# S3 key prefix holding the immutable Parquet data files. The published
-# catalog stores `s3://<bucket>/<dataPrefix>/` as its DATA_PATH; readers
-# mount the bucket at mountPath and pass --data-root, so the same
-# snapshot serves local paths everywhere. The writer builds with the
-# same prefix.
-dataPrefix: data
+# S3 origin holding catalogs/, data/ and refs/. Readers address it
+# through the node-local s3cache DaemonSet (S3_ENDPOINT); only the
+# writer and the proxy talk to the origin over the API.
+s3:
+  bucket: lake
+  # Concrete published catalog readers pin to (restart/rollout to move).
+  # Written by the seed job or the writer; see refs/ in S3 for history.
+  catalog: sha_berlin.ducklake
+  # Key prefix holding the immutable Parquet data files. The published
+  # catalog stores `s3://<bucket>/<dataPrefix>/` as its DATA_PATH.
+  dataPrefix: data
+  # Origin base URL for the writer and the s3cache proxy. Empty + 
+  # seaweed.enabled uses the in-chart dev SeaweedFS.
+  origin: ""
+  # Secret holding S3 credentials (keys: key_id, secret for the proxy;
+  # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY for the writer sidecar).
+  authSecretName: ""
 
-# Static-provisioned mountpoint-S3-CSI volume. The cluster must have the
-# driver installed (s3.csi.aws.com); authentication via driver-level IRSA,
-# Pod Identity, or csi.storageSecretName. prefix scopes the mount when one
-# bucket hosts several lakes. Snapshots are immutable, so prefer an
-# long metadata TTL for immutable snapshot objects. Mutable refs must be
-# resolved separately. Cache capacity is a bounded hot subset of the lake.
-csi:
-  # Static mountpoint-S3-CSI volume (prod). Set enabled=false for kind,
-  # where the lake-lake PVC is provisioned out-of-band (hostPath, see
-  # k8s/kind-data.yaml) pre-seeded with a published snapshot.
-  enabled: true
-  driver: s3.csi.aws.com
-  volumeHandle: lake
-  mountPath: /mnt/lake
-  prefix: ""
-  storageClass: ""
-  authenticationSource: driver
-  storageSecretName: ""
-  mountOptions:
-    - metadata-ttl indefinite
-    - negative-metadata-ttl minimal
-  # emptyDir uses the kubelet's storage medium. For NVMe use ephemeral
-  # plus a local-NVMe StorageClass, as in scripts/cachebench/rig.py.
-  cache:
-    type: emptyDir
-    size: 10Gi
-    storageClass: ""
+# Node-local read-through S3 slice cache (one pod per node, NVMe
+# hostPath, bounded hot subset of the lake). See docs/s3cache.md.
+s3cache:
+  image:
+    repository: lakewing-s3cache
+    tag: latest
+    pullPolicy: IfNotPresent
+  cacheBytes: "10737418240"
+  sliceBytes: "1048576"
+  readahead: "4"
+  port: 8345
+  resources: {}
+#  requests:
+#    memory: 128Mi
+#    cpu: 100m
+
+# Dev-only single-node SeaweedFS origin for kind. Disabled in prod,
+# where s3.origin points at real S3.
+seaweed:
+  enabled: false
+  image: chrislusf/seaweedfs:4.13
+  keyID: dev
+  secret: dev-local-only
 
 # DuckDB spill space: ephemeral emptyDir (counts against the pod's
 # ephemeral-storage quota and evicts with it — size for worst-case sorts,
@@ -72,7 +71,7 @@ temp:
 
 # S3 endpoint + Secret for the writer/seed direct-write sidecars.
 # Defaults address the local SeaweedFS rig (see just seaweed-up); point at
-# real S3 in prod.
+# real S3 in prod. These default into s3.origin / s3.authSecretName below.
 s3endpoint: ""
 s3secret: ""
 

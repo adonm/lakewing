@@ -1,6 +1,6 @@
 apiVersion: v2
 name: lakewing
-description: Huma OGC + Flight read pool over a mountpoint-S3-CSI DuckLake plus the optional direct-S3 writer
+description: Huma OGC + Flight read pool over S3_DIRECT through a node-local s3cache proxy plus the optional direct-S3 writer
 type: application
 version: 0.1.0
 appVersion: 0.1.0

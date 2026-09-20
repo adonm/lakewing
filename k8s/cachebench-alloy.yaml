@@ -44,7 +44,7 @@ data:
       targets = discovery.kubernetes.pods.targets
       rule {
         source_labels = ["__meta_kubernetes_namespace"]
-        regex = "lake-bench|mount-s3"
+        regex = "lake-bench"
         action = "keep"
       }
       rule {

@@ -1,12 +1,20 @@
-# kind overrides: single-zone hostPath lake, kind image tag.
+# kind overrides: single zone, kind image tags, dev SeaweedFS origin +
+# s3cache proxy. Readers serve s3:// URLs over S3_DIRECT; no CSI/FUSE.
 image:
   tag: kind
+s3cache:
+  image:
+    tag: kind
 zones:
   - az-a
 replicasPerZone: 1
-catalog: sha_seed.ducklake
-csi:
-  enabled: false
+s3:
+  catalog: sha_seed.ducklake
+  authSecretName: lake-s3-dev
+seaweed:
+  enabled: true
+  keyID: dev
+  secret: dev-local-only
 temp:
   sizeLimit: 2Gi
 bulk:

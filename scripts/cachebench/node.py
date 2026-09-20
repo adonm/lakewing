@@ -23,12 +23,8 @@ def processes():
             if name == 'cachebench' and b'meter' not in args:
                 env = dict(s.split(b'=', 1) for s in path.joinpath('environ').read_bytes().split(b'\0') if b'=' in s)
                 label = env[b'BACKEND'].decode() + '-' + env[b'HOSTNAME'].decode()
-            elif name == 'rclone' and b'mount' in args:
-                label = 'rclone-mount'
-            elif name in ('mount-s3', 'aws-s3-csi-mounter'):
-                label = 'mountpoint-mount'
             elif name == 's3cache':
-                label = 'proxy-s3cache'
+                label = 's3cache'
             else:
                 continue
             group = path.joinpath('cgroup').read_text().strip().split('::', 1)[1]

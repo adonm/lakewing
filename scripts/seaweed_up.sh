@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Local SeaweedFS lake rig: S3-compatible store for direct writes.
 # Idempotent: safe to re-run. Rig state lives under /tmp/opencode.
-# Readers mount the bucket via ./scripts/lake_mount.sh (mount-s3); writers
-# talk S3 directly. Replaces the old MinIO + Cachey HTTP rig.
+# Readers go over S3_DIRECT through the node-local s3cache proxy;
+# writers talk S3 directly. Replaces the old MinIO + Cachey HTTP rig.
 set -euo pipefail
 
 RIG=/tmp/opencode
@@ -12,7 +12,7 @@ S3_PORT="${S3_PORT:-8333}"
 source "$(dirname "$0")/dev-s3.env"
 
 # S3 identity config: SeaweedFS rejects unknown access keys, so provision
-# the same dev-only pair the rig, rclone and mount-s3 use.
+# the same dev-only pair the rig and the s3cache proxy use.
 mkdir -p "$RIG/seaweed-config"
 cat > "$RIG/seaweed-config/s3.json" <<EOF
 {"identities": [{"name": "dev", "actions": ["Admin"], "credentials": [{"accessKey": "$S3_USER", "secretKey": "$S3_PASS"}]}]}

@@ -12,8 +12,8 @@ source -> build: bbox-pruned range reads
 build -> catalog: atomic publish
 build -> parquet: data files first (direct S3 writes)
 build -> index: per-file bboxes
-catalog -> pool: mountpoint-S3 mount, pinned snapshot
+catalog -> pool: S3_DIRECT via s3cache proxy, pinned snapshot
 index -> pool: candidate files per request
-parquet -> pool: mount reads via node-local disk cache
+parquet -> pool: S3 range reads via node-local disk cache
 pool -> http
 pool -> flight

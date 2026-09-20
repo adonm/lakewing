@@ -94,7 +94,7 @@ func (m *meter) handler(target *url.URL) http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		backend := strings.Split(r.Host, ".")[0]
 		switch backend {
-		case "direct-s3", "mountpoint-s3", "rclone-s3", "geesefs-s3", "httpcache-s3":
+		case "direct-s3", "httpcache-s3":
 		default:
 			http.Error(w, "unknown benchmark endpoint", http.StatusBadRequest)
 			return

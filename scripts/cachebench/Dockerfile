@@ -11,7 +11,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build go build -tags=duckdb_use_li
 RUN --mount=type=cache,target=/root/.cache/go-build go test -c -tags=duckdb_use_lib,duckdb_arrow -o /cachebench.test ./cmd/cachebench
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates fuse3 curl python3 util-linux linux-perf binutils && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 util-linux linux-perf binutils && rm -rf /var/lib/apt/lists/*
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 COPY --from=build /cachebench /usr/local/bin/cachebench
 COPY --from=build /cachebench.test /usr/local/bin/cachebench.test

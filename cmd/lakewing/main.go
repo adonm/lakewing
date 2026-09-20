@@ -1,5 +1,5 @@
 // Command lakewing: build a DuckLake snapshot (direct S3 writes), then
-// serve it through Huma OGC REST and Arrow Flight (CSI mount reads).
+// serve it through Huma OGC REST and Arrow Flight (S3_DIRECT reads).
 package main
 
 import (
@@ -132,7 +132,7 @@ func serveCmd() *cobra.Command {
 	var tempDir string
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Serve a pinned snapshot: Huma OGC + Arrow Flight (CSI mount reads)",
+		Short: "Serve a pinned snapshot: Huma OGC + Arrow Flight (S3_DIRECT reads)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer stop()

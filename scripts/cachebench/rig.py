@@ -117,9 +117,6 @@ class Rig:
         self.apply(self.obj("Namespace", NS))
         credentials = {"AWS_ACCESS_KEY_ID": "cachebench", "AWS_SECRET_ACCESS_KEY": "cachebench-local-only"}
         self.apply(self.obj("Secret", "s3", type="Opaque", stringData=credentials))
-        secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "cachebench-s3", "namespace": "kube-system"}, "stringData": {"key_id": credentials["AWS_ACCESS_KEY_ID"], "access_key": credentials["AWS_SECRET_ACCESS_KEY"]}}
-        self.apply(secret)
-        command("helm", "upgrade", "--install", "cachebench-csi", "aws-mountpoint-s3-csi-driver", "--repo", "https://awslabs.github.io/mountpoint-s3-csi-driver", "--version", "2.8.0", "--kube-context", self.context, "--namespace", "kube-system", "--set", "awsAccessSecret.name=cachebench-s3", "--set", "supportLegacySystemDMounts=false", "--wait", "--timeout", "5m")
         self.kube("apply", "-f", str(ROOT / "k8s/lgtm.yaml"))
         patch = {"spec": {"template": {"spec": {"nodeSelector": {"kubernetes.io/hostname": self.control}, "tolerations": [{"operator": "Exists"}]}}}}
         self.kube("-n", "monitoring", "patch", "deployment", "lgtm", "--type=merge", "-p", json.dumps(patch))
@@ -156,20 +153,12 @@ class Rig:
         self.ready("seaweed")
         meter = self.pod("s3-meter", {"name": "s3-meter", "image": IMAGE, "args": ["meter"], "ports": [{"name": "metrics", "containerPort": 8080}], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}, node=self.control)
         meter["metadata"]["labels"] = {"app": "s3-meter"}
-        self.apply(meter, self.service("s3-meter", "s3-meter"), *(self.service(b + "-s3", "s3-meter") for b in ("direct", "mountpoint", "rclone", "geesefs", "httpcache")))
+        self.apply(meter, self.service("s3-meter", "s3-meter"), *(self.service(b + "-s3", "s3-meter") for b in ("direct", "httpcache")))
         self.ready("s3-meter")
         self.kube("-n", NS, "delete", "pod", "seed", "--ignore-not-found", "--wait=true")
         seed = self.pod("seed", {"name": "seed", "image": IMAGE, "command": ["sh", "-ec", "rclone copy /fixtures/nw-europe.files lake:lake/nw/data\nrclone copyto /fixtures/nw-europe.ducklake lake:lake/nw/catalogs/nw-europe.ducklake"], "env": self.rclone_env("http://seaweed:8333"), "envFrom": [{"secretRef": {"name": "s3"}}], "volumeMounts": [{"name": "fixtures", "mountPath": "/fixtures", "readOnly": True}]}, [{"name": "fixtures", "hostPath": {"path": "/fixtures"}}], self.control)
         self.apply(seed)
         self.wait_finished("seed")
-        # A local PV makes the CSI cache's physical medium explicit.
-        (self.root / "reader/mountpoint").mkdir(exist_ok=True)
-        local = {"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": "cachebench-nvme"}, "spec": {"capacity": {"storage": "2Gi"}, "accessModes": ["ReadWriteOnce"], "storageClassName": "cachebench-nvme", "persistentVolumeReclaimPolicy": "Retain", "local": {"path": "/nvme/mountpoint"}, "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": [self.worker]}]}]}}}}
-        sc = {"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "cachebench-nvme"}, "provisioner": "kubernetes.io/no-provisioner", "volumeBindingMode": "WaitForFirstConsumer"}
-        self.apply(sc, local)
-        pv = {"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": "cachebench-s3"}, "spec": {"capacity": {"storage": "1Ti"}, "accessModes": ["ReadOnlyMany"], "storageClassName": "", "persistentVolumeReclaimPolicy": "Retain", "mountOptions": ["region us-east-1", "endpoint-url http://mountpoint-s3.lake-bench.svc.cluster.local:8080", "force-path-style", "prefix nw/", "metadata-ttl indefinite", "negative-metadata-ttl minimal", f"max-cache-size {self.args.cache_mib}", "read-only", "log-metrics"], "csi": {"driver": "s3.csi.aws.com", "volumeHandle": "cachebench-lake", "volumeAttributes": {"bucketName": "lake", "authenticationSource": "driver", "cache": "ephemeral", "cacheEphemeralStorageClassName": "cachebench-nvme", "cacheEphemeralStorageResourceRequest": "1Gi", "mountpointContainerResourcesLimitsCpu": "2", "mountpointContainerResourcesLimitsMemory": "1Gi"}}}}
-        pvc = self.obj("PersistentVolumeClaim", "mountpoint", {"accessModes": ["ReadOnlyMany"], "storageClassName": "", "volumeName": "cachebench-s3", "resources": {"requests": {"storage": "1Ti"}}})
-        self.apply(pv, pvc)
 
     def rclone_env(self, endpoint):
         return [{"name": "RCLONE_CONFIG_LAKE_" + k, "value": v} for k, v in {"TYPE": "s3", "PROVIDER": "Other", "ENDPOINT": endpoint, "ENV_AUTH": "true", "REGION": "us-east-1", "FORCE_PATH_STYLE": "true"}.items()]
@@ -187,28 +176,13 @@ class Rig:
         raise RuntimeError(name + " timed out")
 
     def mounts(self, backend):
-        if backend == "mountpoint":
-            return [{"name": "lake", "persistentVolumeClaim": {"claimName": "mountpoint"}}], [{"name": "lake", "mountPath": "/lake", "readOnly": True}]
-        if backend == "rclone":
-            return [{"name": "lake", "hostPath": {"path": "/nvme/rclone/mount"}}], [{"name": "lake", "mountPath": "/lake", "mountPropagation": "HostToContainer", "readOnly": True}]
         if backend == "local":
             return [{"name": "fixtures", "hostPath": {"path": "/fixtures"}}], [{"name": "fixtures", "mountPath": "/fixtures", "readOnly": True}]
         return [], []
 
     def cleanup(self):
         self.kube("-n", NS, "delete", "pod", "reader-a", "reader-b", "--ignore-not-found", "--wait=true")
-        self.kube("-n", NS, "delete", "pod", "rclone-mount", "--ignore-not-found", "--wait=true")
         self.kube("-n", NS, "delete", "pod", "s3cache", "--ignore-not-found", "--wait=true")
-        pods = json.loads(self.kube("-n", "mount-s3", "get", "pods", "-o", "json", capture=True))["items"]
-        for pod in pods:
-            self.kube("-n", "mount-s3", "wait", "--for=delete", "pod/" + pod["metadata"]["name"], "--timeout=90s")
-        # Generic ephemeral PVCs are deleted with the Mountpoint pod. Rebind the
-        # retained local test PV only after its former claim has disappeared.
-        pv = json.loads(self.kube("get", "pv", "cachebench-nvme", "-o", "json", capture=True))
-        claim = pv['spec'].get('claimRef')
-        if claim:
-            self.kube("-n", claim['namespace'], "wait", "--for=delete", "pvc/" + claim['name'], "--timeout=60s")
-            self.kube("patch", "pv", "cachebench-nvme", "--type=merge", "-p", '{"spec":{"claimRef":null}}')
 
     def proxy(self):
         """(Re)create the node-local s3cache pod. Its origin traffic flows
@@ -235,16 +209,9 @@ class Rig:
     def readers(self, backend, reset=False):
         if reset:
             self.cleanup()
-            # Only stopped benchmark mounts may have their data caches removed.
-            for name in ('mountpoint', 'rclone/cache', 's3cache'):
-                self.kube('-n', NS, 'exec', 'node-tools', '--', 'python3', '-c',
-                          'import shutil, pathlib; p=pathlib.Path("/nvme") / ' + repr(name) + '; shutil.rmtree(p, ignore_errors=True); p.mkdir(parents=True)')
-        if backend == "rclone":
-            for path in ("reader/rclone/mount", "reader/rclone/cache"):
-                (self.root / path).mkdir(parents=True, exist_ok=True)
-            mount = self.pod("rclone-mount", {"name": "rclone-mount", "image": IMAGE, "command": ["rclone", "mount", "lake:lake/nw", "/node/mount", "--read-only", "--allow-other", "--allow-non-empty", "--vfs-cache-mode=full", "--cache-dir=/node/cache", f"--vfs-cache-max-size={self.args.cache_mib}M", "--vfs-cache-max-age=24h", "--vfs-cache-poll-interval=1s", "--dir-cache-time=24h", "--no-modtime", "--buffer-size=0", "--vfs-read-ahead=0", "--vfs-read-chunk-size=4M", "--vfs-read-chunk-size-limit=4M", "--vfs-read-chunk-streams=4"], "env": self.rclone_env("http://rclone-s3.lake-bench.svc.cluster.local:8080"), "envFrom": [{"secretRef": {"name": "s3"}}], "securityContext": {"privileged": True}, "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "2", "memory": "3Gi"}}, "volumeMounts": [{"name": "node", "mountPath": "/node", "mountPropagation": "Bidirectional"}], "readinessProbe": {"exec": {"command": ["mountpoint", "-q", "/node/mount"]}, "periodSeconds": 2}}, [{"name": "node", "hostPath": {"path": "/nvme/rclone"}}])
-            self.apply(mount)
-            self.ready("rclone-mount")
+            # Only a stopped proxy may have its disk cache removed.
+            self.kube('-n', NS, 'exec', 'node-tools', '--', 'python3', '-c',
+                      'import shutil, pathlib; p=pathlib.Path("/nvme/s3cache"); shutil.rmtree(p, ignore_errors=True); p.mkdir(parents=True)')
         if backend == "proxy":
             self.proxy()
         for slot in ("a", "b"):
@@ -286,13 +253,6 @@ class Rig:
                 print("BACKEND", backend, flush=True)
                 self.readers(backend, reset=True)
                 self.kube("-n", NS, "exec", "reader-a", "--", "cachebench.test", "-test.v")
-                if backend == "mountpoint":
-                    attachments = json.loads(self.kube("get", "mountpoints3podattachments", "-o", "json", capture=True))
-                    (output / "csi-attachments.json").write_text(json.dumps(attachments, indent=2))
-                    pods = json.loads(self.kube("-n", "mount-s3", "get", "pods", "-o", "json", capture=True))
-                    (output / "csi-pods.json").write_text(json.dumps(pods, indent=2))
-                    if len(pods["items"]) != 1:
-                        raise RuntimeError("expected one shared Mountpoint pod for two readers")
                 with self.forward("pod/reader-a") as a, self.forward("pod/reader-b") as b:
                     def observed(base, path, label):
                         before = settled_stats(meter)
@@ -353,13 +313,8 @@ class Rig:
                     (output / f"{backend}-metrics.txt").write_text(request(b + "/metrics", raw=True).decode())
                     # Keep completed observations available for two Alloy scrapes.
                     time.sleep(10)
-                # Preserve native interval metrics before the mount is removed.
-                namespace = 'mount-s3' if backend == 'mountpoint' else NS
-                mount = pods['items'][0]['metadata']['name'] if backend == 'mountpoint' else 'rclone-mount'
-                if backend in ('mountpoint', 'rclone'):
-                    (output / f'{backend}-mount.log').write_text(self.kube('-n', namespace, 'logs', mount, capture=True))
                 self.cleanup()
-                # Restart the mount with its disk directory intact, then open a
+                # Restart the proxy with its disk directory intact, then open a
                 # new reader. This is a distinct cache-reuse condition.
                 self.readers(backend)
                 with self.forward('pod/reader-a') as a:
@@ -386,9 +341,9 @@ def request(url, method="GET", raw=False):
 
 
 def settled_stats(base, timeout=60):
-    # Mountpoint cancels speculative ranges (metered as 502s) and may hold
-    # background prefetch; require stable counts+active for 1s rather than
-    # absolute zero. Best-effort: never fail the run on quiescence.
+    # Readers cancel speculative ranges; require stable counts+active for
+    # 1s rather than absolute zero. Best-effort: never fail the run on
+    # quiescence.
     last, stable = None, 0
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -442,10 +397,10 @@ def main():
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--memory", default="1GB")
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--backends", default="direct,mountpoint,rclone")
+    parser.add_argument("--backends", default="direct,proxy")
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
-    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or any(b not in {"direct", "mountpoint", "rclone", "local", "proxy"} for b in args.backends.split(",")):
+    if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")):
         parser.error("positive repeats, 1..1024 MiB cache, and known backends required")
     rig = Rig(args)
     if args.action in ("up", "all"):

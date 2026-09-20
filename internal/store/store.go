@@ -1,9 +1,8 @@
 // Package store ports src/store.rs + src/db.rs: the shared DuckDB pool over
-// a DuckLake snapshot mounted via mountpoint S3 CSI.
+// a DuckLake snapshot served over S3_DIRECT (normally through the node-local
+// s3cache proxy; see docs/s3cache.md).
 //
-// Storage model (lakewing): reads resolve to local CSI mount paths
-// (e.g. /mnt/lake/catalogs/<sha>.ducklake + /mnt/lake/data/...). There is
-// no Cachey HTTP layer, no per-origin secrets, no --data-base sharding.
+// Storage model (lakewing): reads resolve to s3:// catalog + data URLs.
 // Writes (build/index publish) go direct to S3 over the S3 API.
 //
 // Build with -tags=duckdb_use_lib against the pinned DuckDB 2.0 library
@@ -79,10 +78,11 @@ type LakeLayout struct {
 	Sort     string `json:"sort"`
 }
 
-// Config mirrors StoreConfig minus the Cachey fields: mount paths only.
+// Config mirrors StoreConfig: s3:// catalog location plus DATA_PATH
+// override for the data root.
 type Config struct {
-	Location     string // mount path to the .ducklake catalog
-	DataRoot     string // mount path to the data root (DATA_PATH override); empty = stored path
+	Location     string // s3:// URL of the .ducklake catalog
+	DataRoot     string // s3:// data root (DATA_PATH override); empty = stored path
 	IndexJSON    *string
 	Connections  int
 	MaxWaiters   int
@@ -97,7 +97,7 @@ type Config struct {
 	TempDir string
 }
 
-// ResolvedIndex is a trusted serving index over mount file URLs.
+// ResolvedIndex is a trusted serving index over data file URLs.
 type ResolvedIndex struct {
 	Index index.ServingIndex
 	URLs  []string
@@ -203,7 +203,7 @@ func slash(s string) string {
 	return s + "/"
 }
 
-// fileURLs mirrors store::file_urls with a single mount base: relative
+// fileURLs mirrors store::file_urls with a single data base: relative
 // paths join the DataRoot override (or the stored base for local
 // fixtures); absolute paths pass through.
 func fileURLs(base string, relpaths []string) []string {
@@ -240,8 +240,8 @@ func setupSession(ctx context.Context, c *sql.Conn, tempDir string) error {
 		"SET late_materialization_max_rows=0",
 	}
 	// S3_DIRECT mode: point DuckDB at S3 (normally the node-local s3cache
-	// proxy) instead of CSI mount paths. Catalog/data locations must then
-	// be s3:// URLs; writers still go direct to the origin. The proxy is
+	// proxy). Catalog/data locations are s3:// URLs; writers still go
+	// direct to the origin. The proxy is
 	// the sole signer, so workers need no credentials here: a secret
 	// without KEY_ID gives anonymous access to the proxy.
 	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
@@ -505,7 +505,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		}
 	}
 
-	// Serving index sidecar: mount-local read only; validated against the
+	// Serving index sidecar: read-only S3 sidecar object; validated against the
 	// pinned snapshot and exact file-set agreement.
 	idxJSON := cfg.IndexJSON
 	if idxJSON == nil {
@@ -639,7 +639,7 @@ func (s *Store) Collection(id string) error {
 	return NotFound("unknown collection")
 }
 
-// ReadSource prunes to candidate mount file URLs via the serving index.
+// ReadSource prunes to candidate data file URLs via the serving index.
 func (s *Store) ReadSource(bounds *[4]float64) string {
 	if s.index == nil {
 		return s.fallbackFrom
