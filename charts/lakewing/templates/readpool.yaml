@@ -47,7 +47,7 @@ spec:
           command:
             - sh
             - -c
-            - exec lakewing serve --shard '{{ $shard }}' --data-root '{{ $data }}' --listen 0.0.0.0:3000
+            - exec lakewing serve --shard '{{ $shard }}' --data-root '{{ $data }}' --listen 0.0.0.0:3000 --temp-dir /duckdb-temp
           ports:
             - name: http
               containerPort: 3000
@@ -55,11 +55,16 @@ spec:
             - name: lake
               mountPath: {{ $mount }}
               readOnly: true
+            - name: duckdb-temp
+              mountPath: /duckdb-temp
           resources: {{ toYaml $.Values.resources | nindent 12 }}
       volumes:
         - name: lake
           persistentVolumeClaim:
             claimName: {{ include "lakewing.fullname" $ }}-lake
+        - name: duckdb-temp
+          emptyDir:
+            sizeLimit: {{ $.Values.temp.sizeLimit }}
 {{- end }}
 ---
 apiVersion: v1

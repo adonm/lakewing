@@ -129,6 +129,7 @@ func serveCmd() *cobra.Command {
 	var threads int64
 	var memoryMB uint64
 	var queryTimeoutMS uint64
+	var tempDir string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Serve a pinned snapshot: Huma OGC + Arrow Flight (CSI mount reads)",
@@ -152,6 +153,7 @@ func serveCmd() *cobra.Command {
 				MaxWait:   time.Duration(maxWaitMS) * time.Millisecond,
 				BulkLimit: bulkLimit, Threads: threads, MemoryMB: memoryMB,
 				QueryTimeout: time.Duration(queryTimeoutMS) * time.Millisecond,
+				TempDir:      tempDir,
 			})
 			if err != nil {
 				return err
@@ -204,6 +206,7 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().Int64Var(&threads, "threads", 0, "shared DuckDB threads (0 = NumCPU)")
 	cmd.Flags().Uint64Var(&memoryMB, "memory-mb", 4096, "shared DuckDB memory MiB (0 = default)")
 	cmd.Flags().Uint64Var(&queryTimeoutMS, "query-timeout-ms", 30000, "query deadline ms (0 = none)")
+	cmd.Flags().StringVar(&tempDir, "temp-dir", "", "DuckDB spill dir (empty = engine default; point at ephemeral storage in k8s)")
 	_ = cmd.MarkFlagRequired("shard")
 	return cmd
 }

@@ -88,4 +88,24 @@ func TestPreviewSmoke(t *testing.T) {
 		t.Fatalf("pool query: %v", qerr)
 	}
 	t.Logf("bbox count: %s", one)
+	// Temp spill dir reaches every pooled connection.
+	dir := "/tmp/opencode/lw-tempdir"
+	st2, err := Open(context.Background(), Config{
+		Location: shard, DataRoot: dataroot, Connections: 1, MaxWaiters: 1,
+		MaxWait: 5 * time.Second, BulkLimit: 1, Threads: 1,
+		MemoryMB: 512, QueryTimeout: 30 * time.Second, TempDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("store.Open tempdir: %v", err)
+	}
+	defer st2.Close()
+	var got string
+	if err := st2.Query(context.Background(), false, func(ctx context.Context, c *sql.Conn) error {
+		return c.QueryRowContext(ctx, "SELECT current_setting('temp_directory')").Scan(&got)
+	}); err != nil {
+		t.Fatalf("temp_directory: %v", err)
+	}
+	if got != dir {
+		t.Fatalf("temp_directory = %q, want %q", got, dir)
+	}
 }

@@ -55,6 +55,13 @@ csi:
   authenticationSource: driver
   storageSecretName: ""
 
+# DuckDB spill space: ephemeral emptyDir (counts against the pod's
+# ephemeral-storage quota and evicts with it — size for worst-case sorts,
+# not the dataset). Mounted at /duckdb-temp and passed as --temp-dir so
+# pressure spills to node-local disk instead of the container layer.
+temp:
+  sizeLimit: 10Gi
+
 # S3 endpoint + Secret for the writer/seed direct-write sidecars.
 # Defaults address the local SeaweedFS rig (see just seaweed-up); point at
 # real S3 in prod.

@@ -89,6 +89,10 @@ type Config struct {
 	Threads      int64
 	MemoryMB     uint64
 	QueryTimeout time.Duration
+	// TempDir for DuckDB spill files (SET temp_directory per connection).
+	// Empty leaves the engine default (process TMPDIR). In kind/k8s this
+	// points at the ephemeral emptyDir volume.
+	TempDir string
 }
 
 // ResolvedIndex is a trusted serving index over mount file URLs.
@@ -213,7 +217,7 @@ func fileURLs(base string, relpaths []string) []string {
 
 // setupSession mirrors store::setup_session minus Cachey/S3 secrets:
 // extensions (LOAD, falling back to INSTALL+LOAD), then the lockdown.
-func setupSession(ctx context.Context, c *sql.Conn) error {
+func setupSession(ctx context.Context, c *sql.Conn, tempDir string) error {
 	for _, ext := range []string{"ducklake", "spatial", "httpfs"} {
 		if _, err := c.ExecContext(ctx, "LOAD "+ext); err != nil {
 			if _, err := c.ExecContext(ctx, "INSTALL "+ext); err != nil {
@@ -224,14 +228,18 @@ func setupSession(ctx context.Context, c *sql.Conn) error {
 			}
 		}
 	}
-	return dbutil.ExecAll(ctx, c,
+	stmts := []string{
 		"SET autoinstall_known_extensions=false",
 		"SET autoload_known_extensions=false",
 		"SET parquet_metadata_cache=true",
 		"SET enable_http_metadata_cache=true",
 		"SET validate_external_file_cache='NO_VALIDATION'",
 		"SET late_materialization_max_rows=0",
-	)
+	}
+	if tempDir != "" {
+		stmts = append(stmts, "SET temp_directory="+filter.Quote(tempDir))
+	}
+	return dbutil.ExecAll(ctx, c, stmts...)
 }
 
 // resolvedFiles mirrors store::ResolvedFiles: DATA base + ordered
@@ -397,7 +405,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 			return nil, Backend(err.Error())
 		}
 	}
-	if err := setupSession(ctx, boot); err != nil {
+	if err := setupSession(ctx, boot, cfg.TempDir); err != nil {
 		boot.Close()
 		db.Close()
 		return nil, Backend(err.Error())
@@ -530,7 +538,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 			db.Close()
 			return nil, Backend("pool connect: " + err.Error())
 		}
-		if err := setupSession(ctx, c); err != nil {
+		if err := setupSession(ctx, c, cfg.TempDir); err != nil {
 			boot.Close()
 			c.Close()
 			for _, p := range pool {

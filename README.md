@@ -215,7 +215,10 @@ MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
 DuckDB's unbounded default). Size memory with threads: many threads sorting
 huge match sets can OOM a small budget (fails loud as 500, never wrong
 rows) — the full-region sort needs ~4 GB at 8+ threads on the 25M-row
-shard. Repeated Parquet block reads are absorbed by
+shard. Spill files go to `--temp-dir` (SET temp_directory per connection);
+in kind this points at the ephemeral `emptyDir` (`temp.sizeLimit`), so
+pressure spills to node-local disk instead of the container layer. Repeated
+Parquet block reads are absorbed by
 the mountpoint local disk cache on each node, not by in-DuckDB tuning:
 there are no storage-tuning flags by design (see
 [`docs/mount-lake.md`](docs/mount-lake.md)). Deep `offset` pages (≥ 1000)
