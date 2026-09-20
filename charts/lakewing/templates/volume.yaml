@@ -9,19 +9,36 @@ metadata:
 spec:
   capacity:
     storage: 1200Gi
+  storageClassName: {{ .Values.csi.storageClass | quote }}
+  claimRef:
+    name: {{ include "lakewing.fullname" . }}-lake
+    namespace: {{ .Release.Namespace }}
   accessModes:
     - ReadOnlyMany
   mountOptions:
     - allow-other
+    {{- range .Values.csi.mountOptions }}
+    - {{ . | quote }}
+    {{- end }}
+    {{- if .Values.csi.prefix }}
+    - {{ printf "prefix %s" .Values.csi.prefix | quote }}
+    {{- end }}
   csi:
     driver: {{ .Values.csi.driver }}
     volumeHandle: {{ .Values.csi.volumeHandle }}
     volumeAttributes:
       bucketName: {{ .Values.s3bucket }}
-      {{- if .Values.csi.prefix }}
-      prefix: {{ .Values.csi.prefix }}
-      {{- end }}
       authenticationSource: {{ .Values.csi.authenticationSource }}
+      {{- if eq .Values.csi.cache.type "emptyDir" }}
+      cache: emptyDir
+      cacheEmptyDirSizeLimit: {{ .Values.csi.cache.size | quote }}
+      {{- else if eq .Values.csi.cache.type "ephemeral" }}
+      cache: ephemeral
+      cacheEphemeralStorageClassName: {{ required "csi.cache.storageClass is required for ephemeral cache" .Values.csi.cache.storageClass | quote }}
+      cacheEphemeralStorageResourceRequest: {{ .Values.csi.cache.size | quote }}
+      {{- else if .Values.csi.cache.type }}
+      {{- fail "csi.cache.type must be emptyDir, ephemeral, or empty to disable" }}
+      {{- end }}
       {{- if .Values.csi.storageSecretName }}
       csi.storageSecretName: {{ .Values.csi.storageSecretName }}
       {{- end }}

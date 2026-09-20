@@ -1,97 +1,108 @@
 # Storage-cache options: where to cut the warm path
 
-Goal: lowest-overhead WARM reads, shareable across pods on a node (one
-copy per node, not per pod or per process). Serving reads are Parquet
-row-group column-chunk ranges over an immutable snapshot: highly
-repetitive across requests, never invalidated by writes.
+Goal: lowest-overhead WARM reads under a bounded node NVMe cache for a
+lake that will never fit on any node (PB scale). Serving reads are
+Parquet row-group column-chunk ranges over an immutable snapshot:
+repetitive across requests, never invalidated by writes — but the cache
+holds only a hot subset, so eviction and scan pollution matter.
 
-## Measured (25M-row lake, loopback SeaweedFS, then +20 ms RTT)
+## Measured (in-kind DuckLake, 512 MiB cache vs ~3.0 GiB fixture)
 
-File-list queries, threads=8. Loopback first (S3 artificially fast),
-then with 20 ms loopback latency to simulate real S3 RTT:
+Dedicated kind `lake-cache`: SeaweedFS + Mountpoint CSI v2.8.0 + LGTM +
+Alloy, real-disk `/nvme` binds. Matched DuckDB (4 threads, 1 GB,
+snapshot 6, engine v2.0.0-alpha42069). Every result fully consumed and
+SHA-256 compared across backends and repetitions — all hashes match.
+Harness: `scripts/cachebench/rig.py` (`just bench-paths`).
 
-| Query | Direct cold | Direct warm | Mount cold | Mount warm | Mount warm +20 ms RTT | Direct warm +20 ms RTT |
-|---|---|---|---|---|---|---|
-| City page | 203 ms | 50 ms | 1233 ms | 291 ms | 328 ms | 2285 ms |
-| Broad quarter | 601 ms | 529 ms | 8664 ms | 1698 ms | ~1500 ms | 2135 ms |
-| Full-region page | 2025 ms | 3452/2383 ms | 32565 ms | 5790 ms | — | 3373/4133 ms |
-| Deep offset | 5722 ms | 8713 ms | 9729 ms | 12263 ms† | — | 9610 ms |
+| Query (phase, n) | Direct | Mountpoint CSI | rclone VFS-full (one node mount) |
+|---|---|---|---|
+| CITY first | 121 ms, 50 GETs / 93 MiB | 338 ms, 74 GETs / 167 MiB | 265 ms, 122 GETs / 466 MiB |
+| CITY warm ×5 (median) | 79 ms, 3 GETs / ~15 MiB each | 132 ms, ~0–5 GETs / ~1 MiB each | 102 ms, **0 S3** |
+| BROAD first | 560 ms, 168 GETs / 420 MiB | 2690 ms, 382 GETs / 750 MiB | 906 ms, 359 GETs / 1387 MiB |
+| BROAD warm ×5 (median) | 530 ms, ~40 GETs / ~185 MiB each | 961 ms, ~2–20 GETs / ~5–118 MiB each | 556 ms, **~0 S3** (7 GETs total) |
+| FULL first | 2.7 s, 842 GETs / 2.1 GiB | 23.3 s, 2025 GETs / 2.9 GiB | OOM (see below) |
+| FULL warm ×5 (median) | ~2.6 s, full re-fetch each | ~31–43 s, full re-fetch each | — |
+| DEEP first | 7.0 s, 1844 GETs / 4.5 GiB | 54.1 s, 3568 GETs / 7.1 GiB | — |
+| DEEP warm (median) | ~7.1 s, full re-fetch each | ~52 s, full re-fetch each | — |
+| SCAN (full-payload) | 4.9 s, 1442 GETs / 3.8 GiB | 32.4 s, 1939 GETs / 5.1 GiB | — |
+| Cross-pod peer CITY | direct 106 ms / full re-fetch | mountpoint 153 ms / 1.8 MiB (shared) | not reached |
+| After cgroup page reclaim | both re-fetch catalog+data once, then warm | mountpoint CITY 179 ms / 0.4 MiB (disk serves) | not reached |
+| After SCAN pollution | CITY warm unchanged | CITY warm back to ~147 ms / ~0 S3 after one refill | not reached |
+| Mount restart, disk intact | n/a (no cache) | CITY 520 ms / full re-fetch (**cache cleared on remount**) | not reached |
+| Catalog attach | ~20 ms + ~110 ms metadata, 11 GETs / 2.5 MiB | ~20 ms + ~110 ms, 7 GETs / ~10 MiB + LIST | ~25 ms + ~108 ms, 3 GETs / 8 MiB |
 
-† run-to-run variance under a loaded rig; content identical. (An early
-+20 ms RTT broad run showed 4.4 s from a partial cache miss after a cache
-wipe; clean re-runs hold ~1.5 s with no new S3 GETs.)
-
-DuckLake catalog-table reads (ATTACH + `features`, no frozen file list):
-direct 6.3 s, mount cold 42 s / warm 9.3 s — 4-7x slower than the frozen
-file list. This is why serve resolves to `read_parquet` file lists; the
-catalog path is boot/fallback only.
+S3 counts metered per backend/operation (catalog vs data) through a
+reverse proxy; 502s are mountpoint/rclone speculative-range cancels
+(client-cancelled, zero bytes), not SeaweedFS errors.
 
 ## Readings
 
-1. **On loopback, direct HTTP beats warm mount** (no RTT to amortize;
-   FUSE costs ~1.5-3x on data-heavy queries, ~1x on small ones). Loopback
-   flatters direct and must not drive the decision.
-2. **With 20 ms RTT, warm mount wins 2-7x** (CITY 2285 → 328 ms) because
-   warm mount issues ~zero S3 (verified in mount metrics across ~40 s of
-   flushes). Direct warm still pays full transfer: DuckDB's external file
-   cache measured ~1-1.4x on loopback, sometimes negative (cache blocks
-   compete with query memory under `memory_limit`).
-3. **Catalog reads are never hot-path material** on either backend.
+1. **On fast (loopback-kind) S3, direct is fastest everywhere.**
+   FUSE costs dominate: mountpoint 2.8x (CITY) to ~9x (FULL) slower,
+   rclone 2.2x (CITY) to 1.6x (BROAD) slower. Caches save S3 bytes but
+   not wall time when RTT ≈ 0. With real RTT the byte savings would
+   convert to latency wins; this rig does not simulate RTT.
+2. **Warm small-query caching works on both mounts.**
+   rclone CITY/BROAD warm: zero S3. Mountpoint CITY warm: ~1 MiB/query
+   (vs 93 first), peer reuse 1.8 MiB, post-reclaim 0.4 MiB. Direct warm
+   still pays 15/185 MiB per CITY/BROAD (DuckDB external cache helps
+   only marginally at this shape).
+3. **Large scans (≥ cache) re-fetch everywhere and mounts amplify.**
+   FULL/DEEP/SCAN touch 2–8 GiB > 512 MiB cache: every backend re-reads
+   fully; mountpoint moves 1.3–1.5x more GETs than direct (1 MiB
+   blocks + prefetch/cancel churn) at ~8–10x wall time.
+4. **Mountpoint cache does not survive remount** (restart-first CITY
+   fully re-fetches) and SCAN evicts the hot subset (one refill
+   restores it). Sharing holds across pods on a node (peer-first
+   1.8 MiB) when PV/options/identity match.
+5. **rclone VFS-full OOMs on multi-GB scans**: 1 GiB limit died on
+   BROAD; 3 GiB survived CITY/BROAD but died on FULL first (25-file
+   concurrent chunk caching). It is the most byte-efficient small-query
+   cache and the most memory-hungry large-scan reader.
 
-## Options matrix
+## Sharing and persistence facts
 
-| Option | Shareable by node? | Granularity | Cold cost | Warm cost (real RTT) | Verdict |
-|---|---|---|---|---|---|
-| Mountpoint S3 CSI disk cache (**current**) | Yes — one Mountpoint pod per node when mount config is identical; disk-sized, survives process restarts | ~1 MB blocks, p50 ~170 µs | Full fetch once per node | ~0 S3, disk speed | **Keep**: only node-shared option that fits immutable Parquet ranges |
-| DuckDB 2.0 external file cache (in-memory blocks + spill) | No — per process, bounded by `memory_limit`, competes with queries | 2 MB blocks | Same as direct | ~1-1.4x loopback, ~neutral under RTT | Keep ON (default) for metadata/small wins; does not replace the disk cache |
-| DuckDB parquet/http metadata caches | No (per process) | Footers/HEADs | — | Cheap, always worth it | Keep ON (serve sets both + `NO_VALIDATION`) |
-| Kernel page cache | Per node, but memory-competing and droppable | 4 KB pages | — | Free second chance above disk cache | Comes for free; not plannable |
-| S3 Express / directory buckets | N/A (lower RTT, not a cache) | — | Lower | Lower floor for misses | Consider for miss-heavy estates; orthogonal |
-| JuiceFS / Alluxio | Yes (distributed) | Block/file | Full fetch | Disk/network speed | Rejected: own metadata/format, operational weight; no fit for plain-S3 lake layout |
-| HTTP CDN / Cachey-style sidecar | Zone-shared, but HTTP-range only | Pages | Full fetch | Fast | Rejected: incompatible with the mount/POSIX model (retired) |
-| SeaweedFS gateway cache | Shareable via Service | Chunks | Full fetch | Fast | Fallback if CSI is ever unavailable in an estate; sidecar cost |
+- Mountpoint CSI shares one Mountpoint pod per node only when PV,
+  mount options, authentication, FSGroup and pod identity match
+  ([local-cache](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#local-cache),
+  [pod sharing](https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/MOUNTPOINT_POD_SHARING.md)).
+  It clears its local-cache subdirectory at mount time and on exit.
+- CSI v2 places the cache on explicit local NVMe via generic ephemeral
+  volumes + a local StorageClass
+  ([caching](https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/CACHING.md)).
+  Ordinary `emptyDir` uses the kubelet's default medium.
+- rclone VFS-full uses sparse range caching and CAN share one mount
+  across pods on a node; never share cache dirs between independent
+  rclone processes.
+- GeeseFS has disk caching. Alluxio can cache existing plain-S3 data
+  (operational weight is the real objection). `cache_httpfs` (shared
+  on-disk blocks, process-local metadata, careful eviction) is
+  unverified against the pinned 2.0 alpha.
 
-## Cut point
+## Cut point (current default: no single winner)
 
-Cache at the **block level on the node** (mountpoint disk cache):
-file-level wastes whole 130 MB objects, row-level doesn't exist, and
-per-process memory caches can't share. DuckDB-side caches stay on for
-metadata only. Production mounts: cache ≥ dataset, `--metadata-ttl
-indefinite` (immutable snapshots), serving index pruning so each query
-touches few files.
+- **Serving (small hot pages)**: node-shared rclone VFS-full is the
+  lowest-overhead warm cache measured (zero-S3 CITY/BROAD warm) —
+  *provided* mount memory is sized for the largest concurrent scan or
+  large scans are routed elsewhere. It OOMs where mountpoint survives.
+- **Node-shared default that survives everything**: Mountpoint CSI
+  (`ephemeral` on a local-NVMe StorageClass, bounded hot-subset size,
+  long metadata TTL for immutable snapshots only). Warm CITY costs
+  ~50 ms more than direct here but shares across pods and reuses after
+  page reclaim; expect it to win on wall time once RTT is real.
+- **Bulk (FULL/DEEP/SCAN)**: direct S3 is fastest and most robust in
+  this rig; route multi-GB scans direct (or to a bulk pool) rather than
+  through any FUSE mount.
+- Keep DuckDB parquet/HTTP metadata caches on; external file cache on
+  (default) for metadata/small wins only. Kernel page cache is an
+  unplannable second chance. Production chart templates
+  (`charts/lakewing`) now expose CSI cache type/size and mount options
+  for the ephemeral-NVMe shape.
 
-## Alternative mounts (measured 2026-09-20, same rig + queries)
-
-Same 25-file lake, same DuckDB CLI, cold then warm. All byte-identical
-results (md5-verified across mounts):
-
-| Query | mountpoint cold / warm | mountpoint `--read-part-size 32M` cold / warm | rclone VFS-full cold / warm | weed native mount cold / warm |
-|---|---|---|---|---|
-| City page | 1233 / 291 ms | — | 267 / 173 ms | 354 / 203 ms |
-| Broad quarter | 8664 / 1698 ms | — | 822 / 620 ms | 1009 / 643 ms |
-| Full-region page | 32565 / 5790 ms | 10614 / 6958 ms | 2811 / 2222 ms | 2792 / 2082 ms |
-
-- **rclone mount** (`--vfs-cache-mode full`, sparse chunk cache,
-  `--vfs-read-chunk-size 16M`, `--dir-cache-time 9999h`, `--no-modtime`):
-  2-11x faster than mountpoint here. Bigger sequential chunks + read-ahead
-  + parallel streams fit DuckDB's row-group reads better than mountpoint's
-  on-demand parts. Caveats: one mount process + cache per pod (VFS cache
-  dirs are not safe to share between processes), no CSI driver — each pod
-  carries its own copy and its own FUSE process.
-- **weed native mount** (`-cacheCapacityMB`, filer protocol, no S3
-  translation): tied with rclone, the fastest option against SeaweedFS.
-  SeaweedFS-only (does not apply to AWS S3). Same per-mount cache caveat.
-- **mountpoint tuning**: `--read-part-size 32M` cut cold FULL 32.5 s →
-  10.6 s (3x); warm unchanged within noise. Worth setting; does not close
-  the gap to rclone/weed on this workload.
-- Disqualified without benchmarking: **s3fs-fuse** (slow, weak cache),
-  **goofys/geesefs** (fast streaming, no persistent disk cache — every
-  repeat pays S3), **JuiceFS/Alluxio** (own metadata/format and infra;
-  cannot adopt a plain-S3 lake layout).
-
-Recommendation stands: **mountpoint S3 CSI in AWS estates** — it is the
-only option with a truly node-shared cache (one Mountpoint pod per node
-when mount config is identical) and zero extra infrastructure, and warm
-issues ~zero S3 either way. Where per-pod caches are acceptable, rclone
-VFS-full is faster per mount; against SeaweedFS backends, weed native
-mount is fastest. Revisit if mountpoint's prefetch story improves.
+Evidence: `.tmp/cache-bench/run-20260920T022047Z/` (direct+mountpoint,
+90 hash-validated samples, csi-attachments/pods, mount logs, reclaim
+deltas, DuckDB profiles, bench Prometheus metrics, Loki logs, Tempo
+traces, mountpoint Pyroscope profiles) and
+`.tmp/cache-bench/run-20260920T024438Z/` (rclone CITY/BROAD + FULL OOM).
+Prior loopback claims ("mountpoint always wins 2–7x / zero warm GETs /
+catalog always 4–7x slower") are superseded by the table above.

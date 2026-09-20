@@ -1,7 +1,5 @@
-# Grafana LGTM (Loki + Grafana + Tempo + Mimir) all-in-one for the kind
-# rig: metrics, logs and traces backends behind one Service. The image
-# ships Grafana pre-wired to its bundled backends; Alloy (alloy.yaml)
-# scrapes lakewing /metrics into Mimir and ships pod logs into Loki.
+# Grafana's local LGTM image bundles Loki, Tempo, Prometheus and Pyroscope.
+# Alloy supplies metrics/logs; cachebench-alloy also supplies native profiles.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -69,3 +67,9 @@ spec:
     - name: pyro
       port: 4040
       targetPort: pyro
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc

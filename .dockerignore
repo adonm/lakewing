@@ -2,6 +2,7 @@
 target/
 fixtures/
 .git/
+.tmp/
 charts/
 workloads/
 README.md

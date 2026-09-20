@@ -15,7 +15,7 @@ s3bucket: lake
 catalog: sha_berlin.ducklake
 
 # One Deployment per zone; each pod mounts the bucket via the
-# mountpoint-S3-CSI driver, so the page cache is shared node-wide.
+# mountpoint-S3-CSI driver. CSI v2 shares mounts for matching PV/options/identity.
 replicasPerZone: 1
 zones:
   - az-a
@@ -39,9 +39,8 @@ dataPrefix: data
 # driver installed (s3.csi.aws.com); authentication via driver-level IRSA,
 # Pod Identity, or csi.storageSecretName. prefix scopes the mount when one
 # bucket hosts several lakes. Snapshots are immutable, so prefer an
-# indefinite metadata TTL in mountOptions (see the mountpoint CSI driver
-# docs for the exact key): warmed readers then serve fully from the
-# node-local disk cache, even through S3 outages.
+# long metadata TTL for immutable snapshot objects. Mutable refs must be
+# resolved separately. Cache capacity is a bounded hot subset of the lake.
 csi:
   # Static mountpoint-S3-CSI volume (prod). Set enabled=false for kind,
   # where the lake-lake PVC is provisioned out-of-band (hostPath, see
@@ -51,9 +50,18 @@ csi:
   volumeHandle: lake
   mountPath: /mnt/lake
   prefix: ""
-  storageClass: lakewing-mount
+  storageClass: ""
   authenticationSource: driver
   storageSecretName: ""
+  mountOptions:
+    - metadata-ttl indefinite
+    - negative-metadata-ttl minimal
+  # emptyDir uses the kubelet's storage medium. For NVMe use ephemeral
+  # plus a local-NVMe StorageClass, as in scripts/cachebench/rig.py.
+  cache:
+    type: emptyDir
+    size: 10Gi
+    storageClass: ""
 
 # DuckDB spill space: ephemeral emptyDir (counts against the pod's
 # ephemeral-storage quota and evicts with it — size for worst-case sorts,

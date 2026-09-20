@@ -1,5 +1,6 @@
 /target
 /.deps
+/.tmp/
 /fixtures
 *.db
 *.db-journal

@@ -84,11 +84,10 @@ lake-mount mnt="/tmp/opencode/mnt/lake":
 test-mount-cache *args:
     bash scripts/mount_cache_test.sh {{args}}
 
-# Side-by-side storage backends: DuckDB httpfs/S3 (2.0 external file
-# cache) vs mountpoint disk cache, same OGC-shaped queries cold + warm,
-# plus DuckLake catalog-table variants.
-bench-paths:
-    bash scripts/bench_paths.sh
+# Bounded node-NVMe cache comparison: DuckLake, actual CSI, LGTM + profiling.
+# Default creates kind lake-cache; use `run` to reuse an initialized rig.
+bench-paths *args: setup-duckdb
+    bash scripts/bench_paths.sh {{args}}
 
 # Publish a new immutable snapshot, then move a ref at it. Writes go
 # direct to S3 (never via the mount); reads resolve mount paths.
@@ -188,8 +187,7 @@ kind-seed:
 kind-bench base="http://127.0.0.1:3000" workload="workloads/berlin/mixed.txt": workloads-berlin
     python3 scripts/ogc_bench.py --base {{quote(base)}} --concurrency 8 --requests 100 --workload {{quote(workload)}}
 
-# Observability: Grafana LGTM (metrics/logs/traces backends) + Alloy
-# (scrapes lakewing /metrics into Mimir, ships pod logs into Loki).
+# Observability: Grafana LGTM + Alloy (metrics to Prometheus, logs to Loki).
 kind-obs:
     kubectl apply -f k8s/lgtm.yaml
     kubectl apply -f k8s/alloy.yaml
