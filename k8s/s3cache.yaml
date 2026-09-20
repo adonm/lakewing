@@ -1,0 +1,64 @@
+# s3cache DaemonSet: one read-through S3 slice cache per node.
+# Readers point S3_ENDPOINT at the node-local address
+# (http://$NODE_IP:8345) so every pod shares one NVMe copy.
+# No CSI driver, no FUSE mounts: plain Deployments + hostPath.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: s3cache
+  namespace: lake
+spec:
+  selector:
+    matchLabels:
+      app: s3cache
+  template:
+    metadata:
+      labels:
+        app: s3cache
+    spec:
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: s3cache
+          image: lakewing-s3cache:latest
+          args: ["s3cache"]
+          ports:
+            - name: s3
+              containerPort: 8345
+              hostPort: 8345
+            - name: metrics
+              containerPort: 8080
+          env:
+            - name: UPSTREAM
+              value: "http://seaweed.lake:8333"
+            - name: LISTEN
+              value: ":8345"
+            - name: CACHE_DIR
+              value: /cache
+            - name: CACHE_BYTES
+              value: "10737418240"
+            - name: SLICE_BYTES
+              value: "1048576"
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # Fetch buffers are slice-sized x FETCHERS; the disk budget
+              # (not RAM) holds the dataset subset. Raise with slice size.
+              cpu: "2"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              port: 8345
+              path: /healthz
+            periodSeconds: 5
+      volumes:
+        - name: cache
+          hostPath:
+            path: /nvme/s3cache
+            type: DirectoryOrCreate

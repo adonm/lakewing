@@ -89,6 +89,12 @@ test-mount-cache *args:
 bench-paths *args: setup-duckdb
     bash scripts/bench_paths.sh {{args}}
 
+# Node-local S3 slice cache (no CSI/FUSE): unit tests + image build.
+s3cache-test:
+    go test -count=1 ./internal/s3cache/
+s3cache-build:
+    docker build -f scripts/s3cache/Dockerfile -t lakewing-s3cache:dev .
+
 # Publish a new immutable snapshot, then move a ref at it. Writes go
 # direct to S3 (never via the mount); reads resolve mount paths.
 # Uploads are additive only and catalog keys are never overwritten.
