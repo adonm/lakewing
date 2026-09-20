@@ -3,5 +3,7 @@
 just = "1"
 go = "1.25"
 golangci-lint = "2"
+uv = "0.12.1"
+python = "3.12.14"
 # Optional: DuckDB CLI for poking at shard files. The app's pinned 2.0
 # nightly CLI also lands in .deps/duckdb via `just setup-duckdb`.

@@ -89,6 +89,10 @@ seaweed-down *args:
 bench-paths *args: setup-duckdb
     bash scripts/bench_paths.sh {{args}}
 
+# Indexed Lance sample gate: requires the existing kind-lake-cache rig.
+bench-lance *args: setup-duckdb
+    python scripts/lancebench/run.py {{args}}
+
 # Node-local S3 slice cache (no CSI/FUSE): unit tests + image build.
 s3cache-test:
     go test -count=1 ./internal/s3cache/
