@@ -168,7 +168,7 @@ kind-image:
 
 # Install/upgrade the whole stack (S3_DIRECT read pool + s3cache DaemonSet).
 kind-install *args:
-    helm upgrade --install lake charts/lakewing --namespace lake --create-namespace -f k8s/kind-values.yaml --set image.tag=kind --set s3cache.image.tag=kind {{args}}
+    helm upgrade --install lake charts/lakewing --namespace lake --create-namespace --kube-context kind-lake -f k8s/kind-values.yaml --set image.tag=kind --set s3cache.image.tag=kind {{args}}
 
 kind-status:
     kubectl -n lake get pods,deployments,services 2>&1 | head -30
@@ -176,20 +176,23 @@ kind-status:
 # Seed the kind lake: build the Berlin snapshot and upload it to the
 # in-chart SeaweedFS origin (catalogs/ + data/ + sidecars), then create
 # the dev S3 secret the s3cache proxy and writer sidecars read.
+# Requires `just kind-install` first (creates the seaweed Service).
 kind-seed:
     #!/usr/bin/env bash
     set -euo pipefail
+    K="kubectl --context kind-lake"
+    rm -rf /tmp/opencode/kind-seed
     go run ./cmd/lakewing build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
       --collection buildings --content-address \
       --out /tmp/opencode/kind-seed/sha_seed.ducklake \
       --data-dir /tmp/opencode/kind-seed/files \
       --data-url 's3://lake/data/'
-    kubectl create namespace lake --dry-run=client -o yaml | kubectl apply -f -
-    kubectl -n lake create secret generic lake-s3-dev \
+    $K create namespace lake --dry-run=client -o yaml | $K apply -f -
+    $K -n lake create secret generic lake-s3-dev \
       --from-literal=key_id=dev --from-literal=secret=dev-local-only \
       --from-literal=AWS_ACCESS_KEY_ID=dev --from-literal=AWS_SECRET_ACCESS_KEY=dev-local-only \
-      --dry-run=client -o yaml | kubectl apply -f -
-    kubectl -n lake port-forward svc/lake-seaweed 8333:8333 >/dev/null 2>&1 &
+      --dry-run=client -o yaml | $K apply -f -
+    $K -n lake port-forward svc/lake-seaweed 8333:8333 >/dev/null 2>&1 &
     pf=$!; trap 'kill $pf' EXIT
     sleep 2
     export RCLONE_CONFIG_LAKE_TYPE=s3 RCLONE_CONFIG_LAKE_PROVIDER=Other

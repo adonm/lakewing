@@ -17,6 +17,9 @@ spec:
         app: {{ include "lakewing.fullname" . }}-s3cache
     spec:
       hostNetwork: true
+      # hostNetwork pods inherit the node's resolv.conf; force cluster
+      # DNS so the upstream Service name resolves.
+      dnsPolicy: ClusterFirstWithHostNet
       tolerations:
         - operator: Exists
       containers:
@@ -25,11 +28,11 @@ spec:
           imagePullPolicy: {{ .Values.s3cache.image.pullPolicy }}
           args: ["s3cache"]
           ports:
+            # Single listener: S3 on :8345 with /healthz and /metrics on
+            # the same port (cmd/s3cache serves one mux).
             - name: s3
               containerPort: {{ .Values.s3cache.port }}
               hostPort: {{ .Values.s3cache.port }}
-            - name: metrics
-              containerPort: 8080
           env:
             - name: UPSTREAM
               value: {{ .Values.s3.origin | default (printf "http://%s-seaweed:8333" (include "lakewing.fullname" .)) | quote }}

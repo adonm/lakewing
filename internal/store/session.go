@@ -37,9 +37,11 @@ func setupSession(ctx context.Context, c *sql.Conn, tempDir string) error {
 	// the sole signer, so workers need no credentials here: a secret
 	// without KEY_ID gives anonymous access to the proxy.
 	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
-		secretSQL := fmt.Sprintf("CREATE SECRET s3direct (TYPE S3, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')", filter.Quote(endpoint))
+		// OR REPLACE: setupSession runs on every pooled connection of the
+		// same DuckDB instance, and secrets live per instance.
+		secretSQL := fmt.Sprintf("CREATE OR REPLACE SECRET s3direct (TYPE S3, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')", filter.Quote(endpoint))
 		if id := os.Getenv("AWS_ACCESS_KEY_ID"); id != "" {
-			secretSQL = fmt.Sprintf("CREATE SECRET s3direct (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')",
+			secretSQL = fmt.Sprintf("CREATE OR REPLACE SECRET s3direct (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')",
 				filter.Quote(id), filter.Quote(os.Getenv("AWS_SECRET_ACCESS_KEY")), filter.Quote(endpoint))
 		}
 		stmts = append(stmts, secretSQL)
