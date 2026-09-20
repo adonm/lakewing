@@ -57,9 +57,12 @@ The proxy is the **sole SigV4 signer**:
   the active query still needs, cascading into multi-second stalls
   (observed as a DuckDB HTTP timeout on DEEP under 25 ms RTT).
   `0` disables.
-- **Slice granularity** (default 1 MiB): each `Range` splits into
+- **Slice granularity** (default 4 MiB): each `Range` splits into
   aligned slices keyed `method + path` (`?x-id` SDK telemetry stripped
-  from the key, forwarded upstream verbatim). Length comes from the
+  from the key, forwarded upstream verbatim). 1 MiB slices cost 2x the
+  GET count of DuckDB's native ranges under RTT; 4 MiB matches direct
+  on bulk-first (FULL 3.1 s vs 3.5 s) and beats it on SCAN, at the cost
+  of coarser overfetch on small cold ranges (CITY first 147 vs 81 MiB). Length comes from the
   first fetched slice's `Content-Range` — no second request shape.
   Full GETs assemble from slices; nothing larger than a slice is ever
   buffered in RAM.
@@ -67,7 +70,7 @@ The proxy is the **sole SigV4 signer**:
   range GETs of FULL scans fetch each slice once), atomic
   `.tmp`→rename publish, fd-pinned serving safe against eviction.
 - **Serve path**: pooled 1 MiB copy buffers (one disk read + one
-  socket write per slice); per-slice flush streams progressively.
+  socket write per MiB); per-slice flush streams progressively.
 - **Bounded**: synchronous LRU over `CACHE_BYTES` (hot subset for a PB
   lake); object-length map bounded at 64K entries; oversized objects
   stay correct via on-demand refetch.

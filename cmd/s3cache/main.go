@@ -6,7 +6,7 @@
 // LISTEN       listen address, default :8080
 // CACHE_DIR    disk dir, default /cache (mount NVMe here)
 // CACHE_BYTES  disk budget, default 10737418240 (10 GiB)
-// SLICE_BYTES  slice size, default 1048576 (1 MiB)
+// SLICE_BYTES  slice size, default 4194304 (4 MiB)
 // FETCHERS     concurrent upstream slice fetches, default 32
 // READAHEAD    slices prefetched past a served range, default 4 (0=off)
 // S3_KEY_ID    proxy-held S3 credential; the proxy is the sole signer
@@ -49,7 +49,7 @@ func main() {
 		Upstream:   upstream,
 		CacheDir:   env("CACHE_DIR", "/cache"),
 		MaxBytes:   bytesEnv("CACHE_BYTES", 10<<30),
-		SliceBytes: bytesEnv("SLICE_BYTES", 1<<20),
+		SliceBytes: bytesEnv("SLICE_BYTES", 4<<20),
 		Fetchers:   int(bytesEnv("FETCHERS", 32)),
 		ReadAhead:  int(bytesEnv("READAHEAD", 4)),
 		KeyID:      os.Getenv("S3_KEY_ID"),

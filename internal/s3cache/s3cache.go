@@ -53,7 +53,7 @@ type Config struct {
 func (c *Config) withDefaults() Config {
 	out := *c
 	if out.SliceBytes <= 0 {
-		out.SliceBytes = 1 << 20
+		out.SliceBytes = 4 << 20
 	}
 	if out.Fetchers <= 0 {
 		out.Fetchers = 32

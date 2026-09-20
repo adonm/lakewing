@@ -46,7 +46,7 @@ spec:
             - name: CACHE_BYTES
               value: "10737418240"
             - name: SLICE_BYTES
-              value: "1048576"
+              value: "4194304"
             - name: READAHEAD
               value: "4"
             # The proxy is the sole S3 signer: workers carry no S3
