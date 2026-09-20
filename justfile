@@ -3,21 +3,26 @@
 # the preview binding's bundled engine is 1.5.x and cannot open 2.0
 # catalogs, so every Go command builds with duckdb_use_lib.
 DUCKDB_DIR := justfile_directory() + "/.deps/duckdb"
-export CGO_LDFLAGS := "-L" + DUCKDB_DIR
+LANCE_DIR := justfile_directory() + "/.deps/lance-go"
+export CGO_LDFLAGS := "-L" + DUCKDB_DIR + " -L" + LANCE_DIR
 export LD_LIBRARY_PATH := DUCKDB_DIR
 export DYLD_LIBRARY_PATH := DUCKDB_DIR
 export GOFLAGS := "-tags=duckdb_use_lib,duckdb_arrow"
+export CGO_CFLAGS := "-I" + LANCE_DIR
 # DuckDB spills temp files under the working directory on memory pressure;
 # keep them out of the repo.
 export TMPDIR := "/tmp/opencode"
 
 default: check
 
-setup: setup-duckdb
+setup: setup-duckdb setup-lance-go
     go mod download
 
 setup-duckdb:
     python3 scripts/setup_duckdb.py
+
+setup-lance-go:
+    python3 scripts/setup_lance_go.py
 
 check: setup-duckdb
     gofmt -l cmd internal

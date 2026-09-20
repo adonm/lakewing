@@ -538,21 +538,35 @@ func itemsHandler(ctx huma.Context, st *store.Store) {
 	}
 	href := req.Href()
 	heavy := plan.IsHeavy(uint32(limit), pagination, bounds)
-	from := st.ReadSource(bounds)
 	fetch := store.Predicate(collection, bounds, sources)
 	pageWhere, pageTail := plan.PageParts(fetch, uint32(limit), pagination)
-	query := plan.ItemsSQL(req, pageWhere+" "+pageTail, from)
 	// Two-phase only for deep offsets: OFFSET forces a total sort, where
 	// narrow-id sort + join-back wins. Cursor/limit pages use top-N
 	// heapsort and a second scan would only add probe overhead.
-	if pagination.Cursor == nil && pagination.Offset >= 1000 {
-		query = plan.HeavyItemsSQL(from, pageWhere, pageTail)
+	deep := pagination.Cursor == nil && pagination.Offset >= 1000
+	var query string
+	if st.Lance() == nil {
+		from := st.ReadSource(bounds)
+		query = plan.ItemsSQL(req, pageWhere+" "+pageTail, from)
+		if deep {
+			query = plan.HeavyItemsSQL(from, pageWhere, pageTail)
+		}
 	}
 
 	type row struct{ id, geom, props string }
 	var rows []row
 	qerr := st.Query(ctx.Context(), heavy, func(qctx context.Context, c *sql.Conn) error {
-		r, err := c.QueryContext(qctx, query)
+		run := query
+		if st.Lance() != nil {
+			q, drop, err := lanceItemsQuery(qctx, st, c, collection, bounds, sources,
+				pageWhere, pageTail, deep, int(limit), pagination.Offset)
+			if err != nil {
+				return err
+			}
+			defer drop()
+			run = q
+		}
+		r, err := c.QueryContext(qctx, run)
 		if err != nil {
 			return err
 		}
@@ -664,7 +678,16 @@ func itemHandler(ctx huma.Context, st *store.Store) {
 	var rawID string
 	var geomRaw, propsRaw any
 	qerr := st.Query(ctx.Context(), false, func(qctx context.Context, c *sql.Conn) error {
-		return c.QueryRowContext(qctx, query).Scan(&rawID, &geomRaw, &propsRaw)
+		run := query
+		if st.Lance() != nil {
+			q, drop, err := lanceItemQuery(qctx, st, c, id, collection, sources)
+			if err != nil {
+				return err
+			}
+			defer drop()
+			run = q
+		}
+		return c.QueryRowContext(qctx, run).Scan(&rawID, &geomRaw, &propsRaw)
 	})
 	if qerr != nil {
 		if qerr == sql.ErrNoRows {

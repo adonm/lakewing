@@ -23,6 +23,7 @@ import (
 
 	"github.com/adonm/lakewing/internal/filter"
 	"github.com/adonm/lakewing/internal/flight"
+	"github.com/adonm/lakewing/internal/lance"
 	"github.com/adonm/lakewing/internal/materialize"
 	"github.com/adonm/lakewing/internal/ogc"
 	"github.com/adonm/lakewing/internal/store"
@@ -114,13 +115,15 @@ func indexCmd() *cobra.Command {
 	cmd.Flags().StringVar(&shard, "shard", "", "catalog path (mount path)")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "data root (mount path)")
 	cmd.Flags().StringVar(&out, "out", "", "output sidecar (default <shard>.serving.json)")
-	_ = cmd.MarkFlagRequired("shard")
+		_ = cmd.MarkFlagRequired("shard")
 	_ = cmd.MarkFlagRequired("data-dir")
 	return cmd
 }
 
 func serveCmd() *cobra.Command {
 	var shard, dataRoot string
+	var lanceURI, lanceTag, lanceEndpoint string
+	var lanceVersion uint64
 	var listen, flightListen string
 	var connections int
 	var maxWaitMS uint64
@@ -147,8 +150,25 @@ func serveCmd() *cobra.Command {
 				// small value only to cap CPU on shared boxes.
 				threads = int64(runtime.NumCPU())
 			}
+			var lanceCfg *lance.Config
+			if lanceURI != "" {
+				storage := map[string]string{}
+				if lanceEndpoint != "" {
+					// Unsigned reads through the node-local s3cache proxy.
+					storage = map[string]string{
+						"endpoint":                     lanceEndpoint,
+						"allow_http":                   "true",
+						"virtual_hosted_style_request": "false",
+						"skip_signature":               "true",
+						"region":                       "us-east-1",
+					}
+				}
+				lanceCfg = &lance.Config{URI: lanceURI, Tag: lanceTag,
+					Version: lanceVersion, StorageOptions: storage}
+			}
 			st, err := store.Open(ctx, store.Config{
 				Location: shard, DataRoot: dataRoot,
+				Lance:          lanceCfg,
 				Connections: connections, MaxWaiters: maxWaiters,
 				MaxWait:   time.Duration(maxWaitMS) * time.Millisecond,
 				BulkLimit: bulkLimit, Threads: threads, MemoryMB: memoryMB,
@@ -160,6 +180,9 @@ func serveCmd() *cobra.Command {
 			}
 			defer func() { _ = st.Close() }()
 			slog.Info("serving shard", "shard", shard, "snapshot", st.Snapshot, "http", listen, "flight", flightListen)
+			if st.Lance() != nil {
+				slog.Info("lance feature source", "uri", lanceURI, "version", st.Lance().Version(cmd.Context()))
+			}
 
 			router := chi.NewMux()
 			cfg := huma.DefaultConfig("lakewing", "0.1.0")
@@ -207,6 +230,10 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().Uint64Var(&memoryMB, "memory-mb", 4096, "shared DuckDB memory MiB (0 = default)")
 	cmd.Flags().Uint64Var(&queryTimeoutMS, "query-timeout-ms", 30000, "query deadline ms (0 = none)")
 	cmd.Flags().StringVar(&tempDir, "temp-dir", "", "DuckDB spill dir (empty = engine default; point at ephemeral storage in k8s)")
-	_ = cmd.MarkFlagRequired("shard")
+		cmd.Flags().StringVar(&lanceURI, "lance-uri", "", "optional Lance dataset serving items/item lookups (hybrid with the DuckLake catalog)")
+	cmd.Flags().StringVar(&lanceTag, "lance-tag", "", "pin the Lance dataset by tag")
+	cmd.Flags().Uint64Var(&lanceVersion, "lance-version", 0, "pin the Lance dataset by version (tag wins)")
+	cmd.Flags().StringVar(&lanceEndpoint, "lance-endpoint", "", "unsigned S3 endpoint for the Lance dataset (node-local s3cache)")
+_ = cmd.MarkFlagRequired("shard")
 	return cmd
 }

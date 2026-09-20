@@ -28,6 +28,7 @@ import (
 	"github.com/adonm/lakewing/internal/dbutil"
 	"github.com/adonm/lakewing/internal/filter"
 	"github.com/adonm/lakewing/internal/index"
+	"github.com/adonm/lakewing/internal/lance"
 )
 
 // StoreError mirrors store::Error.
@@ -93,6 +94,10 @@ type Config struct {
 	// Empty leaves the engine default (process TMPDIR). In kind/k8s this
 	// points at the ephemeral emptyDir volume.
 	TempDir string
+	// Lance optionally adds an indexed Lance dataset as the feature source
+	// for items/item lookups. The DuckLake catalog still pins the snapshot
+	// and serves collections/tiles/flight (hybrid store).
+	Lance *lance.Config
 }
 
 // ResolvedIndex is a trusted serving index over data file URLs.
@@ -110,6 +115,7 @@ type Store struct {
 
 	fallbackFrom string
 	index        *ResolvedIndex
+	lance        *lance.Source
 
 	mu     sync.Mutex
 	pool   []*sql.Conn
@@ -560,6 +566,17 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	s.Collections = collections
 	s.pool = pool
+	if cfg.Lance != nil {
+		src, err := lance.Open(ctx, *cfg.Lance)
+		if err != nil {
+			for _, p := range pool {
+				p.Close()
+			}
+			db.Close()
+			return nil, Backend(err.Error())
+		}
+		s.lance = src
+	}
 	if raw, err := os.ReadFile(cfg.Location + ".manifest.json"); err == nil {
 		var m ShardManifest
 		if jerr := json.Unmarshal(raw, &m); jerr == nil {
@@ -716,6 +733,9 @@ func (s *Store) Query(ctx context.Context, bulk bool, fn func(ctx context.Contex
 
 // Close drains the pool.
 func (s *Store) Close() error {
+	if s.lance != nil {
+		s.lance.Close()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, c := range s.pool {
@@ -724,3 +744,7 @@ func (s *Store) Close() error {
 	s.pool = nil
 	return s.db.Close()
 }
+
+// Lance reports the indexed Lance feature source, or nil when the store
+// serves from Parquet only.
+func (s *Store) Lance() *lance.Source { return s.lance }
