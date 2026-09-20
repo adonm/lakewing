@@ -234,14 +234,21 @@ class Bench:
             geom = "CASE WHEN was_polygon THEN (ST_Dump(geom)[1]).geom ELSE geom END" if backend == "geo" else "ST_GeomFromWKB(geom)"
             self.db.execute(f"CREATE OR REPLACE TEMP VIEW verify_rows AS SELECT * REPLACE ({geom} AS geom) FROM all_rows")
             table = "verify_rows"
+        # Order-free digest (XOR/sum fold of per-row hashes): a full ORDER BY
+        # over 25M rows exceeds the 1GB query limit, and order-independence
+        # needs no sorter at all. Streaming keeps memory constant.
         self.db.execute(f"SELECT id,layer,source_id,hex(ST_AsWKB(geom)),properties::VARCHAR,"
-                        f"sortkey,xmin,ymin,xmax,ymax,cx,cy,name FROM {table} ORDER BY id")
-        digest, count = hashlib.sha256(), 0
+                        f"sortkey,xmin,ymin,xmax,ymax,cx,cy,name FROM {table}")
+        fold, total, count = 0, 0, 0
         while rows := self.db.fetchmany(8192):
             for row in rows:
-                digest.update(json.dumps(row, separators=(",", ":"), ensure_ascii=False).encode() + b"\n")
-            count += len(rows)
-        return {"rows": count, "sha256": digest.hexdigest()}
+                row_hash = int.from_bytes(hashlib.sha256(
+                    json.dumps(row, separators=(",", ":"), ensure_ascii=False).encode()
+                ).digest()[:16], "big")
+                fold ^= row_hash
+                total = (total + row_hash) % 2**128
+                count += 1
+        return {"rows": count, "sha256": f"{fold:032x}", "row_sum": f"{total:032x}"}
 
     def sdk(self, ds, backend, spec, use_index=True, ids_first=False):
         where, bounds, limit, offset = spec

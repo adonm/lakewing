@@ -25,50 +25,68 @@ def main():
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--queries", default="ID,CITY,BROAD,FULL,CURSOR,DEEP")
     parser.add_argument("--backends", default="ducklake,wkb,geo,wkb_ids,geo_ids")
+    parser.add_argument("--phases", default="local,s3", help="resume support: e.g. --phases s3")
+    parser.add_argument("--name", help="existing run directory name to resume")
     args = parser.parse_args()
+    if not set(args.phases.split(",")) <= {"local", "s3"}:
+        raise SystemExit("--phases must be a subset of local,s3")
     rig = Rig(args)
-    name = "run-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = args.name or "run-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = rig.root / "reader/lancebench" / name
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
     backing = json.loads(command("findmnt", "-J", "-T", str(root), "-o", "TARGET,SOURCE,FSTYPE", capture=True))["filesystems"][0]
     if backing["fstype"] in ("tmpfs", "ramfs", "overlay"):
         raise RuntimeError(f"expected disk backing: {backing}")
     catalog = ROOT / "fixtures/nw-europe.ducklake"
-    selection = "true" if args.full else "hash(id)%128=0 OR (xmax>=4.85 AND xmin<=4.95 AND ymax>=52.3 AND ymin<=52.4)"
-    sql = f"""LOAD spatial; LOAD ducklake; SET threads=4; SET memory_limit='4GB';
-SET temp_directory='{root}/prepare-spill';
-ATTACH 'ducklake:{catalog}' AS lake (READ_ONLY, DATA_PATH '{ROOT}/fixtures/nw-europe.files/', OVERRIDE_DATA_PATH true);
-COPY (SELECT id,layer,source_id,ST_AsWKB(geom) AS geom,properties::VARCHAR AS properties,
-sortkey,xmin,ymin,xmax,ymax,cx,cy,name FROM lake.features AT (VERSION => {args.snapshot})
-WHERE {selection}
-ORDER BY sortkey,id) TO '{root}/source.parquet' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 65536);
-"""
-    (root / "prepare.sql").write_text(sql)
-    command(str(ROOT / ".deps/duckdb/duckdb"), "-batch", "-bail", ":memory:", "-c", sql)
-    provenance = {"catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
-                  "snapshot": args.snapshot, "backing": backing,
-                  "source_sha256": hashlib.sha256((root / "source.parquet").read_bytes()).hexdigest(),
-                  "source_engine": command(str(ROOT / ".deps/duckdb/duckdb"), "--version", capture=True),
-                  "selection": selection, "order": "sortkey,id",
-                  "pod_cpu": "4", "pod_memory": "6Gi", "cache_bytes": 32 * 1024**2,
-                  "external_file_cache": args.external_file_cache,
-                  "s3_delay": json.loads(rig.kube("-n", "lake-bench", "get", "pod", "s3-delay", "-o", "json", capture=True))["spec"]["containers"][0]["env"],
-                  "notes": "SDK gate; query surfaces, not production Go HTTP endpoints; no OS cache eviction"}
-    (root / "provenance.json").write_text(json.dumps(provenance, indent=2))
+    if not (root / "source.parquet").exists():
+        selection = "true" if args.full else "hash(id)%128=0 OR (xmax>=4.85 AND xmin<=4.95 AND ymax>=52.3 AND ymin<=52.4)"
+        sql = f"""LOAD spatial; LOAD ducklake; SET threads=4; SET memory_limit='4GB';
+    SET temp_directory='{root}/prepare-spill';
+    ATTACH 'ducklake:{catalog}' AS lake (READ_ONLY, DATA_PATH '{ROOT}/fixtures/nw-europe.files/', OVERRIDE_DATA_PATH true);
+    COPY (SELECT id,layer,source_id,ST_AsWKB(geom) AS geom,properties::VARCHAR AS properties,
+    sortkey,xmin,ymin,xmax,ymax,cx,cy,name FROM lake.features AT (VERSION => {args.snapshot})
+    WHERE {selection}
+    ORDER BY sortkey,id) TO '{root}/source.parquet' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 65536);
+    """
+        (root / "prepare.sql").write_text(sql)
+        command(str(ROOT / ".deps/duckdb/duckdb"), "-batch", "-bail", ":memory:", "-c", sql)
+        provenance = {"catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+                      "snapshot": args.snapshot, "backing": backing,
+                      "source_sha256": hashlib.sha256((root / "source.parquet").read_bytes()).hexdigest(),
+                      "source_engine": command(str(ROOT / ".deps/duckdb/duckdb"), "--version", capture=True),
+                      "selection": selection, "order": "sortkey,id",
+                      "pod_cpu": "4", "pod_memory": "6Gi", "cache_bytes": 32 * 1024**2,
+                      "external_file_cache": args.external_file_cache,
+                      "s3_delay": json.loads(rig.kube("-n", "lake-bench", "get", "pod", "s3-delay", "-o", "json", capture=True))["spec"]["containers"][0]["env"],
+                      "notes": "SDK gate; query surfaces, not production Go HTTP endpoints; no OS cache eviction"}
+        (root / "provenance.json").write_text(json.dumps(provenance, indent=2))
     command("docker", "build", "-f", str(ROOT / "scripts/lancebench/Dockerfile"), "-t", IMAGE, str(ROOT))
     command("kind", "load", "docker-image", IMAGE, "--name", args.cluster)
     volume = [{"name": "work", "hostPath": {"path": f"/nvme/lancebench/{name}"}}]
     mounts = [{"name": "work", "mountPath": "/work"}]
-    for phase in ("local", "s3"):
+    build_targets = ["parquet.ducklake", "parquet.files", "wkb.lance", "geo.lance"]
+    need_build = not all((root / target).exists() for target in build_targets)
+    for phase in args.phases.split(","):
         pod_name = "lance-" + phase
+        phase_log = root / f"{phase}.jsonl"
+        if phase_log.exists():
+            attempt = 1
+            while (root / f"{phase}.attempt{attempt}.jsonl").exists():
+                attempt += 1
+            phase_log.rename(root / f"{phase}.attempt{attempt}.jsonl")
         argv = ["--root", "/work", "--label", phase, "--repeats", str(args.repeats),
                 "--queries", args.queries, "--backends", args.backends,
                 "--otlp", "http://lgtm.monitoring.svc.cluster.local:4318/v1/traces"]
         if not args.external_file_cache:
             argv.append("--no-external-file-cache")
         if phase == "local":
-            argv += ["--build", "--source", "/work/source.parquet"]
+            if need_build:
+                if not (root / "source.parquet").exists():
+                    raise SystemExit("local build needs source.parquet; prepare first")
+                argv += ["--build", "--source", "/work/source.parquet"]
         else:
+            if need_build:
+                raise SystemExit("s3 phase needs built datasets; run the local phase first")
             seed = rig.pod("lance-seed", {"name": "seed", "image": "lakewing-cachebench:dev",
                 "command": ["sh", "-ec", "\n".join([
                     f"rclone copy /work/{d} lake:lake/lancebench/{name}/{d}" for d in ("parquet.files", "wkb.lance", "geo.lance")
