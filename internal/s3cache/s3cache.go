@@ -54,7 +54,7 @@ type Config struct {
 func (c *Config) withDefaults() Config {
 	out := *c
 	if out.SliceBytes <= 0 {
-		out.SliceBytes = 4 << 20
+		out.SliceBytes = 1 << 20
 	}
 	if out.Fetchers <= 0 {
 		out.Fetchers = 32
@@ -196,14 +196,28 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.URL.EscapedPath()
 	ctx := r.Context()
-	// Learn the object length from the first needed slice's Content-Range
-	// instead of an upstream HEAD: fewer origin trips and no second
-	// request shape to get wrong.
-	probe := int64(0)
-	if lo, hi, multipart, err := splitRange(r.Header.Get("Range")); err == nil && !multipart && hi >= 0 {
-		probe = lo / p.cfg.SliceBytes
+	header := r.Header.Get("Range")
+	lo, hi, multipart, err := splitRange(header)
+	if err != nil || multipart {
+		p.passthrough(w, r)
+		return
 	}
-	if err := p.fetchSlice(ctx, obj, path, probe); err != nil {
+	sz := p.cfg.SliceBytes
+	// Fetch exactly the slices this request needs — as one coalesced
+	// span when they are contiguous — and learn the object length from
+	// the span's Content-Range (no upstream HEAD, no separate probe).
+	// splitRange: lo==0/hi==-1 covers both absent header and suffix
+	// ("-n", head probe); start- open ranges probe their first slice.
+	var first, last int64
+	switch {
+	case header == "" || (lo == 0 && hi < 0):
+		first, last = 0, 0 // absent header / suffix: probe head for length
+	case hi < 0:
+		first, last = lo/sz, lo/sz
+	default:
+		first, last = lo/sz, hi/sz
+	}
+	if _, err := p.ensureSlices(ctx, obj, path, first, last); err != nil {
 		p.passthrough(w, r)
 		return
 	}
@@ -212,7 +226,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		p.passthrough(w, r)
 		return
 	}
-	start, end, err := parseRange(r.Header.Get("Range"), length)
+	start, end, err := parseRange(header, length)
 	switch {
 	case err == nil:
 	case errors.Is(err, errMultipartRange):
@@ -223,7 +237,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
-	if r.Header.Get("Range") == "" {
+	if header == "" {
 		p.serveFull(w, r, obj, path, length)
 		return
 	}
@@ -237,7 +251,7 @@ func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj, path stri
 		w.Header().Set("Content-Type", "application/octet-stream")
 		return
 	}
-	allHit, err := p.ensureSlices(r.Context(), obj, path, 0, length-1)
+	allHit, err := p.ensureSlices(r.Context(), obj, path, 0, (length-1)/p.cfg.SliceBytes)
 	if err != nil {
 		p.passthrough(w, r)
 		return
@@ -255,7 +269,7 @@ func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj, path stri
 }
 
 func (p *Proxy) serveRange(w http.ResponseWriter, r *http.Request, obj, path string, length, start, end int64) {
-	allHit, err := p.ensureSlices(r.Context(), obj, path, start, end)
+	allHit, err := p.ensureSlices(r.Context(), obj, path, start/p.cfg.SliceBytes, end/p.cfg.SliceBytes)
 	if err != nil {
 		p.passthrough(w, r)
 		return

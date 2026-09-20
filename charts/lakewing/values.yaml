@@ -46,7 +46,7 @@ s3cache:
     tag: latest
     pullPolicy: IfNotPresent
   cacheBytes: "10737418240"
-  sliceBytes: "4194304"
+  sliceBytes: "1048576"
   readahead: "4"
   port: 8345
   resources: {}

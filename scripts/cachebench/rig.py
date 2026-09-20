@@ -432,7 +432,7 @@ def main():
                         help="subset of DuckLake query shapes (SCAN pollution phase always runs)")
     parser.add_argument("--s3-latency-ms", type=int, default=25)
     parser.add_argument("--s3-latency-jitter-ms", type=int, default=5)
-    parser.add_argument("--slice-bytes", type=int, default=4194304)
+    parser.add_argument("--slice-bytes", type=int, default=1048576)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
     if args.repeats < 1 or not 1 <= args.cache_mib <= 1024 or args.s3_latency_ms < 0 or args.s3_latency_jitter_ms < 0 or args.slice_bytes < 65536 or any(b not in {"direct", "local", "proxy"} for b in args.backends.split(",")) or any(q not in {"CITY", "BROAD", "FULL", "DEEP"} for q in args.queries.split(",")):

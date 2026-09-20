@@ -36,6 +36,8 @@ type origin struct {
 	auths  map[string]int
 }
 
+var originLog []string
+
 func newOrigin(size int) *origin {
 	data := make([]byte, size)
 	for i := range data {
@@ -83,6 +85,7 @@ func (o *origin) handler() http.Handler {
 			}()
 			o.gets.Add(1)
 			rg := r.Header.Get("Range")
+			originLog = append(originLog, rg)
 			o.mu.Lock()
 			o.ranges = append(o.ranges, rg)
 			o.mu.Unlock()
@@ -225,28 +228,39 @@ func TestSingleflightCollapses(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if n := o.gets.Load(); n != 2 {
-		t.Fatalf("expected 2 slice fetches, got %d", n)
+	if n := o.gets.Load(); n != 1 {
+		t.Fatalf("expected 1 coalesced origin GET for one 2 KiB range, got %d", n)
 	}
 }
 
-// Slices within one request fetch in parallel: peak in-flight upstream
-// GETs must exceed 1 for a multi-slice range behind a slow origin.
-func TestParallelSliceFetch(t *testing.T) {
+// Slices within one request coalesce: a contiguous multi-slice range
+// is fetched as ONE upstream ranged GET (the request-count fix), which
+// is why peak in-flight is 1 and wall time is one latency, not 8.
+func TestSpanCoalescing(t *testing.T) {
 	o := newOrigin(8192)
 	o.latency = 30 * time.Millisecond
 	_, front := testProxy(t, o, 1<<20, func(c *Config) { c.Fetchers = 8 })
+	originLog = nil
 	start := time.Now()
 	code, body := get(t, front+"/b/f.parquet", "bytes=0-8191", "sig")
 	if code != 206 || string(body) != string(o.data) {
-		t.Fatalf("parallel range: code=%d len=%d", code, len(body))
+		t.Fatalf("span range: code=%d len=%d", code, len(body))
 	}
 	if elapsed := time.Since(start); elapsed > 8*o.latency {
-		t.Fatalf("8 slices took %s; fetches look serial", elapsed)
+		t.Fatalf("8 slices took %s; span GET did not coalesce", elapsed)
 	}
-	if peak := o.peak.Load(); peak < 2 {
-		t.Fatalf("peak in-flight=%d; slices fetched serially", peak)
+	if n := o.gets.Load(); n != 1 {
+		t.Fatalf("expected 1 coalesced origin GET, got %d (ranges=%v)", n, o.ranges)
 	}
+	// A sub-range of the cached span now costs zero origin GETs.
+	before := o.gets.Load()
+	if code, _ := get(t, front+"/b/f.parquet", "bytes=100-999", "sig"); code != 206 {
+		t.Fatal("sub-range failed")
+	}
+	if o.gets.Load() != before {
+		t.Fatalf("sub-range of cached span refetched origin: %v", originLog)
+	}
+	t.Logf("span GET ranges: %v", originLog)
 }
 
 // Read-ahead: after serving a range, the next slices of the same object
