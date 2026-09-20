@@ -1,17 +1,17 @@
 // Package s3cache is a node-local read-through S3 cache for DuckDB
 // workers: fixed-size immutable slices shared by every pod on the node.
 //
-// Trust boundary: the proxy holds no credentials of its own in v1. It
-// forwards the client's SigV4 headers (Authorization, X-Amz-*) to the
-// upstream on a miss and excludes them from the cache key, so all pods
-// share one copy. This works against S3-compatible stores that validate
-// key/secret rather than the signed host (SeaweedFS, MinIO) and public
-// buckets. Strict AWS (host-bound signatures) needs proxy-side
-// re-signing, intentionally left as a follow-up: see README.
+// Trust boundary: the proxy is the sole SigV4 signer. Workers may
+// authenticate to it however the cluster likes (or not at all) — their
+// Authorization never travels upstream and is never part of the cache
+// key. The proxy holds the single S3 credential and signs everything it
+// forwards, so client auth is one env var on the DaemonSet instead of
+// credentials in every worker pod.
 package s3cache
 
 import (
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -33,10 +33,19 @@ type Config struct {
 	CacheDir   string
 	MaxBytes   int64
 	SliceBytes int64
-	// Fetchers bounds concurrent upstream slice fetches.
+	// Fetchers bounds concurrent upstream slice fetches; slices within
+	// one request are fetched in parallel up to this limit.
 	Fetchers int
-	Timeout  time.Duration
-	Client   *http.Client
+	// ReadAhead prefetches this many subsequent slices after a served
+	// range, off the serving path. 0 disables.
+	ReadAhead int
+	Timeout   time.Duration
+	Client    *http.Client
+	// KeyID/Secret/Region sign upstream requests. Empty KeyID means an
+	// unsigned (anonymous) origin.
+	KeyID  string
+	Secret string
+	Region string
 }
 
 func (c *Config) withDefaults() Config {
@@ -51,12 +60,7 @@ func (c *Config) withDefaults() Config {
 		out.Timeout = 60 * time.Second
 	}
 	if out.Client == nil {
-		out.Client = &http.Client{
-			Timeout: out.Timeout,
-			// Preserve the client's Accept-Encoding verbatim: it is
-			// commonly part of the SigV4 signed header set.
-			Transport: &http.Transport{DisableCompression: true},
-		}
+		out.Client = &http.Client{Timeout: out.Timeout}
 	}
 	return out
 }
@@ -70,8 +74,9 @@ type entry struct {
 
 // Proxy serves S3 GETs from disk slices, passing everything else through.
 type Proxy struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg    Config
+	mux    *http.ServeMux
+	signer *signer
 
 	mu    sync.Mutex
 	lru   *list.List
@@ -81,6 +86,7 @@ type Proxy struct {
 	flightsMu sync.Mutex
 	flights   map[string]*flight
 	sem       chan struct{}
+	prefetch  chan struct{}
 
 	totalsMu sync.Mutex
 	totals   map[string]int64 // object key -> length from Content-Range
@@ -114,11 +120,15 @@ func New(cfg Config) (*Proxy, error) {
 	p := &Proxy{
 		cfg:     cfg,
 		mux:     http.NewServeMux(),
+		signer:  newSigner(cfg.KeyID, cfg.Secret, cfg.Region),
 		lru:     list.New(),
 		index:   map[string]*list.Element{},
 		flights: map[string]*flight{},
 		totals:  map[string]int64{},
 		sem:     make(chan struct{}, cfg.Fetchers),
+	}
+	if cfg.ReadAhead > 0 {
+		p.prefetch = make(chan struct{}, cfg.ReadAhead)
 	}
 	p.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") })
 	p.mux.HandleFunc("GET /metrics", p.serveMetrics)
@@ -128,11 +138,9 @@ func New(cfg Config) (*Proxy, error) {
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) { p.mux.ServeHTTP(w, r) }
 
-// objectKey identifies the S3 object; auth headers are deliberately
-// excluded so pods share entries. Only plain object GETs are sliced:
-// LIST and other query-string operations pass through, except the
-// SDK telemetry param (rclone's ?x-id=GetObject), which is stripped
-// from the key but still forwarded upstream byte-identical.
+// objectKey identifies the S3 object. Only plain object GETs are sliced:
+// LIST and other query-string operations pass through. The SDK telemetry
+// param (?x-id=…) is stripped from the key but still forwarded upstream.
 func objectKey(r *http.Request) (string, bool) {
 	if r.Method != http.MethodGet {
 		return "", false
@@ -210,6 +218,38 @@ func parseRange(header string, length int64) (int64, int64, error) {
 	return start, end, nil
 }
 
+// splitRange structurally parses a Range header without validating
+// against a length: returns lo, hi (hi=-1 when open-ended/absent),
+// multipart flag, and syntax errors.
+func splitRange(header string) (int64, int64, bool, error) {
+	if header == "" {
+		return 0, -1, false, nil
+	}
+	rest, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return 0, 0, false, fmt.Errorf("unsupported range unit")
+	}
+	if strings.Contains(rest, ",") {
+		return 0, 0, true, nil
+	}
+	lo, hi, _ := strings.Cut(rest, "-")
+	if lo == "" {
+		return 0, -1, false, nil // suffix; needs length
+	}
+	start, err := strconv.ParseInt(lo, 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, false, fmt.Errorf("bad range start")
+	}
+	if hi == "" {
+		return start, -1, false, nil
+	}
+	end, err := strconv.ParseInt(hi, 10, 64)
+	if err != nil || end < start {
+		return 0, 0, false, fmt.Errorf("bad range end")
+	}
+	return start, end, false, nil
+}
+
 // get returns an open file for a cached slice (hit path is TOCTOU-safe:
 // the fd pins the bytes even if eviction unlinks the path).
 func (p *Proxy) get(key string) (*os.File, int64, bool) {
@@ -256,7 +296,7 @@ func (p *Proxy) insert(key, path string, size int64) {
 
 // fetchSlice downloads one aligned slice; concurrent fetchers collapse
 // onto a single upstream GET via per-slice singleflight.
-func (p *Proxy) fetchSlice(r *http.Request, obj string, i int64) error {
+func (p *Proxy) fetchSlice(ctx context.Context, obj, path string, i int64) error {
 	key := sliceKey(obj, i)
 	if f, _, ok := p.get(key); ok {
 		f.Close()
@@ -269,7 +309,7 @@ func (p *Proxy) fetchSlice(r *http.Request, obj string, i int64) error {
 		p.flights[key] = fl
 		go func() {
 			defer close(fl.done)
-			fl.err = p.downloadSlice(r, obj, i)
+			fl.err = p.downloadSlice(ctx, obj, path, i)
 			p.flightsMu.Lock()
 			delete(p.flights, key)
 			p.flightsMu.Unlock()
@@ -280,31 +320,28 @@ func (p *Proxy) fetchSlice(r *http.Request, obj string, i int64) error {
 	return fl.err
 }
 
-func (p *Proxy) downloadSlice(r *http.Request, obj string, i int64) error {
-	if f, _, ok := p.get(objKeyMust(obj, i)); ok {
+func (p *Proxy) downloadSlice(ctx context.Context, obj, path string, i int64) error {
+	key := sliceKey(obj, i)
+	if f, _, ok := p.get(key); ok {
 		f.Close()
 		return nil
 	}
 	select {
 	case p.sem <- struct{}{}:
 		defer func() { <-p.sem }()
-	case <-r.Context().Done():
-		return r.Context().Err()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	lo := i * p.cfg.SliceBytes
 	hi := lo + p.cfg.SliceBytes - 1
 	target := *p.cfg.Upstream
-	target.Path = singleJoin(target.Path, r.URL.EscapedPath())
-	target.RawQuery = r.URL.RawQuery
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	target.Path = singleJoin(target.Path, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return err
 	}
-	forwardHeaders(req, r)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", lo, hi))
-	// Preserve the incoming Host like the bench meter does: it is part
-	// of the client's SigV4 signature.
-	req.Host = r.Host
+	p.signer.sign(req)
 	resp, err := p.cfg.Client.Do(req)
 	if err != nil {
 		p.bumpOriginErr()
@@ -341,12 +378,11 @@ func (p *Proxy) downloadSlice(r *http.Request, obj string, i int64) error {
 		p.bumpOriginErr()
 		return fmt.Errorf("upstream status %d", resp.StatusCode)
 	}
-	key := sliceKey(obj, i)
-	path := slicePath(p.cfg.CacheDir, key)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	dest := slicePath(p.cfg.CacheDir, key)
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".tmp-*")
 	if err != nil {
 		return err
 	}
@@ -360,15 +396,13 @@ func (p *Proxy) downloadSlice(r *http.Request, obj string, i int64) error {
 	if size < 0 || written < size {
 		size = written
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := os.Rename(tmpName, dest); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	p.insert(key, path, size)
+	p.insert(key, dest, size)
 	if total >= 0 {
-		p.totalsMu.Lock()
-		p.totals[obj] = total
-		p.totalsMu.Unlock()
+		p.rememberTotal(obj, total)
 	}
 	p.metricsMu.Lock()
 	p.misses++
@@ -377,29 +411,8 @@ func (p *Proxy) downloadSlice(r *http.Request, obj string, i int64) error {
 	return nil
 }
 
-func objKeyMust(obj string, i int64) string { return sliceKey(obj, i) }
-
 func singleJoin(base, p string) string {
 	return strings.TrimSuffix(base, "/") + "/" + strings.TrimPrefix(p, "/")
-}
-
-// forwardHeaders passes every incoming header except hop-by-hop ones.
-// SigV4 clients (rclone signs accept-encoding, amz-sdk-*, host,
-// x-amz-*) break if any signed header is dropped or rewritten, so the
-// proxy allowlists removals instead of additions. Auth material stays
-// out of the cache key, keeping entries shared across pods.
-func forwardHeaders(out, in *http.Request) {
-	skip := map[string]bool{
-		"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
-		"Proxy-Authorization": true, "Te": true, "Trailer": true,
-		"Transfer-Encoding": true, "Upgrade": true,
-	}
-	for h, vs := range in.Header {
-		if skip[http.CanonicalHeaderKey(h)] {
-			continue
-		}
-		out.Header[h] = vs
-	}
 }
 
 func parseContentRange(cr string) (int64, int64, int64, error) {
@@ -431,10 +444,17 @@ func (p *Proxy) bumpOriginErr() {
 	p.metricsMu.Unlock()
 }
 
-// headLength is intentionally absent: object length comes from the
-// first fetched slice's Content-Range, so the proxy never invents a
-// second SigV4 request shape (upstream HEAD with a GET's query string
-// breaks strict signers like SeaweedFS).
+// rememberTotal caches object length learned from Content-Range. Bounded:
+// a full-lake scan through the proxy must not grow it without limit.
+func (p *Proxy) rememberTotal(obj string, length int64) {
+	p.totalsMu.Lock()
+	defer p.totalsMu.Unlock()
+	if len(p.totals) >= 1<<16 {
+		p.totals = map[string]int64{obj: length}
+		return
+	}
+	p.totals[obj] = length
+}
 
 func (p *Proxy) cachedTotal(obj string) (int64, bool) {
 	p.totalsMu.Lock()
@@ -460,14 +480,16 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		p.passthrough(w, r)
 		return
 	}
+	path := r.URL.EscapedPath()
+	ctx := r.Context()
 	// Learn the object length from the first needed slice's Content-Range
 	// instead of an upstream HEAD: fewer origin trips and no second
-	// SigV4 request shape to get wrong.
+	// request shape to get wrong.
 	probe := int64(0)
 	if lo, hi, multipart, err := splitRange(r.Header.Get("Range")); err == nil && !multipart && hi >= 0 {
 		probe = lo / p.cfg.SliceBytes
 	}
-	if err := p.fetchSlice(r, obj, probe); err != nil {
+	if err := p.fetchSlice(ctx, obj, path, probe); err != nil {
 		p.passthrough(w, r)
 		return
 	}
@@ -479,7 +501,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	start, end, err := parseRange(r.Header.Get("Range"), length)
 	if err != nil {
 		if err.Error() == "multipart ranges unsupported" {
-			p.serveFull(w, r, obj, length)
+			p.serveFull(w, r, obj, path, length)
 			return
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", length))
@@ -487,81 +509,75 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Header.Get("Range") == "" {
-		p.serveFull(w, r, obj, length)
+		p.serveFull(w, r, obj, path, length)
 		return
 	}
-	p.serveRange(w, r, obj, length, start, end)
+	p.serveRange(w, r, obj, path, length, start, end)
 }
 
-// splitRange structurally parses a Range header without validating
-// against a length: returns lo, hi (hi=-1 when open-ended/absent),
-// multipart flag, and syntax errors.
-func splitRange(header string) (int64, int64, bool, error) {
-	if header == "" {
-		return 0, -1, false, nil
-	}
-	rest, ok := strings.CutPrefix(header, "bytes=")
-	if !ok {
-		return 0, 0, false, fmt.Errorf("unsupported range unit")
-	}
-	if strings.Contains(rest, ",") {
-		return 0, 0, true, nil
-	}
-	lo, hi, _ := strings.Cut(rest, "-")
-	if lo == "" {
-		return 0, -1, false, nil // suffix; needs length
-	}
-	start, err := strconv.ParseInt(lo, 10, 64)
-	if err != nil || start < 0 {
-		return 0, 0, false, fmt.Errorf("bad range start")
-	}
-	if hi == "" {
-		return start, -1, false, nil
-	}
-	end, err := strconv.ParseInt(hi, 10, 64)
-	if err != nil || end < start {
-		return 0, 0, false, fmt.Errorf("bad range end")
-	}
-	return start, end, false, nil
-}
-
-func (p *Proxy) ensureSlices(r *http.Request, obj string, start, end int64) error {
+// ensureSlices fetches [start,end]'s slices in parallel, bounded by the
+// global FETCHERS semaphore; the first error cancels the rest.
+func (p *Proxy) ensureSlices(ctx context.Context, obj, path string, start, end int64) error {
 	sz := p.cfg.SliceBytes
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg       sync.WaitGroup
+		work     = make(chan int64)
+		errOnce  sync.Once
+		firstErr error
+	)
+	for w := 0; w < p.cfg.Fetchers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range work {
+				if err := p.fetchSlice(ctx, obj, path, i); err != nil {
+					errOnce.Do(func() {
+						firstErr = err
+						cancel()
+					})
+				}
+			}
+		}()
+	}
 	for i := start / sz; i <= end/sz; i++ {
-		if err := p.fetchSlice(r, obj, i); err != nil {
-			return err
+		select {
+		case work <- i:
+		case <-ctx.Done():
 		}
 	}
-	return nil
+	close(work)
+	wg.Wait()
+	return firstErr
 }
 
-func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj string, length int64) {
+func (p *Proxy) serveFull(w http.ResponseWriter, r *http.Request, obj, path string, length int64) {
 	if length == 0 {
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Length", "0")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		return
 	}
-	if err := p.ensureSlices(r, obj, 0, length-1); err != nil {
-		// Slice fetch failed after headers were plannable but not yet
-		// written: let the origin answer directly.
+	if err := p.ensureSlices(r.Context(), obj, path, 0, length-1); err != nil {
 		p.passthrough(w, r)
 		return
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if err := p.copySlices(w, r, obj, 0, length-1); err != nil {
+	if err := p.copySlices(w, r, obj, path, 0, length-1); err != nil {
 		return
 	}
 	p.metricsMu.Lock()
 	p.hits++
 	p.hitBytes += uint64(length)
 	p.metricsMu.Unlock()
+	go p.readAhead(obj, path, length-1)
 }
 
-func (p *Proxy) serveRange(w http.ResponseWriter, r *http.Request, obj string, length, start, end int64) {
-	if err := p.ensureSlices(r, obj, start, end); err != nil {
+func (p *Proxy) serveRange(w http.ResponseWriter, r *http.Request, obj, path string, length, start, end int64) {
+	if err := p.ensureSlices(r.Context(), obj, path, start, end); err != nil {
 		p.passthrough(w, r)
 		return
 	}
@@ -570,25 +586,59 @@ func (p *Proxy) serveRange(w http.ResponseWriter, r *http.Request, obj string, l
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, length))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusPartialContent)
-	if err := p.copySlices(w, r, obj, start, end); err != nil {
+	if err := p.copySlices(w, r, obj, path, start, end); err != nil {
 		return
 	}
 	p.metricsMu.Lock()
 	p.hits++
 	p.hitBytes += uint64(end - start + 1)
 	p.metricsMu.Unlock()
+	go p.readAhead(obj, path, end)
+}
+
+// readAhead prefetches the next slices of an object after a served
+// range, off the serving path and bounded by the READAHEAD lane.
+// Parquet reads are largely sequential within a file, so this converts
+// serial row-group latency into pipelined fetches.
+func (p *Proxy) readAhead(obj, path string, end int64) {
+	if p.prefetch == nil {
+		return
+	}
+	sz := p.cfg.SliceBytes
+	length, ok := p.cachedTotal(obj)
+	if !ok {
+		return
+	}
+	for n := int64(1); n <= int64(p.cfg.ReadAhead); n++ {
+		i := end/sz + n
+		if i*sz >= length {
+			return
+		}
+		select {
+		case p.prefetch <- struct{}{}:
+			go func(i int64) {
+				defer func() { <-p.prefetch }()
+				ctx, cancel := context.WithTimeout(context.Background(), p.cfg.Timeout)
+				defer cancel()
+				_ = p.fetchSlice(ctx, obj, path, i)
+			}(i)
+		default:
+			return // prefetch lane busy; never block serving
+		}
+	}
 }
 
 // copySlices streams bytes [start,end] from slice files without
 // materializing the range in memory. Slices evicted mid-serve (object
 // larger than cache) are refetched on demand, so oversized objects stay
 // correct at the cost of re-downloads.
-func (p *Proxy) copySlices(w http.ResponseWriter, r *http.Request, obj string, start, end int64) error {
+func (p *Proxy) copySlices(w http.ResponseWriter, r *http.Request, obj, path string, start, end int64) error {
+	ctx := r.Context()
 	sz := p.cfg.SliceBytes
 	for i := start / sz; i <= end/sz; i++ {
 		f, _, ok := p.get(sliceKey(obj, i))
 		if !ok {
-			if err := p.fetchSlice(r, obj, i); err != nil {
+			if err := p.fetchSlice(ctx, obj, path, i); err != nil {
 				return err
 			}
 			f, _, ok = p.get(sliceKey(obj, i))
@@ -625,7 +675,8 @@ func (p *Proxy) copySlices(w http.ResponseWriter, r *http.Request, obj string, s
 	return nil
 }
 
-// passthrough forwards non-cacheable operations with SigV4 intact.
+// passthrough forwards non-cacheable operations (HEAD, LIST) with the
+// proxy's own signature; nothing from the client request is forwarded.
 func (p *Proxy) passthrough(w http.ResponseWriter, r *http.Request) {
 	target := *p.cfg.Upstream
 	target.Path = singleJoin(target.Path, r.URL.EscapedPath())
@@ -635,24 +686,15 @@ func (p *Proxy) passthrough(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	forwardHeaders(req, r)
-	req.Host = r.Host
+	p.signer.sign(req)
 	resp, err := p.cfg.Client.Do(req)
 	if err != nil {
 		http.Error(w, "origin fetch failed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	skip := map[string]bool{
-		"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
-		"Proxy-Authorization": true, "Te": true, "Trailer": true,
-		"Transfer-Encoding": true, "Upgrade": true,
-	}
 	for h, vs := range resp.Header {
-		if skip[http.CanonicalHeaderKey(h)] {
-			continue
-		}
-		w.Header()[http.CanonicalHeaderKey(h)] = vs
+		w.Header()[h] = vs
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)

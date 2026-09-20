@@ -241,10 +241,16 @@ func setupSession(ctx context.Context, c *sql.Conn, tempDir string) error {
 	}
 	// S3_DIRECT mode: point DuckDB at S3 (normally the node-local s3cache
 	// proxy) instead of CSI mount paths. Catalog/data locations must then
-	// be s3:// URLs; writers still go direct to the origin.
+	// be s3:// URLs; writers still go direct to the origin. The proxy is
+	// the sole signer, so workers need no credentials here: a secret
+	// without KEY_ID gives anonymous access to the proxy.
 	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
-		stmts = append(stmts, fmt.Sprintf("CREATE SECRET s3direct (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')",
-			filter.Quote(os.Getenv("AWS_ACCESS_KEY_ID")), filter.Quote(os.Getenv("AWS_SECRET_ACCESS_KEY")), filter.Quote(endpoint)))
+		secretSQL := fmt.Sprintf("CREATE SECRET s3direct (TYPE S3, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')", filter.Quote(endpoint))
+		if id := os.Getenv("AWS_ACCESS_KEY_ID"); id != "" {
+			secretSQL = fmt.Sprintf("CREATE SECRET s3direct (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')",
+				filter.Quote(id), filter.Quote(os.Getenv("AWS_SECRET_ACCESS_KEY")), filter.Quote(endpoint))
+		}
+		stmts = append(stmts, secretSQL)
 	}
 	if tempDir != "" {
 		stmts = append(stmts, "SET temp_directory="+filter.Quote(tempDir))

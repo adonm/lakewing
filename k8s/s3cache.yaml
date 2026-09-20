@@ -2,6 +2,13 @@
 # Readers point S3_ENDPOINT at the node-local address
 # (http://$NODE_IP:8345) so every pod shares one NVMe copy.
 # No CSI driver, no FUSE mounts: plain Deployments + hostPath.
+#
+# Auth: the proxy is the SOLE SigV4 signer. Create one secret for it:
+#   kubectl -n lake create secret generic s3cache-auth \
+#     --from-literal=key_id=$S3_USER --from-literal=secret=$S3_PASS
+# Workers set only S3_ENDPOINT; their DuckDB secret is created without
+# KEY_ID (anonymous to the proxy). Client credentials never travel
+# upstream and never touch the cache key.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -40,6 +47,21 @@ spec:
               value: "10737418240"
             - name: SLICE_BYTES
               value: "1048576"
+            - name: READAHEAD
+              value: "4"
+            # The proxy is the sole S3 signer: workers carry no S3
+            # credentials at all. One Secret on the DaemonSet replaces
+            # credentials in every reader pod.
+            - name: S3_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3cache-auth
+                  key: key_id
+            - name: S3_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: s3cache-auth
+                  key: secret
           volumeMounts:
             - name: cache
               mountPath: /cache

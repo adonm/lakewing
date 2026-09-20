@@ -2,12 +2,16 @@
 // workers. One DaemonSet pod per node; readers point their S3 endpoint
 // at the node-local address so every pod shares one NVMe copy.
 //
-//	UPSTREAM    S3 origin base URL, e.g. http://seaweed:8333 (required)
-//	LISTEN      listen address, default :8080
-//	CACHE_DIR   disk dir, default /cache (mount NVMe here)
-//	CACHE_BYTES disk budget, default 10737418240 (10 GiB)
-//	SLICE_BYTES slice size, default 1048576 (1 MiB)
-//	FETCHERS    concurrent upstream slice fetches, default 8
+// UPSTREAM     S3 origin base URL, e.g. http://seaweed:8333 (required)
+// LISTEN       listen address, default :8080
+// CACHE_DIR    disk dir, default /cache (mount NVMe here)
+// CACHE_BYTES  disk budget, default 10737418240 (10 GiB)
+// SLICE_BYTES  slice size, default 1048576 (1 MiB)
+// FETCHERS     concurrent upstream slice fetches, default 8
+// READAHEAD    slices prefetched past a served range, default 4 (0=off)
+// S3_KEY_ID    proxy-held S3 credential; the proxy is the sole signer
+// S3_SECRET    matching secret; unset pair = unsigned anonymous origin
+// S3_REGION    signing region, default us-east-1
 package main
 
 import (
@@ -47,13 +51,17 @@ func main() {
 		MaxBytes:   bytesEnv("CACHE_BYTES", 10<<30),
 		SliceBytes: bytesEnv("SLICE_BYTES", 1<<20),
 		Fetchers:   int(bytesEnv("FETCHERS", 8)),
+		ReadAhead:  int(bytesEnv("READAHEAD", 4)),
+		KeyID:      os.Getenv("S3_KEY_ID"),
+		Secret:     os.Getenv("S3_SECRET"),
+		Region:     env("S3_REGION", "us-east-1"),
 		Timeout:    60 * time.Second,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	addr := env("LISTEN", ":8080")
-	log.Printf("s3cache upstream=%s dir=%s", upstream.Redacted(), os.Getenv("CACHE_DIR"))
+	log.Printf("s3cache upstream=%s dir=%s signed=%v", upstream.Redacted(), os.Getenv("CACHE_DIR"), os.Getenv("S3_KEY_ID") != "")
 	server := &http.Server{Addr: addr, Handler: proxy, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(server.ListenAndServe())
 }

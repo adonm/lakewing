@@ -6,36 +6,63 @@ endpoint at the node-local address so every pod shares one disk copy —
 no CSI driver, no FUSE mounts.
 
 ```sh
-# workers (S3_DIRECT mode): catalog + data are s3:// URLs through the proxy
-export NODE_IP=... # downward API spec.nodeName/nodeIP in-cluster
+# one Secret on the DaemonSet; the proxy is the only S3 signer
+kubectl -n lake create secret generic s3cache-auth \
+  --from-literal=key_id=$S3_USER --from-literal=secret=$S3_PASS
+# workers: no credentials at all, just the endpoint
 export S3_ENDPOINT="http://$NODE_IP:8345"
-export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 ```
 
 `internal/store` creates the `s3direct` secret from `S3_ENDPOINT` when
-set (`internal/store/store.go` `setupSession`); otherwise serving keeps
-using CSI mount paths. Writers always go direct to the origin.
+set (`internal/store/store.go` `setupSession`) — **without** `KEY_ID`,
+i.e. anonymous to the proxy, when workers have no AWS env. Writers
+always go direct to the origin.
 
-## Design
+## Auth model (simple on purpose)
 
-- **Slice granularity** (default 1 MiB): each `Range` is split into
+The proxy is the **sole SigV4 signer**:
+
+- Workers hold no S3 credentials; their requests arrive unsigned (or
+  with anything else) and are served from disk or re-signed upstream.
+- Client `Authorization` never crosses the proxy and is never part of
+  the cache key — pods share entries by construction.
+- One `s3cache-auth` Secret on the DaemonSet replaces credentials in
+  every reader pod; rotation happens in one place.
+- No fragile signed-header forwarding: the proxy builds each upstream
+  request itself and signs `host;x-amz-content-sha256;x-amz-date`
+  (minimal valid SigV4, per-date signing key cached).
+- Trust boundary: anything on the node network can read the lake
+  through the proxy — the same node-trust model as a CSI mount
+  (`allow-other`). Put it behind auth at the LB/ingress if exposed
+  beyond the node.
+- Strict AWS works with static proxy credentials today; IRSA/web-
+  identity token refresh is the remaining follow-up in `sign.go`.
+
+## Speed design
+
+- **Parallel slice fetch** (`FETCHERS`, default 8): slices within one
+  request fetch concurrently, bounded by one global semaphore; the
+  first error cancels the rest. Unit-tested via peak in-flight at the
+  origin.
+- **Read-ahead** (`READAHEAD`, default 4): after a served range, the
+  next slices of the same object prefetch off the serving path
+  (bounded lane, never blocks serving, bounded by object length).
+  Parquet reads are largely sequential within a file, so row-group
+  latency pipelines instead of serializing. `0` disables.
+- **Slice granularity** (default 1 MiB): each `Range` splits into
   aligned slices keyed `method + path` (`?x-id` SDK telemetry stripped
-  from the key, forwarded upstream verbatim). Auth headers are forwarded
-  on a miss and excluded from the key, so pods share entries. Object
-  length comes from the first fetched slice's `Content-Range` — the
-  proxy never invents a second SigV4 request shape (an upstream `HEAD`
-  carrying a `GET`'s query string breaks strict signers). Full GETs
-  assemble from slices; nothing larger than a slice is ever buffered
-  in RAM.
+  from the key, forwarded upstream verbatim). Length comes from the
+  first fetched slice's `Content-Range` — no second request shape.
+  Full GETs assemble from slices; nothing larger than a slice is ever
+  buffered in RAM.
 - **Collapse + publish**: per-slice singleflight (the 600+ concurrent
-  range GETs of FULL scans fetch each slice once), atomic `.tmp`→rename
-  publish, fd-pinned serving safe against eviction.
+  range GETs of FULL scans fetch each slice once), atomic
+  `.tmp`→rename publish, fd-pinned serving safe against eviction.
 - **Bounded**: synchronous LRU over `CACHE_BYTES` (hot subset for a PB
-  lake); oversized objects stay correct via on-demand refetch at the
-  cost of re-downloads. Synchronous bounds were chosen over
-  frequency-sketch admission deliberately: predictable under scan churn.
-- **Read-only**: non-GET → `403`; `LIST`/query-string GETs and `HEAD`
-  pass through with SigV4 intact (v1 does not disk-cache them).
+  lake); object-length map bounded at 64K entries; oversized objects
+  stay correct via on-demand refetch.
+- **Read-only**: non-GET → `403`; `LIST`/`HEAD` pass through signed by
+  the proxy.
 - **Observability**: `/metrics` (`s3cache_hits_total`,
   `s3cache_hit_bytes_total`, `s3cache_origin_fetches_total`,
   `s3cache_origin_bytes_total`, `s3cache_evictions_total`,
@@ -44,27 +71,19 @@ using CSI mount paths. Writers always go direct to the origin.
 
 ## Limits (honest)
 
-- v1 forwards **all** non-hop-by-hop headers (allowlist removals, not
-  additions) with `DisableCompression` so `Accept-Encoding` passes
-  through verbatim: rclone signs `accept-encoding`, `amz-sdk-*`, `host`,
-  `x-amz-*`, and dropping/rewriting any of them breaks SigV4
-  (`SignatureDoesNotMatch`, verified live against SeaweedFS). The
-  incoming `Host` is preserved for the same reason.
-- Works with SeaweedFS/MinIO and public buckets. Strict AWS validates
-  the signed host, so private AWS buckets need proxy-side re-signing
-  (proxy holds IRSA and signs upstream) — structured as a follow-up,
-  single function swap at `forwardHeaders` (`internal/s3cache/s3cache.go`).
-- Conditionals (`If-None-Match`) are ignored; safe because snapshots
-  are immutable. `Content-Type` is served as `application/octet-stream`
-  (DuckDB doesn't care); `ETag`s are not synthesized.
-- Multipart ranges fall back to full-body `200` (legal).
+- Conditionals (`If-None-Match`) ignored; safe because snapshots are
+  immutable. `Content-Type` is `application/octet-stream`; no `ETag`
+  synthesis. Multipart ranges fall back to full-body `200`.
+- Client conditionals/auth are dropped at the proxy by design; if the
+  origin needs per-pod identity, this cache is the wrong layer.
+- The benchmark harness comparison (proxy vs direct vs CSI through
+  DuckLake phases) is the remaining validation step before trusting
+  past SeaweedFS; add a `proxy` backend to `scripts/cachebench/rig.py`.
 
 ## Validate
 
 ```sh
-just s3cache-test   # unit: reuse, auth exclusion, singleflight, eviction bound
+just s3cache-test   # unit: reuse, sole-signer, singleflight, parallel
+                    # fetch, read-ahead, eviction bound, 416, x-id
+just s3cache-build   # image
 ```
-
-Then add a `proxy` backend to `scripts/cachebench/rig.py` reusing the
-DuckLake phases (first/warm/peer/reclaim/pollution) with SHA-256 result
-checks before trusting it past SeaweedFS.
