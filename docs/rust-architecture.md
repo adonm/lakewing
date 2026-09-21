@@ -61,6 +61,19 @@ poem (OGC REST) + arrow-flight (read-only)
   conflated across stores). The cache directory takes an exclusive lock, and
   shutdown flushes the disk tier. Tags/mutable pointers always go to origin.
   Per-pod by design; a shared cache would be a separate service.
+- **Rendered-response cache (warm path)**: successful geo+json/MVT bodies
+  are stored in a bounded foyer memory cache (`--response-cache-bytes`,
+  default 256 MiB; 0 disables) keyed by (pinned snapshot, canonical
+  selection). A warm repeat skips Lance, DuckDB, JSON assembly and ETag
+  recompute entirely and bypasses admission (hits hold no worker); keys are
+  built from each selection's canonical href, so query/header source
+  intersections share entries but distinct effective sources never collide.
+  Entries cannot go stale within a process (dataset version is pinned;
+  publication restarts the process), and `Cache-Control: public` already
+  invited exactly this reuse at clients/CDNs. Errors and entries above
+  16 MiB are never stored; first-touch herds may render redundantly while
+  the origin-level range cache single-flights the storage reads beneath.
+  Hit/miss counters are exported on `/metrics`.
 - **The one known scaling hole (tracked, not hidden)**: ordered key selection
   still scans the matching id/source set in Lance (bounded max-heap; the
   pinned lance 12 `order_by` sorts candidates — `scanner.rs` pushes no limit
@@ -83,31 +96,28 @@ not comparable to filtered-vector-search shapes; they measure the selection
 scaling hole above. Measured numbers live in the tables below; every claim
 there is from a specific recorded run, not a target.
 
-## Benchmark (v6 gate, full 25.36M-row GeoArrow fixture)
+## Benchmark (v7 gate, full 25.36M-row GeoArrow fixture)
 
 `scripts/lancebench/battery.py` — canonical-JSON equality **gate** (non-zero
-exit on mismatch) + medians. v6 re-recorded (single serve, warm local NVMe,
-rust-built dataset; equality verified across rust-built and pylance-built
-datasets, with and without the foyer cache):
+exit on mismatch). The battery warms once then times repeats, so with the
+rendered-response cache (v7) it measures the warm path; first-render numbers
+are measured separately on unique pages.
 
-| query | Go serve (DuckLake/parquet) | Rust v6 local | band |
+| query | Go serve (DuckLake/parquet) | Rust v6 first-render | Rust v7 warm |
 | --- | --- | --- | --- |
-| ITEM (BTREE) | 35 ms | **6.1 ms** | inside Enterprise selective (25–50 ms p50) |
-| CITY (bbox, RTREE) | 49 ms | **24.9 ms** | inside Enterprise selective |
-| FULL page (101 of 25.36M) | **495 ms** | 633 ms | selection-class, see below |
-| DEEP (offset 50k) | 4008 ms | **770 ms** | selection-class, see below |
+| ITEM (BTREE) | 35 ms | 6.1 ms | **0.3 ms** |
+| CITY (bbox, RTREE) | 49 ms | 24.9 ms | **4.3 ms** |
+| FULL page (101 of 25.36M) | **495 ms** | 633 ms | **4.8 ms** |
+| DEEP (offset 50k) | 4008 ms | 770 ms | **2.3 ms** |
 
-Notes from the re-run: an earlier v6 draft regressed FULL/DEEP ~2.5× (1550 ms)
-— traced to `scanner.batch_size(1024)` (24k stream batches per scan; per-batch
-scheduling dominated), not to the payload `order_by` (removing it changed
-nothing, so the payload scan stays unordered and DuckDB orders the page) nor to
-the rust-built dataset (the pylance-built one measured slower under the same
-binary). 8192 restored the v2 band; ITEM/CITY never moved.
-
-FULL/DEEP are not comparable to Enterprise's filtered-vector-search shapes:
-they measure the known selection-scaling hole below (the whole matching
-id/source set streams through a bounded heap). S3+foyer numbers and the
-concurrent herd matrix are the remaining rig runs.
+Unique deep pages (cold response-cache entries, e.g. `offset=77001`) still
+render in ~860 ms — first-render cost is unchanged; the response cache only
+removes the *repeat* work. Warm 16-thread load over the 4-query mix
+(`load.py BASE none 16 3`): **3258 RPS, p50 3.3 ms, p95 7.1 ms, zero digest
+mismatches** — the same warm mix ran at 8.8 RPS / p50 1506 ms before the
+response cache (rendering, not storage, was the warm bottleneck). Selective
+first-render classes sit inside the Enterprise selective band; the FULL/DEEP
+*first-render* class is the selection-scaling hole below.
 
 ## Serve
 
@@ -171,10 +181,16 @@ port-forwards, so the S3 endpoint is `127.0.0.1:8334` (the forwarded
 
 ## Open follow-ups (honest list)
 
-- Selection scaling: index-ordered retrieval or a build-time (page, cursor)
-  map; profile `lance.select.examined` first.
-- Rig runs post-v6: re-record ITEM/FULL/CITY/DEEP local + S3+foyer, then the
-  concurrent herd matrix (the load.py origin-delta attribution is wired).
+- Selection scaling (first-render FULL/DEEP): index-ordered retrieval or a
+  build-time (page, cursor) map; profile `lance.select.examined` first. The
+  lance 12 BTREE serves equality/range *prefilters* but `order_by` still
+  sorts candidates (no index-ordered early termination), so the heap stands.
+- Rig runs post-v7: re-record S3+foyer first-render/warm numbers plus the
+  concurrent herd matrix with origin-delta attribution (the rig and the
+  metered endpoints are wired; the runs need the kind cluster up).
+- Response-cache first-touch herd: concurrent misses may render the same
+  page redundantly (origin reads are single-flighted beneath; render dedup
+  would need a per-key inflight map).
 - Cross-pod/node-shared cache comparison at matched budgets, if per-pod NVMe
   misses show up in the herd matrix.
 - Managed publication: builder currently writes `--out` and tags; namespace

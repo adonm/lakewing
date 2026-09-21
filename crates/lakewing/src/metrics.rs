@@ -13,6 +13,8 @@ pub struct Metrics {
     latency: [AtomicU64; 10],
     duration_us: AtomicU64,
     completed: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
     pub dataset_version: AtomicU64,
 }
 
@@ -26,6 +28,8 @@ impl Metrics {
             latency: std::array::from_fn(|_| AtomicU64::new(0)),
             duration_us: AtomicU64::new(0),
             completed: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
             dataset_version: AtomicU64::new(0),
         }
     }
@@ -35,6 +39,12 @@ impl Metrics {
     }
     pub fn count_flight(&self) {
         self.flight_requests.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn count_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn count_cache_miss(&self) {
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
     pub fn enter(&self) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
@@ -65,6 +75,8 @@ impl Metrics {
             ("flight_requests_total", "counter", &self.flight_requests),
             ("in_flight", "gauge", &self.in_flight),
             ("lance_dataset_version", "gauge", &self.dataset_version),
+            ("response_cache_hits_total", "counter", &self.cache_hits),
+            ("response_cache_misses_total", "counter", &self.cache_misses),
         ] {
             out.push_str(&format!(
                 "# TYPE lakewing_{name} {kind}\nlakewing_{name} {}\n",

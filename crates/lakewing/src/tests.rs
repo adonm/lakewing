@@ -30,6 +30,12 @@ impl Fixture {
                 .with_max_level(tracing::Level::ERROR)
                 .try_init();
         });
+        // Fixture creation builds three datasets plus BTREE/RTREE indexes;
+        // Lance's in-process memory reservations are shared, so concurrent
+        // builds exhaust the pool (observed ExternalSorterMerge failures).
+        // Serialize construction across tests.
+        static BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _build = BUILD.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let db = duckdb::Connection::open_in_memory().unwrap();
         db.execute_batch("INSTALL spatial; LOAD spatial").unwrap();
@@ -99,25 +105,26 @@ impl Fixture {
     }
 
     async fn app(&self, uri: &str, concurrency: usize) -> Arc<App> {
+        self.app_with_limits(
+            uri,
+            Limits {
+                concurrency,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn app_with_limits(&self, uri: &str, limits: Limits) -> Arc<App> {
         let (tag, version) = if uri == self.geo {
             (Some("prod".into()), None)
         } else {
             (None, Some(1))
         };
         Arc::new(
-            App::open_at(
-                uri.into(),
-                tag,
-                version,
-                Default::default(),
-                None,
-                Limits {
-                    concurrency,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap(),
+            App::open_at(uri.into(), tag, version, Default::default(), None, limits)
+                .await
+                .unwrap(),
         )
     }
 }
@@ -354,6 +361,113 @@ async fn payload_budget_fails_closed() {
         .metrics
         .exposition()
         .contains("lakewing_http_responses_total{status=\"413\"} 1\n"));
+}
+
+/// Warm repeats answer from the rendered-response cache: identical bytes,
+/// conditional requests still honor the exact ETag, distinct effective
+/// sources never collide, and hits neither hold admission nor re-render.
+/// With the cache disabled the same requests still succeed (all misses).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_cache_serves_repeats_and_isolates_sources() {
+    let fixture = Fixture::new().await;
+    for cache_bytes in [64 * 1024 * 1024usize, 0] {
+        let app = fixture
+            .app_with_limits(&fixture.geo, app_limits(cache_bytes))
+            .await;
+        let ep = crate::api::routes(app.clone());
+        let path = "/collections/buildings/items?sources=2&limit=2";
+
+        let (status, first) = get(&ep, path).await;
+        assert_eq!(status, 200, "{first}");
+        let (status, second) = get(&ep, path).await;
+        assert_eq!(status, 200, "{second}");
+        assert_eq!(first, second);
+
+        // Conditional request against the cached entry: 304 with the same ETag.
+        let etag = etag_of(&ep, path).await;
+        let response = ep
+            .get_response(
+                Request::builder()
+                    .uri(path.parse().unwrap())
+                    .header("if-none-match", &etag)
+                    .finish(),
+            )
+            .await;
+        assert_eq!(response.status().as_u16(), 304);
+
+        // A different effective source set must not collide with the entry.
+        let (status, other) = get(&ep, "/collections/buildings/items?sources=3&limit=2").await;
+        assert_eq!(status, 200, "{other}");
+        assert_ne!(first, other);
+
+        // Same effective selection via query+header intersection shares one entry.
+        let response = ep
+            .get_response(
+                Request::builder()
+                    .uri(
+                        "/collections/buildings/items?sources=2,3&limit=2"
+                            .parse()
+                            .unwrap(),
+                    )
+                    .header("x-source-ids", "2")
+                    .finish(),
+            )
+            .await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        // Tiles repeat through the cache too (204 when the fixture tile is empty).
+        let first_tile = get(&ep, "/collections/buildings/tiles/12/2103/1346?sources=2")
+            .await
+            .0;
+        let second_tile = get(&ep, "/collections/buildings/tiles/12/2103/1346?sources=2")
+            .await
+            .0;
+        assert_eq!(first_tile, second_tile);
+
+        // Validation errors are never cached: repeats still re-validate.
+        for _ in 0..2 {
+            assert_eq!(
+                get(&ep, "/collections/buildings/items?bbox=2,0,1,1")
+                    .await
+                    .0,
+                400
+            );
+        }
+
+        let exposition = app.metrics.exposition();
+        if cache_bytes > 0 {
+            // items x2 -> 1 hit, 304 -> 1 hit, header-intersection -> 1 hit,
+            // tile -> 1 hit; the different-source and error requests miss.
+            assert!(
+                exposition.contains("lakewing_response_cache_hits_total 4\n"),
+                "{exposition}"
+            );
+        } else {
+            assert!(exposition.contains("lakewing_response_cache_hits_total 0\n"));
+        }
+        assert!(exposition.contains("lakewing_in_flight 0\n"));
+    }
+}
+
+fn app_limits(response_cache_bytes: usize) -> crate::app::Limits {
+    crate::app::Limits {
+        concurrency: 2,
+        response_cache_bytes,
+        ..Default::default()
+    }
+}
+
+async fn etag_of(ep: &impl Endpoint, path: &str) -> String {
+    let response = ep
+        .get_response(Request::builder().uri(path.parse().unwrap()).finish())
+        .await;
+    response
+        .headers()
+        .get("etag")
+        .expect("etag")
+        .to_str()
+        .expect("ascii")
+        .to_string()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

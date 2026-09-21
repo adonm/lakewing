@@ -86,13 +86,13 @@ async fn items(
     req: &Request,
     app: Data<&Arc<App>>,
 ) -> Response {
-    let run = async {
+    let parsed = async {
         check_snapshot(q.snapshot, app.lance.version)?;
         let limit = q.limit.unwrap_or(101);
         if !(1..=10_000).contains(&limit) {
             return Err(QueryError::new(400, "limit must be 1..10000").into());
         }
-        let selection = Selection::new(
+        Selection::new(
             collection,
             q.bbox.as_deref().map(parse_bbox).transpose()?,
             sources(&q, req)?,
@@ -100,18 +100,41 @@ async fn items(
             q.offset.unwrap_or(0),
             q.cursor.as_deref(),
             app.lance.version,
-        )?;
+        )
+    };
+    let selection = match parsed.await {
+        Ok(selection) => selection,
+        Err(err) => return error_response(err),
+    };
+    // Canonical key: pinned version + the selection's own canonical href
+    // (sorted sources, normalized bbox, cursor). Equivalent requests share
+    // one entry; different effective sources never collide.
+    let key = format!("items|{}", selection.href(app.lance.version, None));
+    if let Some(rendered) = app.cached_response(&key) {
+        return http_cache::success(
+            req.headers(),
+            &app.metrics,
+            rendered.body,
+            rendered.content_type,
+            rendered.gz,
+        );
+    }
+    let run = async {
         let _permit = app.admit(false)?;
         app.items_page(&selection).await
     };
     match run.await {
-        Ok(body) => http_cache::success(
-            req.headers(),
-            &app.metrics,
-            body.into_bytes(),
-            "application/geo+json",
-            true,
-        ),
+        Ok(body) => {
+            let body = bytes::Bytes::from(body.into_bytes());
+            app.store_response(key, body.clone(), "application/geo+json", true);
+            http_cache::success(
+                req.headers(),
+                &app.metrics,
+                body,
+                "application/geo+json",
+                true,
+            )
+        }
         Err(err) => error_response(err),
     }
 }
@@ -123,20 +146,48 @@ async fn item(
     req: &Request,
     app: Data<&Arc<App>>,
 ) -> Response {
-    let run = async {
+    let parsed = async {
         check_snapshot(q.snapshot, app.lance.version)?;
-        let sources = sources(&q, req)?;
+        sources(&q, req)
+    };
+    let sources = match parsed.await {
+        Ok(sources) => sources,
+        Err(err) => return error_response(err),
+    };
+    let key = format!(
+        "item|{collection}|{feature_id}|{}|v{}",
+        sources
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        app.lance.version
+    );
+    if let Some(rendered) = app.cached_response(&key) {
+        return http_cache::success(
+            req.headers(),
+            &app.metrics,
+            rendered.body,
+            rendered.content_type,
+            rendered.gz,
+        );
+    }
+    let run = async {
         let _permit = app.admit(false)?;
         app.item(&collection, &feature_id, &sources).await
     };
     match run.await {
-        Ok(Some(body)) => http_cache::success(
-            req.headers(),
-            &app.metrics,
-            body.into_bytes(),
-            "application/geo+json",
-            true,
-        ),
+        Ok(Some(body)) => {
+            let body = bytes::Bytes::from(body.into_bytes());
+            app.store_response(key, body.clone(), "application/geo+json", true);
+            http_cache::success(
+                req.headers(),
+                &app.metrics,
+                body,
+                "application/geo+json",
+                true,
+            )
+        }
         Ok(None) => error_response(QueryError::new(404, "not found").into()),
         Err(err) => error_response(err),
     }
@@ -149,21 +200,54 @@ async fn tile(
     req: &Request,
     app: Data<&Arc<App>>,
 ) -> Response {
-    let run = async {
+    let parsed = async {
         check_snapshot(q.snapshot, app.lance.version)?;
         crate::tiles::validate(z, x, y).map_err(|e| QueryError::new(400, e.to_string()))?;
-        let sources = sources(&q, req)?;
+        sources(&q, req)
+    };
+    let sources = match parsed.await {
+        Ok(sources) => sources,
+        Err(err) => return error_response(err),
+    };
+    let key = format!(
+        "tile|{collection}|{z}/{x}/{y}|{}|v{}",
+        sources
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        app.lance.version
+    );
+    if let Some(rendered) = app.cached_response(&key) {
+        return http_cache::success(
+            req.headers(),
+            &app.metrics,
+            rendered.body,
+            rendered.content_type,
+            rendered.gz,
+        );
+    }
+    let run = async {
         let _permit = app.admit(false)?;
         app.tile(&collection, z, x, y, &sources).await
     };
     match run.await {
-        Ok(Some(body)) => http_cache::success(
-            req.headers(),
-            &app.metrics,
-            body,
-            "application/vnd.mapbox-vector-tile",
-            false,
-        ),
+        Ok(Some(body)) => {
+            let body = bytes::Bytes::from(body);
+            app.store_response(
+                key,
+                body.clone(),
+                "application/vnd.mapbox-vector-tile",
+                false,
+            );
+            http_cache::success(
+                req.headers(),
+                &app.metrics,
+                body,
+                "application/vnd.mapbox-vector-tile",
+                false,
+            )
+        }
         Ok(None) => http_cache::no_content(&app.metrics),
         Err(err) => error_response(err),
     }

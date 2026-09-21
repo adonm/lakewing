@@ -15,6 +15,7 @@ mod lake;
 mod metrics;
 mod otel;
 mod query;
+mod response_cache;
 #[cfg(test)]
 mod tests;
 mod tiles;
@@ -47,6 +48,7 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
     let mut concurrency: usize = 4;
     let mut duck_threads: usize = 1;
     let mut duck_memory_mb: usize = 512;
+    let mut response_cache_bytes: usize = 256 * 1024 * 1024;
     while let Some(arg) = args.next() {
         // Accept both `--flag value` and `--flag=value`.
         let (flag, inline) = match arg.split_once('=') {
@@ -75,6 +77,9 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
             "--concurrency" => concurrency = value().parse().unwrap_or(concurrency),
             "--duck-threads" => duck_threads = value().parse().unwrap_or(duck_threads),
             "--duck-memory-mb" => duck_memory_mb = value().parse().unwrap_or(duck_memory_mb),
+            "--response-cache-bytes" => {
+                response_cache_bytes = value().parse().unwrap_or(response_cache_bytes)
+            }
             other => anyhow::bail!("unknown flag {other}"),
         }
     }
@@ -123,6 +128,7 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
                     concurrency,
                     duck_threads,
                     duck_memory_mb,
+                    response_cache_bytes,
                 },
             )
             .await?
@@ -139,6 +145,7 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
                     concurrency,
                     duck_threads,
                     duck_memory_mb,
+                    response_cache_bytes,
                 },
             )
             .await?

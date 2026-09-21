@@ -32,6 +32,7 @@ spec:
             - --concurrency={{ .Values.serve.concurrency }}
             - --duck-threads={{ .Values.serve.duckThreads }}
             - --duck-memory-mb={{ .Values.serve.duckMemoryMb }}
+            - --response-cache-bytes={{ .Values.serve.responseCacheBytes }}
             {{- if .Values.serve.flightListen }}
             - --flight-listen={{ .Values.serve.flightListen }}
             {{- end }}

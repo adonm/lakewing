@@ -14,6 +14,8 @@ pub struct Limits {
     pub concurrency: usize,
     pub duck_threads: usize,
     pub duck_memory_mb: usize,
+    /// Rendered-response cache budget in bytes; 0 disables the cache.
+    pub response_cache_bytes: usize,
 }
 
 impl Default for Limits {
@@ -22,6 +24,7 @@ impl Default for Limits {
             concurrency: 4,
             duck_threads: 1,
             duck_memory_mb: 512,
+            response_cache_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -43,6 +46,7 @@ pub struct App {
     pub collections: Vec<String>,
     pub metrics: Arc<crate::metrics::Metrics>,
     pub cache_metrics: Option<Arc<crate::cache::CacheMetrics>>,
+    responses: Option<crate::response_cache::ResponseCache>,
     sem: Arc<Semaphore>,
 }
 
@@ -102,8 +106,53 @@ impl App {
             collections,
             metrics,
             cache_metrics,
+            responses: if limits.response_cache_bytes > 0 {
+                Some(crate::response_cache::ResponseCache::new(
+                    limits.response_cache_bytes,
+                ))
+            } else {
+                None
+            },
             sem: Arc::new(Semaphore::new(limits.concurrency)),
         })
+    }
+
+    /// Cached rendered response for a canonical request key, if enabled and
+    /// present. Counts hit/miss metrics so warm behavior is observable.
+    pub fn cached_response(&self, key: &str) -> Option<crate::response_cache::Rendered> {
+        match &self.responses {
+            Some(cache) => {
+                let hit = cache.get(key);
+                if hit.is_some() {
+                    self.metrics.count_cache_hit();
+                } else {
+                    self.metrics.count_cache_miss();
+                }
+                hit
+            }
+            None => None,
+        }
+    }
+
+    /// Store a successful render. Only called for 200 responses; errors are
+    /// never stored.
+    pub fn store_response(
+        &self,
+        key: String,
+        body: bytes::Bytes,
+        content_type: &'static str,
+        gz: bool,
+    ) {
+        if let Some(cache) = &self.responses {
+            cache.insert(
+                key,
+                crate::response_cache::Rendered {
+                    body,
+                    content_type,
+                    gz,
+                },
+            );
+        }
     }
 
     pub fn admit(&self, flight: bool) -> Result<Admission, QueryError> {

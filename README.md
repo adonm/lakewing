@@ -96,6 +96,12 @@ temporary page table, so requests are isolated and cancellation cannot strand
 a worker. Payloads are capped at 64 MiB per page (413 above), requests at a
 30 s deadline (504 / DEADLINE_EXCEEDED).
 
+Warm repeats of a successful page or tile are served from the bounded
+rendered-response cache (`--response-cache-bytes`, default 256 MiB, 0
+disables) keyed by the pinned snapshot plus the canonical selection — they
+skip rendering and admission entirely. Hit/miss counters are on `/metrics`
+(`lakewing_response_cache_*`).
+
 ## Object storage + cache
 
 `--endpoint`, `--s3-key/--s3-secret` (or unsigned reads via a signing gateway)
@@ -141,19 +147,21 @@ counts and payload timings).
 ## Verification
 
 ```sh
-just check test                          # fmt + clippy -D warnings + regression tests
+just check test                          # fmt + clippy -D warnings + 9 regression tests
 python3 scripts/lancebench/battery.py http://127.0.0.1:3140 http://127.0.0.1:3141
 python3 scripts/lancebench/flight_check.py grpc://127.0.0.1:50071 http://127.0.0.1:3140
-python3 scripts/lancebench/load.py http://127.0.0.1:3140 http://127.0.0.1:8335 16 3
+python3 scripts/lancebench/load.py http://127.0.0.1:3140 none 16 3
 ```
 
 The battery is a **gate** (non-zero exit on any digest mismatch). The
 regression suite (`cargo test`) covers: exact polygon-hole filtering before
 pagination, cross-source pagination with duplicate ids, cursor snapshot
 binding, strict request validation (400/404/409), per-connection isolation
-under concurrent load, DuckDB permit safety under cancellation, Flight
-schema/geometry parity with HTTP, admission exhaustion and release, and
-non-spatial datasets (bbox → 400, null geometry).
+under concurrent load, DuckDB permit safety under cancellation, the 64 MiB
+payload budget failing closed, Flight schema/geometry parity with HTTP,
+admission exhaustion and release, non-spatial datasets (bbox → 400, null
+geometry), and rendered-response-cache repeats (identical bytes, ETag
+conditionals on cached entries, source isolation, disabled mode).
 
 Layercake data is © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright),
 available under the [ODbL](https://opendatacommons.org/licenses/odbl/).

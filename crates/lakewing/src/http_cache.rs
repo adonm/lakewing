@@ -84,7 +84,7 @@ fn base_headers(mut response: poem::Response, etag_value: &str) -> poem::Respons
 pub fn success(
     headers: &HeaderMap,
     _metrics: &Metrics,
-    body: Vec<u8>,
+    body: bytes::Bytes,
     content_type: &str,
     gz: bool,
 ) -> Response {

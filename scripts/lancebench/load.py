@@ -35,12 +35,16 @@ def main():
     stats = sys.argv[2]
     threads = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     rounds = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+    # `none` runs without the metered rig: local warm-load measurement
+    # without origin-delta attribution (origin fields report as null).
+    metered = stats.lower() != "none"
 
-    # Warm the foyer cache once so the load measures warm-path stability.
+    # Warm the response + storage caches once so the load measures the
+    # warm-path stability, not first-touch.
     for path in QUERIES.values():
         fetch(base, path)
 
-    before = meter_stats(stats)
+    before = meter_stats(stats) if metered else None
     latencies = []
     digests = {}
     lock = threading.Lock()
@@ -59,23 +63,21 @@ def main():
         for lat in pool.map(worker, range(threads * rounds)):
             latencies.extend(lat)
     wall = time.perf_counter() - t0
-    after = meter_stats(stats)
+    after = meter_stats(stats) if metered else None
 
-    def delta(key):
-        return {k: after["counts"].get(k, {"requests": 0, "bytes": 0})["requests"]
-                   - before["counts"].get(k, {"requests": 0, "bytes": 0})["requests"]
-                for k in [key]}
-
-    gets = sum(
-        v["requests"] - before["counts"].get(k, {"requests": 0})["requests"]
-        for k, v in after["counts"].items()
-        if k not in before["counts"] or v["requests"] > before["counts"][k]["requests"]
-    )
-    origin_bytes = sum(
-        v["bytes"] - before["counts"].get(k, {"bytes": 0})["bytes"]
-        for k, v in after["counts"].items()
-        if v["bytes"] > before["counts"].get(k, {"bytes": 0})["bytes"]
-    )
+    if metered:
+        gets = sum(
+            v["requests"] - before["counts"].get(k, {"requests": 0})["requests"]
+            for k, v in after["counts"].items()
+            if k not in before["counts"] or v["requests"] > before["counts"][k]["requests"]
+        )
+        origin_bytes = sum(
+            v["bytes"] - before["counts"].get(k, {"bytes": 0})["bytes"]
+            for k, v in after["counts"].items()
+            if v["bytes"] > before["counts"].get(k, {"bytes": 0})["bytes"]
+        )
+    else:
+        gets, origin_bytes = None, None
 
     latencies.sort()
     p = lambda q: latencies[min(int(q * len(latencies)), len(latencies) - 1)]
