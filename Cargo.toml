@@ -13,6 +13,8 @@ license = "Apache-2.0"
 # rev our datasets were written with (pylance 12 / rev 356acb0).
 lance = { version = "=12.0.0", features = ["aws", "geo"] }
 lance-io = "=12.0.0"
+lance-index = "=12.0.0"
+lance-file = "=12.0.0"
 lance-namespace = "=12.0.0"
 lance-namespace-impls = "=12.0.0"
 object_store = { version = "0.14", features = ["aws"] }
@@ -25,6 +27,9 @@ foyer = "0.22"
 bytes = "1"
 anyhow = "1"
 flate2 = "1"
+parquet = { version = "58", features = ["arrow"] }
+geoarrow-array = "0.8"
+geoarrow-schema = "0.8"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

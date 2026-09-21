@@ -85,14 +85,35 @@ just run -- --catalog-uri s3://lake/catalog --table features --tag prod \
 
 Local benchmark replica: `--catalog-uri .tmp/cache-bench/reader/lancebench/run-20260920T134150Z --table geo --tag prod`.
 
+## Build pipeline
+
+`lakewing build` materializes the serving dataset from WKB parquet
+sources, on the same pinned release train as the serve — the pylance
+harness is retired as the producer:
+
+```
+just run -- build --source <parquet-or-dir> --out <dir>.lance --tag prod
+```
+
+Steps: parquet → GeoArrow multipolygon conversion (polygons promoted,
+`was_polygon` bit from the WKB type word, geoarrow 0.8 — the same crate
+lance's geo feature uses) → lance 12 write (2.2 storage, 512 MiB
+fragments / 10M rows per file) → BTREE(id) + RTREE(geom) → tag.
+Verified against the harness-built dataset on the full 25.36M-row
+fixture: items digests and MVT tiles byte-identical, same 8.75 GB
+footprint.
+
 ## Not yet ported from the Go serve
 
-Arrow Flight (the Go serve exposed read-only Flight over the same pages)
-and the build/materialize pipeline (converting source data into indexed
-GeoArrow Lance datasets — currently done by the pylance harness). Both
-are sized in "next steps" below.
+Arrow Flight (the Go serve exposed read-only Flight over the same pages).
 
-## What v3 added
+
+## What v4 added
+
+- `lakewing build`: the materialize pipeline in Rust (source WKB parquet
+  → GeoArrow multipolygon + was_polygon → lance 2.2 write → BTREE(id) +
+  RTREE(geom) → tag). Full-fixture verification: items digests equal and
+  MVT tiles byte-identical to the harness-built dataset, same footprint.
 
 - HTTP caching contract: strong fnv ETags, gzip variants, If-None-Match
   304s, Cache-Control/Vary (ported byte-for-byte from the Go serve —
@@ -105,3 +126,4 @@ are sized in "next steps" below.
   `ST_AsMVT` assembly — byte-identical output to the Go serve (verified
   on the full fixture, same ETag); empty tiles 204.
 - Helm chart (`charts/lakewing`) + Dockerfile for the Rust serve.
+  (v3)

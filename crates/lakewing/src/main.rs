@@ -1,8 +1,11 @@
 //! lakewing (rust): poem OGC API over a catalog-resolved, tag-pinned Lance
 //! dataset on S3, DuckDB for exact predicates/rendering, and a foyer NVMe
-//! range cache under Lance's object store. See docs/rust-architecture.md.
+//! range cache under Lance's object store. `lakewing build` materializes
+//! indexed GeoArrow datasets from WKB parquet sources. See
+//! docs/rust-architecture.md.
 mod api;
 mod app;
+mod build;
 mod cache;
 mod catalog;
 mod duck;
@@ -15,13 +18,23 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("build") {
+        return run_build(args[1..].to_vec()).await;
+    }
+    serve_main(args.into_iter()).await
+}
+
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+}
 
-    let mut args = std::env::args().skip(1);
+async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> {
     let mut catalog_root: Option<String> = None;
     let mut table = "features".to_string();
     let mut uri: Option<String> = None;
@@ -95,4 +108,39 @@ async fn main() -> anyhow::Result<()> {
         "serving lance dataset"
     );
     api::serve(app, &listen).await
+}
+
+async fn run_build(args: Vec<String>) -> anyhow::Result<()> {
+    let mut source = String::new();
+    let mut out = String::new();
+    let mut tag = "prod".to_string();
+    let mut max_rows_per_file = 10_000_000usize;
+    let mut max_bytes_per_file = 512 * 1024 * 1024usize;
+    let mut args = args.into_iter();
+    while let Some(flag) = args.next() {
+        let mut value = || args.next().expect("flag needs a value");
+        match flag.as_str() {
+            "--source" => source = value(),
+            "--out" => out = value(),
+            "--tag" => tag = value(),
+            "--max-rows-per-file" => {
+                max_rows_per_file = value().parse().unwrap_or(max_rows_per_file)
+            }
+            "--max-bytes-per-file" => {
+                max_bytes_per_file = value().parse().unwrap_or(max_bytes_per_file)
+            }
+            other => anyhow::bail!("unknown flag {other}"),
+        }
+    }
+    if source.is_empty() || out.is_empty() {
+        anyhow::bail!("build needs --source and --out");
+    }
+    build::build(build::BuildConfig {
+        source,
+        out,
+        tag,
+        max_rows_per_file,
+        max_bytes_per_file,
+    })
+    .await
 }

@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 lance = { workspace = true }
 lance-io = { workspace = true }
+lance-index = { workspace = true }
+lance-file = { workspace = true }
 lance-namespace = { workspace = true }
 lance-namespace-impls = { workspace = true }
 object_store = { workspace = true }
@@ -19,6 +21,9 @@ foyer = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
 flate2 = { workspace = true }
+parquet = { workspace = true }
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
