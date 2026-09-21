@@ -24,6 +24,7 @@ duckdb = { version = "=1.10505.0", features = ["bundled"] }
 foyer = "0.22"
 bytes = "1"
 anyhow = "1"
+flate2 = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

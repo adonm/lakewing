@@ -15,6 +15,8 @@ pub struct App {
     pub lance: Arc<LanceSource>,
     pub duck: Arc<Duck>,
     pub collections: Vec<String>,
+    pub metrics: Arc<crate::metrics::Metrics>,
+    sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl App {
@@ -66,7 +68,44 @@ impl App {
             lance,
             duck,
             collections,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(4)),
         })
+    }
+
+    /// Admission: acquire one of the concurrency permits (bounded wait).
+    pub async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ()> {
+        self.sem.acquire().await.map_err(|_| ())
+    }
+
+    /// XYZ MVT tile over the same ids-first candidate flow: pushed bbox
+    /// filter (RTREE on geo datasets), ordered id window, payload by id
+    /// IN, then DuckDB assembles the MVT. None = empty tile (204).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tile(
+        &self,
+        collection: &str,
+        z: u8,
+        x: u32,
+        y: u32,
+        sources: &[i64],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        self.validate_collection(collection)?;
+        let bounds = crate::tiles::xyz_to_bbox(z, x, y);
+        let exact = exact_predicate(collection, Some(bounds), sources);
+        let pushed = pushed_filter(collection, Some(bounds), sources, self.lance.geo_geom);
+        let ids = self
+            .lance
+            .scan_ids_topk(&pushed, crate::tiles::TILE_LIMIT)
+            .await?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let payload_filter = format!("{pushed} AND id IN ({})", id_in_list(&ids));
+        let batches = self.lance.scan_page(&payload_filter, None, None).await?;
+        let extent = crate::tiles::mercator_extent(z, x, y);
+        let sql = crate::tiles::mvt_sql(collection, &exact, extent, self.lance.has_was_polygon);
+        self.duck.mvt(&batches, &sql, self.lance.has_was_polygon)
     }
 
     fn validate_collection(&self, collection: &str) -> anyhow::Result<()> {

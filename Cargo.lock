@@ -3801,6 +3801,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "duckdb",
+ "flate2",
  "foyer",
  "futures",
  "lance",

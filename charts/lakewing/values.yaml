@@ -1,0 +1,41 @@
+# Default values for lakewing.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/adonm/lakewing
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+serve:
+  # Catalog of record (Lance Namespace directory root) and pin.
+  catalogUri: s3://lake/catalog
+  table: features
+  tag: prod
+  listen: 0.0.0.0:3000
+  # S3 access: endpoint (node-local gateway or direct) plus either static
+  # credentials from an existing secret or unsigned reads (gateway signs).
+  endpoint: ""          # e.g. http://s3-gateway:8080 (empty = cloud S3)
+  s3KeySecret: ""       # existing secret name with s3-key / s3-secret keys
+  unsigned: false       # true when a signing gateway fronts S3
+  cacheDir: /nvme/lakewing
+  cacheBytes: "8589934592"  # 8 GiB disk tier
+  # Concurrency permits (admission): 429 + Retry-After when saturated.
+  concurrency: 4
+
+# Per-node NVMe cache directory. When set, every replica mounts the same
+# hostPath; the foyer cache is per-pod (not node-shared) — the documented
+# tradeoff vs the archived Go s3cache proxy.
+cacheHostPath: /mnt/nvme/lakewing
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

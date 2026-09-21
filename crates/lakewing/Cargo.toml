@@ -18,6 +18,7 @@ duckdb = { workspace = true }
 foyer = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
+flate2 = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

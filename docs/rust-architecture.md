@@ -87,7 +87,21 @@ Local benchmark replica: `--catalog-uri .tmp/cache-bench/reader/lancebench/run-2
 
 ## Not yet ported from the Go serve
 
-Tiles, Arrow Flight, ETags/gzip/conditional requests, metrics/OTel,
-admission lanes, k8s charts, the build (materialize) pipeline, and the
-kind cachebench rig integration (the battery already runs against this
-serve over both local and S3 datasets).
+Arrow Flight (the Go serve exposed read-only Flight over the same pages)
+and the build/materialize pipeline (converting source data into indexed
+GeoArrow Lance datasets — currently done by the pylance harness). Both
+are sized in "next steps" below.
+
+## What v3 added
+
+- HTTP caching contract: strong fnv ETags, gzip variants, If-None-Match
+  304s, Cache-Control/Vary (ported byte-for-byte from the Go serve —
+  tiles and items ETags match the Go serve exactly).
+- `/metrics`: Prometheus text exposition (response counters by status,
+  requests total, in-flight gauge, pinned dataset version).
+- Admission: concurrency semaphore (4 permits) with 429 + Retry-After.
+- XYZ MVT tiles (`/collections/{c}/tiles/{z}/{x}/{y}`): same ids-first
+  flow (RTREE pushdown, ordered window, payload by id IN) with DuckDB
+  `ST_AsMVT` assembly — byte-identical output to the Go serve (verified
+  on the full fixture, same ETag); empty tiles 204.
+- Helm chart (`charts/lakewing`) + Dockerfile for the Rust serve.

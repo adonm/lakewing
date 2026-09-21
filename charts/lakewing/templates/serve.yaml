@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-serve
+  labels: &labels
+    app.kubernetes.io/name: lakewing
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: serve
+spec:
+  replicas: {{ .replicaCount }}
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: serve
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --catalog-uri={{ .Values.serve.catalogUri }}
+            - --table={{ .Values.serve.table }}
+            - --tag={{ .Values.serve.tag }}
+            - --listen={{ .Values.serve.listen }}
+            - --cache-dir={{ .Values.serve.cacheDir }}
+            - --cache-bytes={{ .Values.serve.cacheBytes }}
+            {{- if .Values.serve.endpoint }}
+            - --endpoint={{ .Values.serve.endpoint }}
+            {{- end }}
+            {{- if .Values.serve.s3KeySecret }}
+            {{- $secret := .Values.serve.s3KeySecret }}
+            - --s3-key=$(S3_KEY)
+            - --s3-secret=$(S3_SECRET)
+            {{- end }}
+          {{- if .Values.serve.s3KeySecret }}
+          env:
+            - name: S3_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.serve.s3KeySecret }}
+                  key: s3-key
+            - name: S3_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.serve.s3KeySecret }}
+                  key: s3-secret
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+          volumeMounts:
+            - name: cache
+              mountPath: {{ .Values.serve.cacheDir }}
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: cache
+          {{- if .Values.cacheHostPath }}
+          hostPath:
+            path: {{ .Values.cacheHostPath }}
+            type: DirectoryOrCreate
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: lakewing
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/name: lakewing
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: serve
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

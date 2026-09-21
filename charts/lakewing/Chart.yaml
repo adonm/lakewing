@@ -1,0 +1,6 @@
+apiVersion: v2
+name: lakewing
+description: OGC API Features serve over a pinned Lance dataset (lance-namespace catalog, DuckDB compute, foyer NVMe cache)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -6,7 +6,10 @@ mod app;
 mod cache;
 mod catalog;
 mod duck;
+mod http_cache;
 mod lake;
+mod metrics;
+mod tiles;
 
 use std::sync::Arc;
 

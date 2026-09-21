@@ -133,6 +133,23 @@ impl Duck {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Assemble an MVT over loaded candidates; Ok(None) = empty tile.
+    pub fn mvt(
+        &self,
+        batches: &[RecordBatch],
+        sql: &str,
+        was_polygon: bool,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        self.load_page(batches, was_polygon)?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, Option<Vec<u8>>>(0)?),
+            None => Ok(None),
+        }
+    }
+
     /// Distinct layer values (collections) over narrow batches.
     pub fn distinct_layers(&self, batches: &[RecordBatch]) -> anyhow::Result<Vec<String>> {
         let layers: std::collections::BTreeSet<String> = batches
