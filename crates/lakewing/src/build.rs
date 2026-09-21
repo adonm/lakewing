@@ -109,6 +109,10 @@ fn discover(source: &str) -> anyhow::Result<Vec<String>> {
     Ok(files)
 }
 
+pub(crate) fn discover_parquet(source: &str) -> anyhow::Result<Vec<String>> {
+    discover(source)
+}
+
 fn collect_parquet(dir: &std::path::Path, out: &mut Vec<String>) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -121,7 +125,7 @@ fn collect_parquet(dir: &std::path::Path, out: &mut Vec<String>) -> anyhow::Resu
     Ok(())
 }
 
-fn validate_source(schema: &Schema) -> anyhow::Result<()> {
+pub(crate) fn validate_source(schema: &Schema) -> anyhow::Result<()> {
     for name in [
         "id",
         "layer",

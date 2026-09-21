@@ -26,20 +26,23 @@ serve:
   # Optional OTLP/gRPC trace collector (e.g. http://lgtm:4317).
   otelEndpoint: ""
   # Node-local NVMe range cache; one directory per pod (see templates).
+  # Byte budgets left empty are derived from pod resources at startup
+  # (cgroup memory/CPU, cache-volume free space) and logged — see
+  # docs/tuning.md. Set explicit values to pin them.
   cacheDir: /nvme/lakewing
-  cacheBytes: "8589934592"  # 8 GiB disk tier
-  cacheMemoryBytes: "67108864"  # 64 MiB raw data/index bytes
-  cacheMetadataBytes: "2097152"  # 2 MiB immutable HEAD metadata
+  cacheBytes: ""            # "" = quarter of the volume's free space
+  cacheMemoryBytes: ""      # "" = memory limit / 128
+  cacheMetadataBytes: ""    # "" = memory limit / 4096
   # Block alignment for immutable ranges: overlapping queries reuse cached
   # bytes (0 = exact ranges).
   cacheBlockBytes: "262144"  # 256 KiB
   cacheIndexBlockBytes: "65536"  # 64 KiB for small index probes (0 = exact)
   cacheAlignMaxBlocks: 4
   cacheMaxRangeBytes: "8388608"  # bypass larger sequential reads
-  cacheFetchConcurrency: 16  # global cache-fill GET/HEAD limit
-  # Decoded Lance caches are separate RAM budgets, not part of foyer.
-  lanceIndexCacheBytes: "268435456"  # 256 MiB
-  lanceMetadataCacheBytes: "67108864"  # 64 MiB
+  cacheFetchConcurrency: ""  # "" = CPUs x 4 (8 floor, 64 cap)
+  # Decoded Lance caches; empty = derived from pod memory.
+  lanceIndexCacheBytes: ""   # "" = memory limit / 32
+  lanceMetadataCacheBytes: ""  # "" = memory limit / 128
   # Rendered-response cache (opt-in; the default posture optimizes serving
   # over cached data instead of caching rendered responses).
   responseCacheBytes: "0"

@@ -12,6 +12,8 @@ mod lake;
 mod metrics;
 mod otel;
 mod query;
+mod replicate;
+mod resources;
 mod response_cache;
 #[cfg(test)]
 mod tests;
@@ -79,11 +81,13 @@ struct ServeArgs {
     #[command(flatten)]
     cache: cache::CacheConfig,
     /// RAM for decoded Lance index pages; 0 disables. Separate from foyer.
-    #[arg(long, default_value_t = 256 * 1024 * 1024)]
-    lance_index_cache_bytes: usize,
+    /// Unset = memory limit / 32 (64 MiB floor, 2 GiB cap).
+    #[arg(long)]
+    lance_index_cache_bytes: Option<usize>,
     /// RAM for Lance file metadata; 0 disables. Separate from foyer HEADs.
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
-    lance_metadata_cache_bytes: usize,
+    /// Unset = memory limit / 128 (8 MiB floor, 512 MiB cap).
+    #[arg(long)]
+    lance_metadata_cache_bytes: Option<usize>,
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
     #[arg(long, default_value_t = 1)]
@@ -137,6 +141,25 @@ struct IndexArgs {
     storage: StorageArgs,
 }
 
+#[derive(Parser)]
+#[command(
+    name = "lakewing replicate",
+    about = "Materialize longitude-shifted GeoParquet copies of a real source for scale testing"
+)]
+struct ReplicateArgs {
+    #[arg(long)]
+    source: String,
+    #[arg(long)]
+    out_dir: String,
+    #[arg(long, default_value_t = 2)]
+    copies: usize,
+    #[arg(long, default_value_t = 10.0)]
+    offset_degrees: f64,
+    /// Cap rows per copy (verification aid; 0 = all).
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
@@ -152,6 +175,19 @@ async fn main() -> anyhow::Result<()> {
                 max_rows_per_file: args.max_rows_per_file,
                 max_bytes_per_file: args.max_bytes_per_file,
                 indexes: args.indexes,
+            })
+            .await
+        }
+        Some("replicate") => {
+            args.remove(1);
+            let args = ReplicateArgs::parse_from(args);
+            let _telemetry = otel::init(None)?;
+            replicate::replicate(replicate::ReplicateConfig {
+                source: args.source,
+                out_dir: args.out_dir,
+                copies: args.copies,
+                offset_degrees: args.offset_degrees,
+                limit: args.limit,
             })
             .await
         }
@@ -186,11 +222,37 @@ async fn main() -> anyhow::Result<()> {
 async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     args.cache.validate()?;
     let _telemetry = otel::init(args.otel_endpoint.as_deref())?;
+    let resources = resources::Resources::detect(args.cache_dir.as_deref());
+    let (cache_config, derived) = args.cache.resolve(&resources)?;
+    let lance_index_cache_bytes = args
+        .lance_index_cache_bytes
+        .unwrap_or_else(|| resources::derive_lance_index_bytes(resources.memory_bytes));
+    let lance_metadata_cache_bytes = args
+        .lance_metadata_cache_bytes
+        .unwrap_or_else(|| resources::derive_lance_metadata_bytes(resources.memory_bytes));
+    tracing::info!(
+        memory_bytes = resources.memory_bytes,
+        cpus = resources.cpus,
+        disk_free_bytes = ?resources.disk_free_bytes,
+        "detected pod resources"
+    );
+    tracing::info!(
+        auto_derived = ?derived,
+        cache_disk_bytes = cache_config.disk_bytes,
+        cache_memory_bytes = cache_config.memory_bytes,
+        cache_metadata_bytes = cache_config.metadata_bytes,
+        cache_fetch_concurrency = cache_config.fetch_concurrency,
+        ?lance_index_cache_bytes,
+        ?lance_metadata_cache_bytes,
+        origin_latency_ms = args.cache.origin_latency_ms,
+        origin_mbps = ?args.cache.origin_mbps,
+        "effective cache budgets (explicit flags override)"
+    );
     let cache = match &args.cache_dir {
         Some(dir) => Some(Arc::new(
             cache::CachingStore::open(
                 dir,
-                args.cache.clone(),
+                cache_config,
                 args.storage
                     .endpoint
                     .as_deref()
@@ -205,8 +267,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         duck_threads: args.duck_threads,
         duck_memory_mb: args.duck_memory_mb,
         response_cache_bytes: args.response_cache_bytes,
-        lance_index_cache_bytes: args.lance_index_cache_bytes,
-        lance_metadata_cache_bytes: args.lance_metadata_cache_bytes,
+        lance_index_cache_bytes: Some(lance_index_cache_bytes),
+        lance_metadata_cache_bytes: Some(lance_metadata_cache_bytes),
     };
     let options = args.storage.options();
     let app = Arc::new(match args.catalog_uri {
@@ -236,8 +298,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         }
     });
     tracing::info!(version = app.lance.version, collections = app.collections.join(","), listen = args.listen,
-        cache = ?args.cache, lance_index_cache_bytes = args.lance_index_cache_bytes,
-        lance_metadata_cache_bytes = args.lance_metadata_cache_bytes, "serving lance dataset");
+        cache = ?cache_config, lance_index_cache_bytes,
+        lance_metadata_cache_bytes, "serving lance dataset");
     if let Some(addr) = args.flight_listen {
         let flight_app = app.clone();
         tokio::spawn(async move {

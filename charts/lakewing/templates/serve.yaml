@@ -33,8 +33,6 @@ spec:
             - --duck-threads={{ .Values.serve.duckThreads }}
             - --duck-memory-mb={{ .Values.serve.duckMemoryMb }}
             - --response-cache-bytes={{ .Values.serve.responseCacheBytes }}
-            - --lance-index-cache-bytes={{ .Values.serve.lanceIndexCacheBytes }}
-            - --lance-metadata-cache-bytes={{ .Values.serve.lanceMetadataCacheBytes }}
             {{- if .Values.serve.flightListen }}
             - --flight-listen={{ .Values.serve.flightListen }}
             {{- end }}
@@ -43,14 +41,28 @@ spec:
             {{- end }}
             {{- if .Values.serve.cacheDir }}
             - --cache-dir={{ .Values.serve.cacheDir }}
+            {{- if .Values.serve.cacheBytes }}
             - --cache-bytes={{ .Values.serve.cacheBytes }}
+            {{- end }}
+            {{- if .Values.serve.cacheMemoryBytes }}
             - --cache-memory-bytes={{ .Values.serve.cacheMemoryBytes }}
+            {{- end }}
+            {{- if .Values.serve.cacheMetadataBytes }}
             - --cache-metadata-bytes={{ .Values.serve.cacheMetadataBytes }}
+            {{- end }}
             - --cache-block-bytes={{ .Values.serve.cacheBlockBytes }}
             - --cache-index-block-bytes={{ .Values.serve.cacheIndexBlockBytes }}
             - --cache-align-max-blocks={{ .Values.serve.cacheAlignMaxBlocks }}
             - --cache-max-range-bytes={{ .Values.serve.cacheMaxRangeBytes }}
+            {{- if .Values.serve.cacheFetchConcurrency }}
             - --cache-fetch-concurrency={{ .Values.serve.cacheFetchConcurrency }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.serve.lanceIndexCacheBytes }}
+            - --lance-index-cache-bytes={{ .Values.serve.lanceIndexCacheBytes }}
+            {{- end }}
+            {{- if .Values.serve.lanceMetadataCacheBytes }}
+            - --lance-metadata-cache-bytes={{ .Values.serve.lanceMetadataCacheBytes }}
             {{- end }}
             {{- if .Values.serve.endpoint }}
             - --endpoint={{ .Values.serve.endpoint }}

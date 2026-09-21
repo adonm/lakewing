@@ -20,8 +20,8 @@ pub struct SourceConfig {
     pub tag: Option<String>,
     pub version: Option<u64>,
     pub storage_options: HashMap<String, String>,
-    pub index_cache_bytes: usize,
-    pub metadata_cache_bytes: usize,
+    pub index_cache_bytes: Option<usize>,
+    pub metadata_cache_bytes: Option<usize>,
 }
 
 pub struct LanceSource {
@@ -40,10 +40,14 @@ impl LanceSource {
             cfg.tag.is_some() ^ cfg.version.is_some(),
             "pin exactly one tag or version"
         );
-        let builder = DatasetBuilder::from_uri(&cfg.uri)
-            .with_storage_options(cfg.storage_options)
-            .with_index_cache_size_bytes(cfg.index_cache_bytes)
-            .with_metadata_cache_size_bytes(cfg.metadata_cache_bytes);
+        let mut builder =
+            DatasetBuilder::from_uri(&cfg.uri).with_storage_options(cfg.storage_options);
+        if let Some(bytes) = cfg.index_cache_bytes {
+            builder = builder.with_index_cache_size_bytes(bytes);
+        }
+        if let Some(bytes) = cfg.metadata_cache_bytes {
+            builder = builder.with_metadata_cache_size_bytes(bytes);
+        }
         let dataset = match (cfg.tag, cfg.version) {
             (Some(tag), None) => builder.with_tag(&tag).load().await?,
             (None, Some(version)) => builder.with_version(version).load().await?,

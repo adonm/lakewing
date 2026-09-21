@@ -95,6 +95,8 @@ def main():
     parser.add_argument("--lance-index-cache-bytes", type=int, default=256 * 1024**2)
     parser.add_argument("--cache-fetch-concurrency", type=int, default=16)
     parser.add_argument("--cache-max-range-bytes", type=int, default=8 * 1024**2)
+    parser.add_argument("--origin-latency-ms", type=int, default=0, help="model fixed origin GET latency")
+    parser.add_argument("--origin-mbps", type=float, help="cap modeled origin GET throughput")
     parser.add_argument("--selective-only", action="store_true", help="Skip wide/full scans for cache-probe sweeps")
     args = parser.parse_args()
     if args.rounds < 1 or args.concurrency < 1:
@@ -115,6 +117,10 @@ def main():
                    "--lance-metadata-cache-bytes", str(64 * 1024**2), "--cache-fetch-concurrency", str(args.cache_fetch_concurrency),
                    "--cache-max-range-bytes", str(args.cache_max_range_bytes), "--response-cache-bytes", "0",
                    "--concurrency", str(args.concurrency), "--duck-threads", "1", "--duck-memory-mb", "512"]
+        if args.origin_latency_ms:
+            command.extend(["--origin-latency-ms", str(args.origin_latency_ms)])
+        if args.origin_mbps:
+            command.extend(["--origin-mbps", str(args.origin_mbps)])
         for key in ["endpoint", "s3_key", "s3_secret"]:
             value = getattr(args, key)
             if value:

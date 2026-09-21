@@ -4028,6 +4028,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parquet",
  "poem",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",

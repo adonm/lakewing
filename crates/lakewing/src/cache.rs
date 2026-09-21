@@ -30,15 +30,18 @@ use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CacheConfig {
-    /// Foyer disk budget (requires --cache-dir).
-    #[arg(long = "cache-bytes", default_value_t = 512 * 1024 * 1024)]
-    pub disk_bytes: usize,
-    /// Foyer data/index byte-cache RAM budget, excluding Lance's decoded caches.
-    #[arg(long = "cache-memory-bytes", default_value_t = 64 * 1024 * 1024)]
-    pub memory_bytes: usize,
+    /// Foyer disk budget. Unset = quarter of the cache volume's free space
+    /// (64 MiB floor, 256 GiB cap).
+    #[arg(long = "cache-bytes")]
+    pub disk_bytes: Option<usize>,
+    /// Foyer data/index byte-cache RAM, excluding Lance's decoded caches.
+    /// Unset = memory limit / 128 (16 MiB floor, 1 GiB cap).
+    #[arg(long = "cache-memory-bytes")]
+    pub memory_bytes: Option<usize>,
     /// Bounded in-memory immutable-object HEAD cache.
-    #[arg(long = "cache-metadata-bytes", default_value_t = 2 * 1024 * 1024)]
-    pub metadata_bytes: usize,
+    /// Unset = memory limit / 4096 (1 MiB floor, 16 MiB cap).
+    #[arg(long = "cache-metadata-bytes")]
+    pub metadata_bytes: Option<usize>,
     /// Data block grid in bytes; 0 uses exact ranges.
     #[arg(long = "cache-block-bytes", default_value_t = 256 * 1024)]
     pub block_bytes: u64,
@@ -51,12 +54,52 @@ pub struct CacheConfig {
     /// Larger ranges bypass cache admission to limit sequential-scan pollution.
     #[arg(long = "cache-max-range-bytes", default_value_t = 8 * 1024 * 1024)]
     pub max_range_bytes: u64,
-    /// Concurrent cache-fill GETs/HEADs across all requests and wrapped stores.
-    #[arg(long = "cache-fetch-concurrency", default_value_t = 16)]
-    pub fetch_concurrency: usize,
+    /// Concurrent cache-fill GETs/HEADs across all requests and wrapped
+    /// stores. Unset = CPUs x 4 (8 floor, 64 cap).
+    #[arg(long = "cache-fetch-concurrency")]
+    pub fetch_concurrency: Option<usize>,
+    /// Add fixed latency to every origin GET (benchmark modeling; 0 = off).
+    #[arg(long = "origin-latency-ms", default_value_t = 0)]
+    pub origin_latency_ms: u64,
+    /// Cap origin GET throughput in Mbit/s (benchmark modeling; unset = off).
+    #[arg(long = "origin-mbps")]
+    pub origin_mbps: Option<f64>,
 }
 
 impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            disk_bytes: None,
+            memory_bytes: None,
+            metadata_bytes: None,
+            block_bytes: 256 * 1024,
+            index_block_bytes: 64 * 1024,
+            align_max_blocks: 4,
+            max_range_bytes: 8 * 1024 * 1024,
+            fetch_concurrency: None,
+            origin_latency_ms: 0,
+            origin_mbps: None,
+        }
+    }
+}
+
+/// Concrete cache settings after explicit flags are merged with
+/// resource-derived defaults; every effective value is logged at startup.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedCacheConfig {
+    pub disk_bytes: usize,
+    pub memory_bytes: usize,
+    pub metadata_bytes: usize,
+    pub block_bytes: u64,
+    pub index_block_bytes: u64,
+    pub align_max_blocks: u64,
+    pub max_range_bytes: u64,
+    pub fetch_concurrency: usize,
+    pub origin_latency: std::time::Duration,
+    pub origin_bytes_per_sec: Option<u64>,
+}
+
+impl Default for ResolvedCacheConfig {
     fn default() -> Self {
         Self {
             disk_bytes: 512 * 1024 * 1024,
@@ -67,24 +110,76 @@ impl Default for CacheConfig {
             align_max_blocks: 4,
             max_range_bytes: 8 * 1024 * 1024,
             fetch_concurrency: 16,
+            origin_latency: std::time::Duration::ZERO,
+            origin_bytes_per_sec: None,
         }
     }
 }
 
 impl CacheConfig {
+    /// Explicit flags win; anything unset is derived from detected
+    /// resources. Returns the effective config plus which values were
+    /// auto-derived (for startup logging).
+    pub fn resolve(
+        &self,
+        resources: &crate::resources::Resources,
+    ) -> anyhow::Result<(ResolvedCacheConfig, Vec<&'static str>)> {
+        self.validate()?;
+        let mut derived = Vec::new();
+        let mut resolved = ResolvedCacheConfig {
+            block_bytes: self.block_bytes,
+            index_block_bytes: self.index_block_bytes,
+            align_max_blocks: self.align_max_blocks,
+            max_range_bytes: self.max_range_bytes,
+            origin_latency: std::time::Duration::from_millis(self.origin_latency_ms),
+            origin_bytes_per_sec: self.origin_mbps.map(|mbps| (mbps * 125_000.0) as u64),
+            ..Default::default()
+        };
+        resolved.disk_bytes = match self.disk_bytes {
+            Some(bytes) => bytes,
+            None => {
+                derived.push("cache-bytes");
+                resources
+                    .disk_free_bytes
+                    .map(crate::resources::derive_disk_bytes)
+                    .unwrap_or(512 * 1024 * 1024)
+            }
+        };
+        resolved.memory_bytes = match self.memory_bytes {
+            Some(bytes) => bytes,
+            None => {
+                derived.push("cache-memory-bytes");
+                crate::resources::derive_memory_bytes(resources.memory_bytes)
+            }
+        };
+        resolved.metadata_bytes = match self.metadata_bytes {
+            Some(bytes) => bytes,
+            None => {
+                derived.push("cache-metadata-bytes");
+                crate::resources::derive_metadata_bytes(resources.memory_bytes)
+            }
+        };
+        resolved.fetch_concurrency = match self.fetch_concurrency {
+            Some(concurrency) => concurrency,
+            None => {
+                derived.push("cache-fetch-concurrency");
+                crate::resources::derive_fetch_concurrency(resources.cpus)
+            }
+        };
+        resolved.validate()?;
+        Ok((resolved, derived))
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.disk_bytes >= 64 * 1024 * 1024,
-            "cache-bytes must be >=64 MiB"
-        );
-        anyhow::ensure!(
-            self.memory_bytes > 0 && self.metadata_bytes > 0,
-            "cache RAM budgets must be positive"
-        );
-        anyhow::ensure!(
-            (4096..=64 * 1024 * 1024).contains(&self.max_range_bytes),
-            "cache-max-range-bytes must be 4 KiB..64 MiB"
-        );
+        for (name, value) in [
+            ("cache-bytes", self.disk_bytes),
+            ("cache-memory-bytes", self.memory_bytes),
+            ("cache-metadata-bytes", self.metadata_bytes),
+        ] {
+            if let Some(bytes) = value {
+                anyhow::ensure!(bytes > 0, "{name} must be positive");
+            }
+        }
         for block in [self.block_bytes, self.index_block_bytes] {
             anyhow::ensure!(
                 block == 0 || (4096..=4 * 1024 * 1024).contains(&block),
@@ -96,8 +191,42 @@ impl CacheConfig {
             );
         }
         anyhow::ensure!(
+            (4096..=64 * 1024 * 1024).contains(&self.max_range_bytes),
+            "cache-max-range-bytes must be 4 KiB..64 MiB"
+        );
+        anyhow::ensure!(
             (1..=64).contains(&self.align_max_blocks),
             "cache-align-max-blocks must be 1..64"
+        );
+        if let Some(concurrency) = self.fetch_concurrency {
+            anyhow::ensure!(
+                (1..=256).contains(&concurrency),
+                "cache-fetch-concurrency must be 1..256"
+            );
+        }
+        anyhow::ensure!(
+            self.origin_latency_ms <= 10_000,
+            "origin-latency-ms must be at most 10 s"
+        );
+        if let Some(mbps) = self.origin_mbps {
+            anyhow::ensure!(
+                mbps.is_finite() && mbps > 0.0,
+                "origin-mbps must be positive"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl ResolvedCacheConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.disk_bytes >= 64 * 1024 * 1024,
+            "cache-bytes must be >=64 MiB"
+        );
+        anyhow::ensure!(
+            self.memory_bytes > 0 && self.metadata_bytes > 0,
+            "cache RAM budgets must be positive"
         );
         anyhow::ensure!(
             (1..=256).contains(&self.fetch_concurrency),
@@ -121,7 +250,7 @@ pub struct CachingStore {
     cache: HybridCache<String, Bytes>,
     metadata: foyer::Cache<String, (ObjectMeta, Attributes)>,
     scheme: String,
-    config: CacheConfig,
+    config: ResolvedCacheConfig,
     fetches: Arc<Semaphore>,
     pub metrics: Arc<CacheMetrics>,
     _lock: Arc<std::fs::File>,
@@ -182,7 +311,11 @@ impl std::fmt::Display for CachingStore {
 }
 
 impl CachingStore {
-    pub async fn open(dir: &str, config: CacheConfig, identity: &str) -> anyhow::Result<Self> {
+    pub async fn open(
+        dir: &str,
+        config: ResolvedCacheConfig,
+        identity: &str,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
         std::fs::create_dir_all(dir)?;
         let lock = std::fs::OpenOptions::new()
@@ -207,7 +340,7 @@ impl CachingStore {
             })
             .build();
         Ok(Self {
-            inner: Arc::new(object_store::memory::InMemory::new()),
+            inner: throttled(Arc::new(object_store::memory::InMemory::new()), &config),
             cache,
             metadata,
             scheme: identity.to_string(),
@@ -492,11 +625,11 @@ impl ObjectStore for CachingStore {
 impl WrappingObjectStore for CachingStore {
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSStore>) -> Arc<dyn OSStore> {
         Arc::new(CachingStore {
-            inner: original,
+            inner: throttled(original, &self.config),
             cache: self.cache.clone(),
             metadata: self.metadata.clone(),
             scheme: serde_json::to_string(&(&self.scheme, store_prefix)).expect("store identity"),
-            config: self.config.clone(),
+            config: self.config,
             fetches: self.fetches.clone(),
             metrics: self.metrics.clone(),
             _lock: self._lock.clone(),
@@ -510,6 +643,24 @@ impl WrappingObjectStore for CachingStore {
     ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
         Some(original)
     }
+}
+
+/// Wrap an origin store with benchmark latency/throughput modeling
+/// (`--origin-latency-ms` / `--origin-mbps`): deterministic and local-only,
+/// never a production control.
+fn throttled(inner: Arc<dyn OSStore>, config: &ResolvedCacheConfig) -> Arc<dyn OSStore> {
+    if config.origin_latency.is_zero() && config.origin_bytes_per_sec.is_none() {
+        return inner;
+    }
+    let mut throttle = object_store::throttle::ThrottleConfig::default();
+    if !config.origin_latency.is_zero() {
+        throttle.wait_get_per_call = config.origin_latency;
+    }
+    if let Some(bytes_per_sec) = config.origin_bytes_per_sec {
+        throttle.wait_get_per_byte =
+            std::time::Duration::from_nanos((1_000_000_000 / bytes_per_sec.max(1)).max(1));
+    }
+    Arc::new(object_store::throttle::ThrottledStore::new(inner, throttle))
 }
 
 fn immutable(location: &Path) -> bool {
@@ -646,8 +797,8 @@ mod tests {
         store.close().await.unwrap();
     }
 
-    fn test_config(block: u64) -> CacheConfig {
-        CacheConfig {
+    fn test_config(block: u64) -> ResolvedCacheConfig {
+        ResolvedCacheConfig {
             disk_bytes: 64 * 1024 * 1024,
             memory_bytes: 1024 * 1024,
             block_bytes: block,
@@ -655,6 +806,103 @@ mod tests {
             max_range_bytes: 16 * 1024,
             fetch_concurrency: 2,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolves_explicit_over_derived_and_logs_the_rest() {
+        let resources = crate::resources::Resources {
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            cpus: 4,
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+        };
+        let (resolved, derived) = CacheConfig::default().resolve(&resources).unwrap();
+        assert_eq!(
+            derived,
+            vec![
+                "cache-bytes",
+                "cache-memory-bytes",
+                "cache-metadata-bytes",
+                "cache-fetch-concurrency"
+            ]
+        );
+        assert_eq!(resolved.disk_bytes, 25 * 1024 * 1024 * 1024);
+        assert_eq!(resolved.memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(resolved.metadata_bytes, 2 * 1024 * 1024);
+        assert_eq!(resolved.fetch_concurrency, 16);
+        // Explicit flags win over every derivation.
+        let config = CacheConfig {
+            disk_bytes: Some(128 * 1024 * 1024),
+            memory_bytes: Some(32 * 1024 * 1024),
+            metadata_bytes: Some(1024 * 1024),
+            fetch_concurrency: Some(3),
+            ..Default::default()
+        };
+        let (resolved, derived) = config.resolve(&resources).unwrap();
+        assert!(derived.is_empty());
+        assert_eq!(resolved.disk_bytes, 128 * 1024 * 1024);
+        assert_eq!(resolved.memory_bytes, 32 * 1024 * 1024);
+        assert_eq!(resolved.metadata_bytes, 1024 * 1024);
+        assert_eq!(resolved.fetch_concurrency, 3);
+        // Latency modeling is carried through, and absent disk info keeps
+        // the static disk default.
+        let config = CacheConfig {
+            origin_latency_ms: 20,
+            origin_mbps: Some(200.0),
+            ..Default::default()
+        };
+        let (resolved, _) = config
+            .resolve(&crate::resources::Resources {
+                memory_bytes: 8 * 1024 * 1024 * 1024,
+                cpus: 4,
+                disk_free_bytes: None,
+            })
+            .unwrap();
+        assert_eq!(
+            resolved.origin_latency,
+            std::time::Duration::from_millis(20)
+        );
+        assert_eq!(resolved.origin_bytes_per_sec, Some(25_000_000));
+        assert_eq!(resolved.disk_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_unbounded_cache_settings() {
+        for config in [
+            CacheConfig {
+                block_bytes: u64::MAX,
+                ..Default::default()
+            },
+            CacheConfig {
+                index_block_bytes: 1,
+                ..Default::default()
+            },
+            CacheConfig {
+                align_max_blocks: u64::MAX,
+                ..Default::default()
+            },
+            CacheConfig {
+                max_range_bytes: u64::MAX,
+                ..Default::default()
+            },
+            CacheConfig {
+                memory_bytes: Some(0),
+                ..Default::default()
+            },
+            CacheConfig {
+                fetch_concurrency: Some(0),
+                ..Default::default()
+            },
+            CacheConfig {
+                origin_latency_ms: 60_000,
+                ..Default::default()
+            },
+            CacheConfig {
+                origin_mbps: Some(0.0),
+                ..Default::default()
+            },
+        ] {
+            assert!(config.validate().is_err());
         }
     }
 
@@ -762,11 +1010,11 @@ mod tests {
             .put(&path, Bytes::from(vec![7; 8192]).into())
             .await
             .unwrap();
-        let store = CachingStore::open(dir.path().to_str().unwrap(), config.clone(), "endpoint")
+        let store = CachingStore::open(dir.path().to_str().unwrap(), config, "endpoint")
             .await
             .unwrap();
         assert!(
-            CachingStore::open(dir.path().to_str().unwrap(), config.clone(), "endpoint")
+            CachingStore::open(dir.path().to_str().unwrap(), config, "endpoint")
                 .await
                 .is_err()
         );
@@ -825,37 +1073,5 @@ mod tests {
         assert_eq!(reopened.metrics.disk_hits.load(Ordering::Relaxed), 1);
         drop(wrapped);
         reopened.close().await.unwrap();
-    }
-
-    #[test]
-    fn rejects_unbounded_cache_settings() {
-        for config in [
-            CacheConfig {
-                block_bytes: u64::MAX,
-                ..Default::default()
-            },
-            CacheConfig {
-                index_block_bytes: 1,
-                ..Default::default()
-            },
-            CacheConfig {
-                align_max_blocks: u64::MAX,
-                ..Default::default()
-            },
-            CacheConfig {
-                max_range_bytes: u64::MAX,
-                ..Default::default()
-            },
-            CacheConfig {
-                memory_bytes: 0,
-                ..Default::default()
-            },
-            CacheConfig {
-                fetch_concurrency: 0,
-                ..Default::default()
-            },
-        ] {
-            assert!(config.validate().is_err());
-        }
     }
 }

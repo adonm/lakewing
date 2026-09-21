@@ -21,6 +21,7 @@ foyer = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
 flate2 = { workspace = true }
+rustix = { workspace = true }
 parquet = { workspace = true }
 geoarrow-array = { workspace = true }
 tonic = { workspace = true }

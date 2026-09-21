@@ -190,7 +190,30 @@ bypass call across the whole sweep) — local file reads do not traverse the
 wrapped ranged-`get` path. Cache-behavior claims therefore run against an
 object-store dataset.
 
-### v10 cache sweep (S3/SeaweedFS origin, equal 512 MiB budgets)
+### v11 nation-scale fixture (2026-09-21)
+
+`lakewing replicate --copies 4 --offset-degrees 10` materialized four
+longitude-shifted copies of the real NW-Europe source through DuckDB
+`ST_Affine` (bbox columns shifted to match) in ~90 s, and `lakewing build`
+indexed the result in ~8 min: **101,433,016 features, 31 GiB Lance, 49
+fragments, BTREE 24,764 leaf pages, RTREE + 49,528-zone bbox zonemaps**,
+tagged `prod`. Copy 0 keeps original ids (the battery's ITEM id still
+resolves); copy k prefixes `k:`. First local smoke (concurrent with other
+disk load): ITEM 28 ms (copy 0) / 15 ms (`2:` copy), CITY 61 ms, shifted
+CITY at +20° 50 ms, z12 Amsterdam tile 507 ms and **byte-identical
+(244,593 B) to the 25M fixture's tile** — each region sees only its copy,
+so spatial-index behavior scales as N independent datasets rather than N×
+density in one place. Headroom on this workstation (1.7 TiB free,
+~312 B/row): ~500M–1B rows before disk; beyond that (and for real
+PB-scale) the path is more regions/collections, not one bigger dataset.
+The same dataset is seeded into the local origin at
+`s3://lake/lancebench/nation/geo.lance`.
+
+Workspace convention: benchmark data, caches, logs and index-training
+spills all live in the repo's `.tmp/` (NVMe). `/tmp` here is a 32 GiB
+tmpfs and has already caused a spurious `EDQUOT` during RTREE training;
+the justfile exports `TMPDIR` into `.tmp/` for exactly that reason.
+
 
 Same binary and dataset (`s3://lake/lancebench/run-20260920T134150Z`,
 25.36M rows) served through a port-forwarded SeaweedFS S3 endpoint; three
@@ -224,6 +247,15 @@ port-forwarded origin has near-zero latency; the GET-count reduction is the
 transferable measurement, and modeling it against real S3 latencies needs
 the rig's delay endpoint (follow-up). Single host, one dataset, OS/origin
 caches not flushed.
+
+Latency-model check (v11, `--origin-latency-ms 20 --origin-mbps 200`
+against the local SeaweedFS origin, under concurrent load): the same
+sweep did byte-identical work (3 021 origin GETs / 360.6 MB cold, zero
+warm) with and without the model. Modeled S3 latency roughly tripled
+first-touch times (CITY0 712 → 2 116 ms) while warm passes converged back
+to ~25–30 ms — repeat and overlapping traffic is shielded from origin
+latency by the block cache, which is the point of caching data instead of
+responses.
 
 ## Serve
 

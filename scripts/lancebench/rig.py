@@ -142,7 +142,8 @@ def main():
     table = args.remote_prefix.rsplit("/", 1)[-1]
 
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log = Path(f"/tmp/opencode/rust-rig-{stamp}.log")
+    log = ROOT / ".tmp" / f"rust-rig-{stamp}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         args.serve_bin,
         "--catalog-uri", catalog_root,
@@ -154,7 +155,7 @@ def main():
         "--s3-key", "cachebench",
         "--s3-secret", "cachebench-local-only",
         "--listen", args.listen,
-        "--cache-dir", "/tmp/opencode/rust-rig-cache",
+        "--cache-dir", str(ROOT / ".tmp" / "rust-rig-cache"),
         "--cache-bytes", str(512 * 1024 * 1024),
     ]
     print("serve:", " ".join(cmd))

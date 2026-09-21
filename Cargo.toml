@@ -27,6 +27,7 @@ foyer = "0.22"
 bytes = "1"
 anyhow = "1"
 flate2 = "1"
+rustix = { version = "1", features = ["fs"] }
 parquet = { version = "58", features = ["arrow"] }
 geoarrow-array = "0.8"
 tonic = "0.14"

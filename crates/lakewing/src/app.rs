@@ -16,8 +16,10 @@ pub struct Limits {
     pub duck_memory_mb: usize,
     /// Rendered-response cache budget in bytes; 0 disables the cache.
     pub response_cache_bytes: usize,
-    pub lance_index_cache_bytes: usize,
-    pub lance_metadata_cache_bytes: usize,
+    /// Decoded Lance index RAM; None derives from the pod memory limit.
+    pub lance_index_cache_bytes: Option<usize>,
+    /// Lance file-metadata RAM; None derives from the pod memory limit.
+    pub lance_metadata_cache_bytes: Option<usize>,
 }
 
 impl Default for Limits {
@@ -27,8 +29,8 @@ impl Default for Limits {
             duck_threads: 1,
             duck_memory_mb: 512,
             response_cache_bytes: 0,
-            lance_index_cache_bytes: 256 * 1024 * 1024,
-            lance_metadata_cache_bytes: 64 * 1024 * 1024,
+            lance_index_cache_bytes: None,
+            lance_metadata_cache_bytes: None,
         }
     }
 }

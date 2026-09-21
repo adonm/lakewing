@@ -22,7 +22,8 @@ OSM Layercake GeoParquet (WKB)
                                  └─ foyer: NVMe range cache under the object store
 ```
 
-One binary: serve (the default), `build`, and `index`; one pinned snapshot per reader.
+One binary: serve (the default), `build`, `index`, and `replicate`; one
+pinned snapshot per reader.
 Apache-2.0.
 
 ## Quickstart
@@ -135,6 +136,9 @@ serving path and data cache rather than caching rendered responses.
 See [cache and index tuning](docs/tuning.md) for every budget, measurement
 counters, and the equal-budget sweep. `lakewing --help` lists the controls;
 invalid numeric settings fail startup instead of silently selecting defaults.
+**Size budgets left unset are derived from pod resources at startup**
+(cgroup memory/CPU, cache-volume free space) and logged — explicit flags
+always win, and an 8 GiB / 4-CPU pod reproduces the previous static defaults.
 
 ## Build
 
@@ -160,6 +164,27 @@ just run -- index --uri <dir>.lance --tag tuned-v2 --replace \
 `index` operates on the latest snapshot with a single writer and creates a
 new tag only after success. Existing tags and pinned readers retain their
 snapshot. The same index parameters are available on `build`.
+
+## Local S3-like origin
+
+`just dev-origin` runs one SeaweedFS container (image already local) with
+fixed credentials and a `lake` bucket; `just dev-seed <dir> s3/prefix`
+uploads a dataset with rclone. No kind cluster, no port-forwards. Model
+real-world S3 latency on any serve with `--origin-latency-ms 20
+--origin-mbps 500` (also `just dev-serve-latency`) — sweeps then show
+latency savings from GET-count reductions. See docs/tuning.md.
+
+## Scale datasets
+
+```sh
+just run -- replicate --source source.parquet --out-dir parts --copies 4 --offset-degrees 10
+just run -- build --source parts --out nation.lance --tag prod
+```
+
+Materializes longitude-shifted copies of a real source through DuckDB
+spatial (`ST_Affine`, bbox columns shifted to match): real geometry at
+realistic density across a nation-scale extent. Copy 0 keeps original ids;
+copy k ≥ 1 prefixes `k:`.
 
 ## Deployment
 

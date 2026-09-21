@@ -3,21 +3,49 @@
 Response caching defaults to **off**. These controls tune reusable data and
 index pages. Byte budgets below are per reader process, not per request.
 
+## Auto-derived budgets
+
+Every size-oriented budget may be left unset (CLI flag absent, chart value
+empty), in which case startup derives it from the resources the pod actually
+has — the cgroup memory limit (v2 `memory.max`, v1 fallback, `/proc/meminfo`
+last), the effective CPU quota (cgroup `cpu.max`/CFS, affinity), and the
+free space of the cache directory's filesystem — and logs both the detected
+resources and the effective values. Explicit flags always win.
+
+| Flag | Derivation when unset |
+|---|---|
+| `--cache-bytes` | quarter of cache-volume free space, clamped 64 MiB..256 GiB |
+| `--cache-memory-bytes` | memory limit / 128, clamped 16 MiB..1 GiB |
+| `--cache-metadata-bytes` | memory limit / 4096, clamped 1 MiB..16 MiB |
+| `--cache-fetch-concurrency` | CPUs × 4, clamped 8..64 |
+| `--lance-index-cache-bytes` | memory limit / 32, clamped 64 MiB..2 GiB |
+| `--lance-metadata-cache-bytes` | memory limit / 128, clamped 8 MiB..512 MiB |
+
+The formulas reproduce the previous static defaults on an 8 GiB / 4-CPU pod
+(64 MiB / 2 MiB / 16 / 256 MiB / 64 MiB). They are deliberately small
+fractions: these budgets coexist with DuckDB's memory limit, in-flight Arrow
+batches and engine buffers, so treat them as shares, not as the pod's whole
+memory. The disk derivation assumes the cache directory is (mostly)
+dedicated; on a shared volume set `--cache-bytes` explicitly. Geometry
+controls (block sizes, alignment threshold, admission ceiling) are workload
+choices, not resource shares, and keep static defaults. Admission
+(`--concurrency`) and DuckDB budgets stay explicit for the same reason.
+
 ## Reader controls
 
 | Flag | Default | Purpose |
 |---|---:|---|
 | `--cache-dir` | unset | Enable the foyer raw-byte cache on node-local NVMe |
-| `--cache-bytes` | 512 MiB (chart: 8 GiB) | Disk tier; minimum 64 MiB |
-| `--cache-memory-bytes` | 64 MiB | Raw data/index byte RAM tier |
-| `--cache-metadata-bytes` | 2 MiB | Immutable-object HEAD metadata RAM |
+| `--cache-bytes` | auto | Disk tier; quarter of volume free space |
+| `--cache-memory-bytes` | auto | Raw data/index byte RAM tier |
+| `--cache-metadata-bytes` | auto | Immutable-object HEAD metadata RAM |
 | `--cache-block-bytes` | 256 KiB | Data block grid; 0 = exact ranges |
 | `--cache-index-block-bytes` | 64 KiB | Separate `_indices/` grid; 0 = exact ranges |
 | `--cache-align-max-blocks` | 4 | Reads at least this many blocks wide use one exact entry |
 | `--cache-max-range-bytes` | 8 MiB | Larger reads bypass cache admission |
-| `--cache-fetch-concurrency` | 16 | Global cached-range fill GET/HEAD concurrency, shared across requests/stores |
-| `--lance-index-cache-bytes` | 256 MiB | Decoded Lance index RAM; 0 = disabled |
-| `--lance-metadata-cache-bytes` | 64 MiB | Lance file metadata RAM; 0 = disabled |
+| `--cache-fetch-concurrency` | auto | Global cached-range fill GET/HEAD concurrency, shared across requests/stores |
+| `--lance-index-cache-bytes` | auto | Decoded Lance index RAM; 0 = disabled |
+| `--lance-metadata-cache-bytes` | auto | Lance file metadata RAM; 0 = disabled |
 
 Raw foyer bytes and decoded Lance pages are separate budgets. Add DuckDB's
 memory budget, in-flight Arrow batches, query-engine buffers, and allocator
@@ -143,3 +171,34 @@ path (run cache sweeps against an object-store `--uri`), and a port-forwarded
 localhost origin hides the latency benefit of fewer GETs. Recorded v10 sweep
 numbers (equality plus origin-GET/byte attribution) live in
 `docs/rust-architecture.md`.
+
+## Local S3-like origin (one process, no cluster)
+
+`just dev-origin` starts a single SeaweedFS process on local NVMe (ports
+8337 S3 / 19333 master / 18888 filer; data under `.tmp/origin/`), with fixed
+benchmark credentials (`cachebench` / `cachebench-local-only`) and a `lake`
+bucket. `just dev-seed <dir> s3/prefix` uploads a dataset into it with
+rclone. This replaces the kind-cluster rig for everyday cache work: same S3
+semantics (HTTP, range GETs, path-style), no port-forwards, no cluster state.
+The metered/delay kind rig remains available for origin-side attribution when
+needed.
+
+To model real-world S3 latency without any infrastructure, pass
+`--origin-latency-ms 20 --origin-mbps 500` to the serve (or tune.py): every
+origin GET beneath the cache then sleeps the fixed latency and is capped at
+the modeled throughput (deterministic, via object_store's `ThrottledStore`).
+Sweeps then show latency/throughput savings from GET-count reductions, not
+just counter deltas. Measured: identical origin work with and without the
+model; cold CITY0 712 → 2 116 ms while warm passes stayed ~25–30 ms — the
+cache shields repeat traffic from origin latency. These flags are benchmark
+controls, never production tunables.
+
+## Scale datasets
+
+`lakewing replicate --source <parquet> --out-dir <dir> --copies N
+--offset-degrees 10` materializes N longitude-shifted copies of a real
+source through DuckDB spatial (`ST_Affine`; bbox columns shifted to match),
+then `lakewing build --source <dir>` indexes them as usual. Copy 0 keeps the
+original ids (existing workload ids still resolve); copy k ≥ 1 prefixes
+`k:`. The result is real geometry at realistic density spread over a
+nation-scale extent — see rust-architecture.md for the measured run.
