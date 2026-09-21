@@ -11,7 +11,7 @@ license = "Apache-2.0"
 # One release train, pinned together (see docs/rust-architecture.md):
 # writer/reader vintages must match; 12.0.0 is the crates release of the
 # rev our datasets were written with (pylance 12 / rev 356acb0).
-lance = { version = "=12.0.0", features = ["aws"] }
+lance = { version = "=12.0.0", features = ["aws", "geo"] }
 lance-io = "=12.0.0"
 lance-namespace = "=12.0.0"
 lance-namespace-impls = "=12.0.0"

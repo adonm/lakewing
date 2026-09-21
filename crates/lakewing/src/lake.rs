@@ -1,14 +1,17 @@
 //! Lance feature source: a tag/version-pinned dataset with SQL-filtered
 //! scans. "Basic retrieval/lookup done by lance": point lookups ride the
-//! BTREE on id, bbox pages push the column-overlap predicates, and exact
+//! BTREE on id, bbox pages push `ST_Intersects` on the GeoArrow geometry
+//! (driving the RTREE) or bbox-column overlap on WKB datasets, and exact
 //! predicates run in DuckDB over the candidate rows (duck.rs).
+use std::collections::BinaryHeap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, LargeStringArray, StringArray};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use lance::dataset::refs::Ref;
-use lance::dataset::scanner::ColumnOrdering;
+use lance::dataset::builder::DatasetBuilder;
 use lance::Dataset;
 
 use crate::cache::CachingStore;
@@ -19,11 +22,18 @@ pub struct SourceConfig {
     pub uri: String,
     pub tag: Option<String>,
     pub version: Option<u64>,
+    /// Object-store options (endpoint/allow_http/skip_signature/region).
+    pub storage_options: HashMap<String, String>,
 }
 
 pub struct LanceSource {
     dataset: Arc<Dataset>,
     pub version: u64,
+    /// geom is GeoArrow (list-of-rings) — payloads project WKB via
+    /// ST_AsBinary and the pushed filter uses ST_Intersects (RTREE).
+    pub geo_geom: bool,
+    /// geo datasets carry the polygon-vs-multipolygon promotion bit.
+    pub has_was_polygon: bool,
 }
 
 impl LanceSource {
@@ -33,14 +43,13 @@ impl LanceSource {
         if tag.is_none() && version.is_none() {
             anyhow::bail!("pin a tag or version (latest is not a snapshot)");
         }
-        let dataset = Dataset::open(&cfg.uri).await?;
+        let mut builder = DatasetBuilder::from_uri(&cfg.uri);
+        if !cfg.storage_options.is_empty() {
+            builder = builder.with_storage_options(cfg.storage_options);
+        }
         let dataset = match (tag, version) {
-            (Some(tag), _) => dataset.checkout_version(Ref::Tag(tag.to_string())).await?,
-            (None, Some(version)) => {
-                dataset
-                    .checkout_version(Ref::VersionNumber(version))
-                    .await?
-            }
+            (Some(tag), _) => builder.with_tag(tag).load().await?,
+            (None, Some(version)) => builder.with_version(version).load().await?,
             _ => unreachable!(),
         };
         let dataset = match cache {
@@ -49,10 +58,20 @@ impl LanceSource {
             ]),
             None => dataset,
         };
+
+        let schema = dataset.schema();
+        let geom_type = schema
+            .field("geom")
+            .map(|f| f.data_type().clone())
+            .ok_or_else(|| anyhow::anyhow!("dataset has no geom column"))?;
+        let geo_geom = !matches!(geom_type, DataType::Binary | DataType::LargeBinary);
+        let has_was_polygon = schema.field("was_polygon").is_some();
         let version = dataset.version().version;
         Ok(Self {
             dataset: Arc::new(dataset),
             version,
+            geo_geom,
+            has_was_polygon,
         })
     }
 
@@ -63,7 +82,8 @@ impl LanceSource {
         Ok(scanner)
     }
 
-    /// Scan payload columns (geom as stored: WKB-blob datasets).
+    /// Scan payload columns. GeoArrow geometry projects as WKB
+    /// (`ST_AsBinary(geom)`); WKB datasets pass the blob through.
     pub async fn scan_page(
         &self,
         filter: &str,
@@ -71,67 +91,80 @@ impl LanceSource {
         offset: Option<u64>,
     ) -> anyhow::Result<Vec<RecordBatch>> {
         let mut scanner = self.scanner(filter)?;
+        let mut projection: Vec<(&str, String)> = vec![
+            ("id", "id".to_string()),
+            ("geom", "geom".to_string()),
+            ("properties", "properties".to_string()),
+            ("layer", "layer".to_string()),
+            ("source_id", "source_id".to_string()),
+            ("xmin", "xmin".to_string()),
+            ("ymin", "ymin".to_string()),
+            ("xmax", "xmax".to_string()),
+            ("ymax", "ymax".to_string()),
+        ];
+        if self.geo_geom {
+            projection[1] = ("geom", "ST_AsBinary(geom)".to_string());
+        }
+        if self.has_was_polygon {
+            projection.push(("was_polygon", "was_polygon".to_string()));
+        }
         let _ = scanner
-            .project(&[
-                "id",
-                "geom",
-                "properties",
-                "layer",
-                "source_id",
-                "xmin",
-                "ymin",
-                "xmax",
-                "ymax",
-            ])?
+            .project_with_transform(&projection)?
             .limit(limit.map(|l| l as i64), offset.map(|o| o as i64));
-        let batches = scanner.try_into_stream().await?.try_collect().await?;
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
         Ok(batches)
     }
 
-    /// Scan the narrow id/layer/source/bbox projection for ids-first
-    /// pagination and layer discovery. Bbox columns ride along so pushed
-    /// range filters prune fragments without touching payloads.
-    pub async fn scan_ids(&self, filter: &str) -> anyhow::Result<Vec<RecordBatch>> {
-        let mut scanner = self.scanner(filter)?;
-        scanner.project(&["id", "layer", "source_id", "xmin", "ymin", "xmax", "ymax"])?;
-        let batches = scanner.try_into_stream().await?.try_collect().await?;
-        Ok(batches)
-    }
-
-    /// Ordered id window with the top-N pushed into Lance
-    /// (`order_by` id asc plus `limit`), returning at most `fetch` ids
-    /// in id order. The caller applies cursor/offset slicing; Lance
-    /// never materializes more than the window.
-    pub async fn scan_ids_window(&self, filter: &str, fetch: u64) -> anyhow::Result<Vec<String>> {
+    /// Ordered id window: unsorted narrow id scan (parallel, index-free)
+    /// with a bounded max-heap selecting the `fetch` smallest ids — no
+    /// full sort of the candidate set, no more than `fetch` ids held.
+    pub async fn scan_ids_topk(&self, filter: &str, fetch: usize) -> anyhow::Result<Vec<String>> {
         let mut scanner = self.scanner(filter)?;
         scanner.project(&["id"])?;
-        scanner.order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))?;
-        let _ = scanner.limit(Some(fetch as i64), None);
-        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
-        batch_ids(&batches)
-    }
-}
-
-/// Collect the `id` column (VARCHAR or LargeVARCHAR) into Strings.
-pub fn batch_ids(batches: &[RecordBatch]) -> anyhow::Result<Vec<String>> {
-    let mut ids = Vec::new();
-    for batch in batches {
-        let idx = batch
-            .schema()
-            .index_of("id")
-            .map_err(|_| anyhow::anyhow!("id column missing"))?;
-        let col = batch.column(idx);
-        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-            for i in 0..a.len() {
-                ids.push(a.value(i).to_string());
+        let stream = scanner.try_into_stream().await?;
+        tokio::pin!(stream);
+        let mut heap: BinaryHeap<String> = BinaryHeap::with_capacity(fetch + 1);
+        while let Some(batch) = stream.try_next().await? {
+            let idx = batch
+                .schema()
+                .index_of("id")
+                .map_err(|_| anyhow::anyhow!("id column missing"))?;
+            let col = batch.column(idx);
+            let push = |heap: &mut BinaryHeap<String>, value: &str| {
+                if heap.len() < fetch {
+                    heap.push(value.to_string());
+                } else if let Some(max) = heap.peek() {
+                    if value < max.as_str() {
+                        // Replace the current max.
+                        let mut slot = heap.pop().unwrap();
+                        slot.clear();
+                        slot.push_str(value);
+                        heap.push(slot);
+                    }
+                }
+            };
+            if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+                for i in 0..a.len() {
+                    push(&mut heap, a.value(i));
+                }
+            } else if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+                for i in 0..a.len() {
+                    push(&mut heap, a.value(i));
+                }
+            } else {
+                anyhow::bail!("id column is {}", col.data_type());
             }
-        } else if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
-            for i in 0..a.len() {
-                ids.push(a.value(i).to_string());
-            }
-        } else {
-            anyhow::bail!("id column is {}", col.data_type());
         }
+        let mut ids = heap.into_vec();
+        ids.sort_unstable();
+        Ok(ids)
     }
-    Ok(ids)
+
+    /// Scan the narrow id/layer projection for layer discovery.
+    pub async fn scan_ids(&self, filter: &str) -> anyhow::Result<Vec<RecordBatch>> {
+        let mut scanner = self.scanner(filter)?;
+        scanner.project(&["id", "layer", "source_id"])?;
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        Ok(batches)
+    }
 }

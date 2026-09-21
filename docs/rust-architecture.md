@@ -40,22 +40,32 @@ poem (OGC REST)
   hop. Per-pod, not node-shared — the known tradeoff vs the archived Go
   s3cache proxy; a shared foyer proxy can slot in behind the same trait.
 
-## Benchmark (v1 parity gate, full 25.36M-row fixture, local NVMe)
+## Benchmark (v2 parity gate, full 25.36M-row GeoArrow fixture)
 
-`scripts/lancebench/battery.py` — canonical-JSON equality + medians:
+`scripts/lancebench/battery.py` — canonical-JSON equality + medians.
+Serving dataset: `geo.lance` (GeoArrow geom, RTREE on geom, BTREE on id,
+tag-pinned v3). Local = dataset on NVMe; S3 = same dataset via SeaweedFS
+with the foyer NVMe cache (512 MiB) under Lance:
 
-| query | Go serve (DuckLake/parquet) | Rust serve (lance+duckdb) |
-| --- | --- | --- |
-| ITEM (BTREE) | 43 ms | **6.8 ms** |
-| FULL page | 600 ms | **573 ms** |
-| CITY (bbox) | **76 ms** | 372 ms |
-| DEEP (offset 50k) | **3.9 s** | 6.9 s |
+| query | Go serve (DuckLake/parquet) | Rust local | Rust S3+foyer |
+| --- | --- | --- | --- |
+| ITEM (BTREE) | 35 ms | **7.9 ms** | **7.0 ms** |
+| FULL page | **495 ms** | 602 ms | 560 ms |
+| CITY (bbox) | 49 ms | 30.5 ms | **30.4 ms** |
+| DEEP (offset 50k) | 4008 ms | **718 ms** | **735 ms** |
 
-Equality: all match (ids, geometry, properties, links). Known v1 gaps:
-CITY scans bbox columns of every fragment (the RTree/GeoArrow dataset
-path and `ST_Intersects` pushdown close this — verified in the SDK
-battery at 2 ms); DEEP's 50k window does a top-N over all ids (needs
-either Lance index-assisted ordering or a DuckDB-side stream).
+Equality: all match across every pair (ids, geometry, properties, links),
+local vs S3 included.
+
+v2 changes over v1: bbox pages push `ST_Intersects` on the GeoArrow
+geometry (drives the RTREE — CITY went 372 ms → 30 ms); the deep-offset
+id window uses a bounded max-heap during the narrow scan instead of a
+Lance-side ordered scan (DEEP 6.9 s → 0.72 s); payload projections emit
+WKB via `ST_AsBinary(geom)` with `was_polygon` restoring single-part
+polygons in DuckDB so GeoJSON matches the source byte-for-byte; storage
+options (--endpoint/--s3-key/--s3-secret) flow to both the directory
+namespace and the dataset; cold-cache S3 first-touch: CITY 189 ms,
+FULL 630 ms, ITEM 673 ms.
 
 ## Serve
 
@@ -64,12 +74,20 @@ just run -- --catalog-uri s3://lake/catalog --table features --tag prod \
             --listen 0.0.0.0:3000 --cache-dir /mnt/nvme/lakewing --cache-bytes 8589934592
 ```
 
-Local benchmark replica: `--catalog-uri .tmp/cache-bench/reader/lancebench/run-20260920T134150Z --table wkb --tag prod`.
+S3 with credentials (omit --s3-key/--s3-secret for unsigned reads
+through the node-local cache gateway):
+
+```
+just run -- --catalog-uri s3://lake/catalog --table features --tag prod \
+            --endpoint http://s3-gateway:8080 --s3-key ... --s3-secret ... \
+            --listen 0.0.0.0:3000 --cache-dir /mnt/nvme/lakewing
+```
+
+Local benchmark replica: `--catalog-uri .tmp/cache-bench/reader/lancebench/run-20260920T134150Z --table geo --tag prod`.
 
 ## Not yet ported from the Go serve
 
 Tiles, Arrow Flight, ETags/gzip/conditional requests, metrics/OTel,
-admission lanes, k8s charts, the build (materialize) pipeline, S3
-endpoint/storage-option wiring for the dataset handle, and the kind
-cachebench rig integration (the Python harness is language-neutral and
-will be pointed at this serve next).
+admission lanes, k8s charts, the build (materialize) pipeline, and the
+kind cachebench rig integration (the battery already runs against this
+serve over both local and S3 datasets).

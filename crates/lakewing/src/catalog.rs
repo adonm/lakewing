@@ -14,9 +14,17 @@ pub struct Catalog {
 
 impl Catalog {
     /// Open a directory namespace rooted at `root` (local path or
-    /// `s3://bucket/prefix`).
-    pub async fn open(root: &str) -> anyhow::Result<Self> {
-        let ns = lance_namespace_impls::dir::DirectoryNamespaceBuilder::new(root)
+    /// `s3://bucket/prefix`), applying object-store options (endpoint,
+    /// allow_http, skip_signature, region, ...).
+    pub async fn open(
+        root: &str,
+        storage_options: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        let mut builder = lance_namespace_impls::dir::DirectoryNamespaceBuilder::new(root);
+        if !storage_options.is_empty() {
+            builder = builder.storage_options(storage_options.clone());
+        }
+        let ns = builder
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("directory namespace: {e}"))?;

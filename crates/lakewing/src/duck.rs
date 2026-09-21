@@ -30,59 +30,43 @@ impl Duck {
         })
     }
 
-    fn load_page(&self, batches: &[RecordBatch]) -> anyhow::Result<()> {
+    fn load_page(&self, batches: &[RecordBatch], was_polygon: bool) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "DROP TABLE IF EXISTS lw_page; CREATE TEMP TABLE lw_page(
                 id VARCHAR, geom BLOB, properties VARCHAR,
                 layer VARCHAR, source_id BIGINT,
-                xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE)",
+                xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE);
+             DROP TABLE IF EXISTS lw_wp; CREATE TEMP TABLE lw_wp(id VARCHAR, was_polygon BOOLEAN);",
         )?;
         let mut appender = conn.appender("lw_page")?;
         for batch in batches {
             let schema = batch.schema();
-            let id = batch.column(schema.index_of("id").map_err(|_| anyhow::anyhow!("id"))?);
-            let geom = batch.column(
+            let col = |name: &str| {
                 schema
-                    .index_of("geom")
-                    .map_err(|_| anyhow::anyhow!("geom"))?,
-            );
-            let props = batch.column(
-                schema
-                    .index_of("properties")
-                    .map_err(|_| anyhow::anyhow!("props"))?,
-            );
-            let layer = batch.column(
-                schema
-                    .index_of("layer")
-                    .map_err(|_| anyhow::anyhow!("layer"))?,
-            );
-            let source = batch.column(
-                schema
-                    .index_of("source_id")
-                    .map_err(|_| anyhow::anyhow!("source"))?,
-            );
-            let xmin = batch.column(
-                schema
-                    .index_of("xmin")
-                    .map_err(|_| anyhow::anyhow!("xmin"))?,
-            );
-            let ymin = batch.column(
-                schema
-                    .index_of("ymin")
-                    .map_err(|_| anyhow::anyhow!("ymin"))?,
-            );
-            let xmax = batch.column(
-                schema
-                    .index_of("xmax")
-                    .map_err(|_| anyhow::anyhow!("xmax"))?,
-            );
-            let ymax = batch.column(
-                schema
-                    .index_of("ymax")
-                    .map_err(|_| anyhow::anyhow!("ymax"))?,
-            );
+                    .index_of(name)
+                    .map_err(|_| anyhow::anyhow!("{name} column missing"))
+            };
+            let id = batch.column(col("id")?);
+            let geom = batch.column(col("geom")?);
+            let props = batch.column(col("properties")?);
+            let layer = batch.column(col("layer")?);
+            let source = batch.column(col("source_id")?);
+            let xmin = batch.column(col("xmin")?);
+            let ymin = batch.column(col("ymin")?);
+            let xmax = batch.column(col("xmax")?);
+            let ymax = batch.column(col("ymax")?);
+            let wp_col = if was_polygon {
+                Some(batch.column(col("was_polygon")?))
+            } else {
+                None
+            };
             let n = batch.num_rows();
+            let mut wp_appender = if was_polygon {
+                Some(conn.appender("lw_wp")?)
+            } else {
+                None
+            };
             for i in 0..n {
                 appender.append_rows([(
                     str_at(id, i)?,
@@ -95,6 +79,9 @@ impl Duck {
                     f64_at(xmax, i)?,
                     f64_at(ymax, i)?,
                 )])?;
+                if let (Some(wp), Some(app)) = (wp_col, wp_appender.as_mut()) {
+                    app.append_rows([(str_at(id, i)?, bool_at(wp, i)?)])?;
+                }
             }
         }
         Ok(())
@@ -109,16 +96,30 @@ impl Duck {
         exact: &str,
         fetch_limit: Option<usize>,
         offset: usize,
+        was_polygon: bool,
     ) -> anyhow::Result<Vec<FeatureRow>> {
-        self.load_page(batches)?;
+        self.load_page(batches, was_polygon)?;
         let conn = self.conn.lock().unwrap();
         let tail = match fetch_limit {
             Some(limit) => format!("LIMIT {} OFFSET {}", limit, offset),
             None => format!("OFFSET {}", offset),
         };
+        // GeoArrow datasets store every polygon promoted to multipolygon;
+        // was_polygon restores the original single-part form so GeoJSON
+        // matches the source features exactly.
+        let geom_expr = if was_polygon {
+            "CASE WHEN lw_wp.was_polygon THEN (ST_Dump(ST_GeomFromWKB(geom)))[1].geom ELSE ST_GeomFromWKB(geom) END"
+        } else {
+            "ST_GeomFromWKB(geom)"
+        };
+        let from_join = if was_polygon {
+            "lw_page JOIN lw_wp USING (id)"
+        } else {
+            "lw_page"
+        };
         let sql = format!(
-            "SELECT id, ST_AsGeoJSON(ST_GeomFromWKB(geom)), properties FROM lw_page \
-             WHERE {} ORDER BY id {}",
+            "SELECT lw_page.id, ST_AsGeoJSON({geom_expr}), lw_page.properties FROM {from_join} \
+             WHERE lw_page.id IS NOT NULL AND {} ORDER BY lw_page.id {}",
             exact, tail
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -176,6 +177,15 @@ fn blob_at(col: &dyn Array, i: usize) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+fn bool_at(col: &dyn Array, i: usize) -> anyhow::Result<bool> {
+    use arrow::array::BooleanArray;
+    if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+        Ok(a.value(i))
+    } else {
+        anyhow::bail!("expected boolean column, got {}", col.data_type())
+    }
+}
+
 fn int_at(col: &dyn Array, i: usize) -> anyhow::Result<i64> {
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
         Ok(a.value(i))
@@ -221,8 +231,15 @@ pub fn exact_predicate(collection: &str, bounds: Option<[f64; 4]>, sources: &[i6
 }
 
 /// The candidate-superset filter pushed into Lance (same contract as
-/// Parquet zonemap pruning: DuckDB re-checks everything).
-pub fn pushed_filter(collection: &str, bounds: Option<[f64; 4]>, sources: &[i64]) -> String {
+/// Parquet zonemap pruning: DuckDB re-checks everything). GeoArrow
+/// geometries push `ST_Intersects` (drives the RTREE); WKB datasets push
+/// bbox-column overlap.
+pub fn pushed_filter(
+    collection: &str,
+    bounds: Option<[f64; 4]>,
+    sources: &[i64],
+    geo_geom: bool,
+) -> String {
     let srcs: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
     let mut base = format!(
         "layer = {} AND source_id IN ({})",
@@ -230,9 +247,15 @@ pub fn pushed_filter(collection: &str, bounds: Option<[f64; 4]>, sources: &[i64]
         srcs.join(",")
     );
     if let Some([w, s, e, n]) = bounds {
-        base.push_str(&format!(
-            " AND xmax >= {w} AND xmin <= {e} AND ymax >= {s} AND ymin <= {n}"
-        ));
+        if geo_geom {
+            base.push_str(&format!(
+                " AND ST_Intersects(geom, ST_GeomFromText('POLYGON (({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))'))"
+            ));
+        } else {
+            base.push_str(&format!(
+                " AND xmax >= {w} AND xmin <= {e} AND ymax >= {s} AND ymin <= {n}"
+            ));
+        }
     }
     base
 }

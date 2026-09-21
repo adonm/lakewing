@@ -25,12 +25,13 @@ impl App {
         table: &str,
         tag: Option<String>,
         version: Option<u64>,
+        storage_options: std::collections::HashMap<String, String>,
         cache: Option<Arc<crate::cache::CachingStore>>,
     ) -> anyhow::Result<Self> {
-        let catalog = Catalog::open(root).await?;
+        let catalog = Catalog::open(root, &storage_options).await?;
         let uri = catalog.resolve(table).await?;
         tracing::info!(%root, table, %uri, "catalog resolved table");
-        Self::open_at(uri, tag, version, cache).await
+        Self::open_at(uri, tag, version, storage_options, cache).await
     }
 
     /// Open directly at a dataset URI (development/benchmark bypass of the
@@ -39,10 +40,20 @@ impl App {
         uri: String,
         tag: Option<String>,
         version: Option<u64>,
+        storage_options: std::collections::HashMap<String, String>,
         cache: Option<Arc<crate::cache::CachingStore>>,
     ) -> anyhow::Result<Self> {
         let lance = Arc::new(
-            LanceSource::open(crate::lake::SourceConfig { uri, tag, version }, cache).await?,
+            LanceSource::open(
+                crate::lake::SourceConfig {
+                    uri,
+                    tag,
+                    version,
+                    storage_options,
+                },
+                cache,
+            )
+            .await?,
         );
         let duck = Arc::new(Duck::open()?);
         // Collections: distinct layer values over a narrow scan.
@@ -77,17 +88,17 @@ impl App {
     ) -> anyhow::Result<String> {
         self.validate_collection(collection)?;
         let exact = exact_predicate(collection, bounds, sources);
-        let pushed = pushed_filter(collection, bounds, sources);
+        let pushed = pushed_filter(collection, bounds, sources, self.lance.geo_geom);
 
-        // Always ids-first: the ordered id window pushes top-N into Lance
-        // (order_by + limit), the payload scan is by id IN, and DuckDB
-        // only ever sees the page.
+        // Always ids-first: a bounded heap selects the ordered id window
+        // during the narrow scan (no full sort of the candidate set), the
+        // payload scan is by id IN, and DuckDB only ever sees the page.
         let pushed = match cursor {
             Some(cursor) => format!("{pushed} AND id > {}", crate::duck::quote(cursor)),
             None => pushed,
         };
-        let fetch = limit as u64 + 1 + offset as u64;
-        let ids = self.lance.scan_ids_window(&pushed, fetch).await?;
+        let fetch = limit + 1 + offset as usize;
+        let ids = self.lance.scan_ids_topk(&pushed, fetch).await?;
         let ids: Vec<String> = ids
             .into_iter()
             .skip(offset as usize)
@@ -98,7 +109,8 @@ impl App {
         } else {
             let payload_filter = format!("{pushed} AND id IN ({})", id_in_list(&ids));
             let batches = self.lance.scan_page(&payload_filter, None, None).await?;
-            self.duck.render_page(&batches, &exact, None, 0)?
+            self.duck
+                .render_page(&batches, &exact, None, 0, self.lance.has_was_polygon)?
         };
 
         let has_next = rows.len() > limit;
@@ -143,11 +155,13 @@ impl App {
         self.validate_collection(collection)?;
         let pushed = format!(
             "{} AND id = {}",
-            pushed_filter(collection, None, sources),
+            pushed_filter(collection, None, sources, self.lance.geo_geom),
             crate::duck::quote(feature_id)
         );
         let batches = self.lance.scan_page(&pushed, Some(2), None).await?;
-        let rows = self.duck.render_page(&batches, "TRUE", Some(1), 0)?;
+        let rows =
+            self.duck
+                .render_page(&batches, "TRUE", Some(1), 0, self.lance.has_was_polygon)?;
         match rows.into_iter().next() {
             Some(row) => Ok(Some(serde_json::to_string(&render_feature(
                 collection,
