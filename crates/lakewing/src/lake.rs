@@ -12,6 +12,7 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::scanner::ColumnOrdering;
 use lance::Dataset;
 
 use crate::cache::CachingStore;
@@ -158,6 +159,34 @@ impl LanceSource {
         let mut ids = heap.into_vec();
         ids.sort_unstable();
         Ok(ids)
+    }
+
+    /// Flight projection: ticket columns mapped onto the dataset
+    /// (`geometry` = WKB via ST_AsBinary on GeoArrow datasets, `x`/`y` =
+    /// centroid columns).
+    pub async fn scan_flight(
+        &self,
+        filter: &str,
+        columns: &[String],
+    ) -> anyhow::Result<Vec<RecordBatch>> {
+        let mut scanner = self.scanner(filter)?;
+        scanner.order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))?;
+        let projection: Vec<(&str, String)> = columns
+            .iter()
+            .map(|c| {
+                let expr = match c.as_str() {
+                    "geometry" if self.geo_geom => "ST_AsBinary(geom)".to_string(),
+                    "geometry" => "geom".to_string(),
+                    "x" => "cx".to_string(),
+                    "y" => "cy".to_string(),
+                    other => other.to_string(),
+                };
+                (c.as_str(), expr)
+            })
+            .collect();
+        scanner.project_with_transform(&projection)?;
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        Ok(batches)
     }
 
     /// Scan the narrow id/layer projection for layer discovery.

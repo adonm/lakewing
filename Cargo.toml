@@ -29,6 +29,9 @@ anyhow = "1"
 flate2 = "1"
 parquet = { version = "58", features = ["arrow"] }
 geoarrow-array = "0.8"
+tonic = "0.14"
+tokio-stream = "0.1"
+arrow-flight = "58"
 geoarrow-schema = "0.8"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

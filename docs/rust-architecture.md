@@ -105,8 +105,29 @@ footprint.
 
 ## Not yet ported from the Go serve
 
-Arrow Flight (the Go serve exposed read-only Flight over the same pages).
+Nothing functionally blocking: the Go serve's user-facing surface (OGC +
+tiles + Flight) is ported. Remaining follow-ups are operational: OTel
+spans, ETag pre-warming, the kind cachebench rig integration, and
+distributed-write tooling if multi-node builds are ever needed.
 
+
+## What v5 added
+
+- Arrow Flight (read-only): ListFlights (one flight per collection),
+  GetFlightInfo/GetSchema/PollInfo, DoGet with ShardTicket JSON
+  `{collection, bbox, columns, limit, offset, sources}`; columns id,
+  geometry (WKB), properties, source_id, x, y, name. Projection applies
+  inside the Lance scan (`ST_AsBinary` on GeoArrow datasets, cx/cy
+  mapped to x/y); pages flow through the same ids-first window, ordered
+  by id. Verified with a pyarrow client: schema, 101-row pages, id
+  ordering identical to the OGC serve, geometry round-trips through
+  ST_GeomFromWKB. Contract note: DoGet returns the stored MultiPolygon
+  form; the OGC serve's per-feature Polygon restore (was_polygon) is an
+  OGC-render concern, not a Flight one.
+- Concurrent S3 load validation (`scripts/lancebench/load.py`): at 1/4/16
+  threads over the metered 25 ms-delay origin, warm loads issued **zero
+  origin GETs** — the foyer cache absorbed the full mix; digest
+  stability held at every concurrency.
 
 ## What v4 added
 

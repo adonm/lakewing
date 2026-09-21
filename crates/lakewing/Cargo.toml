@@ -23,6 +23,9 @@ anyhow = { workspace = true }
 flate2 = { workspace = true }
 parquet = { workspace = true }
 geoarrow-array = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+arrow-flight = { workspace = true }
 geoarrow-schema = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

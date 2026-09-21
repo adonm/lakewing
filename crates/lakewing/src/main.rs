@@ -9,6 +9,7 @@ mod build;
 mod cache;
 mod catalog;
 mod duck;
+mod flight;
 mod http_cache;
 mod lake;
 mod metrics;
@@ -44,6 +45,7 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
     let mut tag: Option<String> = None;
     let mut version: Option<u64> = None;
     let mut listen = "127.0.0.1:3000".to_string();
+    let mut flight_listen: Option<String> = None;
     let mut cache_dir: Option<String> = None;
     let mut cache_bytes: usize = 512 * 1024 * 1024;
     while let Some(flag) = args.next() {
@@ -58,6 +60,7 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
             "--tag" => tag = Some(value()),
             "--version" => version = value().parse().ok(),
             "--listen" => listen = value(),
+            "--flight-listen" => flight_listen = Some(value()),
             "--cache-dir" => cache_dir = Some(value()),
             "--cache-bytes" => cache_bytes = value().parse().unwrap_or(cache_bytes),
             other => anyhow::bail!("unknown flag {other}"),
@@ -105,8 +108,17 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
         version = app.lance.version,
         collections = app.collections.join(","),
         listen = %listen,
+        flight = ?flight_listen,
         "serving lance dataset"
     );
+    if let Some(addr) = flight_listen {
+        let flight_app = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = flight::serve(flight_app, &addr).await {
+                tracing::error!(%e, "flight server failed");
+            }
+        });
+    }
     api::serve(app, &listen).await
 }
 
