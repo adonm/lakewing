@@ -10,17 +10,21 @@
 //! behind the same trait if measurements demand it.
 use std::fmt::Debug;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use foyer::HybridCache;
-use futures::stream::BoxStream;
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use lance_io::object_store::WrappingObjectStore;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as StoreResult,
+    Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions, Result as StoreResult,
 };
 
 /// CachingStore wraps the real object store and serves range reads from a
@@ -30,7 +34,42 @@ use object_store::{
 pub struct CachingStore {
     inner: Arc<dyn OSStore>,
     cache: HybridCache<String, Bytes>,
+    metadata: foyer::Cache<String, (ObjectMeta, Attributes)>,
     scheme: String,
+    pub metrics: Arc<CacheMetrics>,
+    _lock: Arc<std::fs::File>,
+}
+
+#[derive(Debug, Default)]
+pub struct CacheMetrics {
+    lookups: AtomicU64,
+    memory_hits: AtomicU64,
+    disk_hits: AtomicU64,
+    origin_ranges: AtomicU64,
+    origin_bytes: AtomicU64,
+    origin_heads: AtomicU64,
+    bypass_get_opts: AtomicU64,
+}
+
+impl CacheMetrics {
+    pub fn exposition(&self) -> String {
+        let mut out = String::new();
+        for (name, value) in [
+            ("lookups", &self.lookups),
+            ("memory_hits", &self.memory_hits),
+            ("disk_hits", &self.disk_hits),
+            ("origin_ranges", &self.origin_ranges),
+            ("origin_bytes", &self.origin_bytes),
+            ("origin_heads", &self.origin_heads),
+            ("bypass_get_opts", &self.bypass_get_opts),
+        ] {
+            out.push_str(&format!(
+                "# TYPE lakewing_cache_{name}_total counter\nlakewing_cache_{name}_total {}\n",
+                value.load(Ordering::Relaxed)
+            ));
+        }
+        out
+    }
 }
 
 use object_store::ObjectStore as OSStore;
@@ -50,16 +89,94 @@ impl std::fmt::Display for CachingStore {
 }
 
 impl CachingStore {
-    pub fn new(inner: Arc<dyn OSStore>, cache: HybridCache<String, Bytes>, scheme: &str) -> Self {
-        Self {
-            inner,
+    pub async fn open(
+        dir: &str,
+        disk_bytes: usize,
+        memory_bytes: usize,
+        identity: &str,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            disk_bytes >= 64 * 1024 * 1024 && memory_bytes > 0,
+            "cache needs >=64 MiB disk and positive memory capacity"
+        );
+        std::fs::create_dir_all(dir)?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(std::path::Path::new(dir).join("lakewing.lock"))?;
+        lock.try_lock()
+            .map_err(|e| anyhow::anyhow!("cache directory already in use ({dir}): {e}"))?;
+        let cache = build_cache(dir, disk_bytes, memory_bytes).await?;
+        let metadata = foyer::CacheBuilder::new(2 * 1024 * 1024)
+            .with_weighter(|key: &String, value: &(ObjectMeta, Attributes)| {
+                key.len()
+                    + value.0.location.as_ref().len()
+                    + 256
+                    + value
+                        .1
+                        .iter()
+                        .map(|(_, v)| v.as_ref().len() + 64)
+                        .sum::<usize>()
+            })
+            .build();
+        Ok(Self {
+            inner: Arc::new(object_store::memory::InMemory::new()),
             cache,
-            scheme: scheme.to_string(),
-        }
+            metadata,
+            scheme: identity.to_string(),
+            metrics: Arc::default(),
+            _lock: Arc::new(lock),
+        })
     }
 
     fn key(&self, location: &Path, range: &Range<u64>) -> String {
-        format!("{}{}:{}:{}", self.scheme, location, range.start, range.end)
+        serde_json::to_string(&(&self.scheme, location.as_ref(), range.start, range.end))
+            .expect("range key")
+    }
+
+    async fn range(&self, location: &Path, range: Range<u64>) -> StoreResult<Bytes> {
+        // Lance data, index, deletion and numbered manifest objects are immutable.
+        // Tags, namespace metadata and arbitrary objects always retain origin semantics.
+        if !immutable(location) || range.start >= range.end {
+            return self.inner.get_range(location, range).await;
+        }
+        self.metrics.lookups.fetch_add(1, Ordering::Relaxed);
+        let key = self.key(location, &range);
+        let store = self.inner.clone();
+        let location = location.clone();
+        let metrics = self.metrics.clone();
+        let entry = self
+            .cache
+            .get_or_fetch(&key, move || async move {
+                metrics.origin_ranges.fetch_add(1, Ordering::Relaxed);
+                let bytes = store.get_range(&location, range).await?;
+                metrics
+                    .origin_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                Ok::<_, object_store::Error>(bytes)
+            })
+            .await
+            .map_err(|error| object_store::Error::Generic {
+                store: "foyer",
+                source: Box::new(error),
+            })?;
+        match entry.source() {
+            foyer::Source::Memory => {
+                self.metrics.memory_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            foyer::Source::Disk => {
+                self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            foyer::Source::Outer => {}
+        }
+        Ok(entry.value().clone())
+    }
+
+    pub async fn close(&self) -> anyhow::Result<()> {
+        self.cache.close().await?;
+        Ok(())
     }
 }
 
@@ -83,30 +200,77 @@ impl ObjectStore for CachingStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
+        let eligible = immutable(location)
+            && !options.head
+            && options.version.is_none()
+            && options.if_match.is_none()
+            && options.if_none_match.is_none()
+            && options.if_modified_since.is_none()
+            && options.if_unmodified_since.is_none()
+            && options.extensions.is_empty();
+        if eligible {
+            if let Some(get_range) = options.range.as_ref() {
+                let key = serde_json::to_string(&(&self.scheme, location.as_ref()))
+                    .expect("metadata key");
+                let store = self.inner.clone();
+                let path = location.clone();
+                let metrics = self.metrics.clone();
+                let meta = self
+                    .metadata
+                    .get_or_fetch(&key, move || async move {
+                        metrics.origin_heads.fetch_add(1, Ordering::Relaxed);
+                        let result = store
+                            .get_opts(
+                                &path,
+                                GetOptions {
+                                    head: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        Ok::<_, object_store::Error>((result.meta, result.attributes))
+                    })
+                    .await
+                    .map_err(|e| object_store::Error::Generic {
+                        store: "foyer",
+                        source: Box::new(e),
+                    })?;
+                let (meta, attributes) = meta.value();
+                let range =
+                    get_range
+                        .as_range(meta.size)
+                        .map_err(|e| object_store::Error::Generic {
+                            store: "lakewing",
+                            source: Box::new(e),
+                        })?;
+                if range.end - range.start <= 64 * 1024 * 1024 {
+                    let bytes = self.range(location, range.clone()).await?;
+                    return Ok(GetResult {
+                        payload: GetResultPayload::Stream(
+                            futures::stream::once(async move { Ok(bytes) }).boxed(),
+                        ),
+                        meta: meta.clone(),
+                        range,
+                        attributes: attributes.clone(),
+                        extensions: Default::default(),
+                    });
+                }
+            }
+        }
+        self.metrics.bypass_get_opts.fetch_add(1, Ordering::Relaxed);
         self.inner.get_opts(location, options).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> StoreResult<Vec<Bytes>> {
-        let mut out: Vec<Bytes> = Vec::with_capacity(ranges.len());
-        let mut missing: Vec<usize> = Vec::new();
-        for (i, range) in ranges.iter().enumerate() {
-            if let Ok(Some(hit)) = self.cache.get(&self.key(location, range)).await {
-                out.push(hit.value().clone());
-            } else {
-                out.push(Bytes::new());
-                missing.push(i);
-            }
-        }
-        if !missing.is_empty() {
-            let fetch: Vec<Range<u64>> = missing.iter().map(|i| ranges[*i].clone()).collect();
-            let fetched = self.inner.get_ranges(location, &fetch).await?;
-            for (slot, bytes) in missing.iter().zip(fetched) {
-                let range = &ranges[*slot];
-                self.cache.insert(self.key(location, range), bytes.clone());
-                out[*slot] = bytes;
-            }
-        }
-        Ok(out)
+        futures::stream::iter(
+            ranges
+                .iter()
+                .cloned()
+                .map(|range| self.range(location, range)),
+        )
+        .buffered(16)
+        .try_collect()
+        .await
     }
 
     fn delete_stream(
@@ -143,11 +307,14 @@ impl ObjectStore for CachingStore {
 
 /// lance-io hook: wrap the constructed store with our cache.
 impl WrappingObjectStore for CachingStore {
-    fn wrap(&self, _store_prefix: &str, original: Arc<dyn OSStore>) -> Arc<dyn OSStore> {
+    fn wrap(&self, store_prefix: &str, original: Arc<dyn OSStore>) -> Arc<dyn OSStore> {
         Arc::new(CachingStore {
             inner: original,
             cache: self.cache.clone(),
-            scheme: self.scheme.clone(),
+            metadata: self.metadata.clone(),
+            scheme: serde_json::to_string(&(&self.scheme, store_prefix)).expect("store identity"),
+            metrics: self.metrics.clone(),
+            _lock: self._lock.clone(),
         })
     }
 
@@ -160,14 +327,21 @@ impl WrappingObjectStore for CachingStore {
     }
 }
 
+fn immutable(location: &Path) -> bool {
+    location
+        .parts()
+        .any(|p| matches!(p.as_ref(), "data" | "_indices" | "_deletions" | "_versions"))
+}
+
 /// Build the foyer hybrid cache (memory + NVMe disk tiers).
-pub async fn build_cache(
+async fn build_cache(
     dir: &str,
     disk_bytes: usize,
+    memory_bytes: usize,
 ) -> anyhow::Result<HybridCache<String, Bytes>> {
     let cache = foyer::HybridCacheBuilder::new()
-        .memory(64 * 1024 * 1024)
-        .with_weighter(|_k: &String, v: &Bytes| v.len())
+        .memory(memory_bytes)
+        .with_weighter(|k: &String, v: &Bytes| k.len() + v.len() + 64)
         .storage()
         .with_engine_config(foyer::BlockEngineConfig::new(
             <foyer::FsDeviceBuilder as foyer::DeviceBuilder>::build(

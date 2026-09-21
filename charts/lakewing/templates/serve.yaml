@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: serve
 spec:
-  replicas: {{ .replicaCount }}
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels: *labels
   template:
@@ -29,15 +29,27 @@ spec:
             - --table={{ .Values.serve.table }}
             - --tag={{ .Values.serve.tag }}
             - --listen={{ .Values.serve.listen }}
+            - --concurrency={{ .Values.serve.concurrency }}
+            - --duck-threads={{ .Values.serve.duckThreads }}
+            - --duck-memory-mb={{ .Values.serve.duckMemoryMb }}
+            {{- if .Values.serve.flightListen }}
+            - --flight-listen={{ .Values.serve.flightListen }}
+            {{- end }}
+            {{- if .Values.serve.otelEndpoint }}
+            - --otel-endpoint={{ .Values.serve.otelEndpoint }}
+            {{- end }}
+            {{- if .Values.serve.cacheDir }}
             - --cache-dir={{ .Values.serve.cacheDir }}
             - --cache-bytes={{ .Values.serve.cacheBytes }}
+            {{- end }}
             {{- if .Values.serve.endpoint }}
             - --endpoint={{ .Values.serve.endpoint }}
             {{- end }}
             {{- if .Values.serve.s3KeySecret }}
-            {{- $secret := .Values.serve.s3KeySecret }}
             - --s3-key=$(S3_KEY)
             - --s3-secret=$(S3_SECRET)
+            {{- else if not .Values.serve.endpoint }}
+            # No endpoint and no credentials: cloud S3 with ambient credentials.
             {{- end }}
           {{- if .Values.serve.s3KeySecret }}
           env:
@@ -52,9 +64,20 @@ spec:
                   name: {{ .Values.serve.s3KeySecret }}
                   key: s3-secret
           {{- end }}
+          {{- if .Values.serve.cacheDir }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          {{- end }}
           ports:
             - name: http
               containerPort: 3000
+            {{- if .Values.serve.flightListen }}
+            - name: flight
+              containerPort: 50051
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /healthz
@@ -66,18 +89,21 @@ spec:
               port: http
             initialDelaySeconds: 10
           volumeMounts:
+            {{- if .Values.serve.cacheDir }}
+            # Each pod gets its own directory under the node-local hostPath:
+            # the foyer disk tier is single-process and must never be shared.
             - name: cache
               mountPath: {{ .Values.serve.cacheDir }}
+              subPathExpr: $(POD_NAME)
+            {{- end }}
           resources: {{ toYaml .Values.resources | nindent 12 }}
       volumes:
+        {{- if .Values.serve.cacheDir }}
         - name: cache
-          {{- if .Values.cacheHostPath }}
           hostPath:
             path: {{ .Values.cacheHostPath }}
             type: DirectoryOrCreate
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -95,3 +121,8 @@ spec:
     - name: http
       port: 80
       targetPort: http
+    {{- if .Values.serve.flightListen }}
+    - name: flight
+      port: 50051
+      targetPort: flight
+    {{- end }}

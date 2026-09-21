@@ -1,299 +1,159 @@
 # lakewing
 
-> **Rust rewrite (current):** poem OGC API over a Lance-namespace-cataloged,
-> tag-pinned Lance dataset (lance 12 release train) with DuckDB for exact
-> predicates/rendering and a foyer NVMe range cache under Lance's object
-> store. See `docs/rust-architecture.md`.
+> **Rust implementation (current):** poem OGC API + read-only Arrow Flight over a
+> Lance-Namespace-cataloged, tag-pinned Lance dataset (lance 12 release train),
+> DuckDB for local exact rendering, and a foyer NVMe range cache under Lance's
+> object store. See `docs/rust-architecture.md` for the design and measurements.
 >
-> **Go archive:** the previous Go/DuckLake/s3cache implementation lives on
-> the `go-legacy` branch (tag `go-archive-v1`), including its benchmarks
-> and the kind cachebench rig. The experiment history that motivated the
-> rewrite is in `docs/lance-experiment.md`.
+> **Go archive:** the previous Go/DuckLake/s3cache implementation lives on the
+> `go-legacy` branch (tag `go-archive-v1`), including its benchmarks and the
+> kind cachebench rig. The experiment history that motivated the rewrite is in
+> `docs/lance-experiment.md`.
 
-**Build a DuckLake snapshot on S3, then serve it through OGC REST and Arrow Flight.**
+**Serve a tag-pinned Lance feature dataset on S3 through OGC REST and Arrow Flight.**
 
 ```text
-OSM Layercake GeoParquet (HTTPS)
-  → bbox-pruned import → DuckLake catalog + clustered Parquet (local or S3)
-                          └─ shared read-only connection pool
-                               ├─ OGC Features / XYZ tiles → response bytes
-                               └─ Arrow Flight → native DuckDB Arrow batches
+OSM Layercake GeoParquet (WKB)
+  → lakewing build  → GeoArrow Lance 2.2 dataset, BTREE(id) + RTREE(geom), tag
+                       └─ Lance Namespace catalog (DirectoryNamespace, V1 layout)
+                            └─ poem OGC REST / Arrow Flight (shared admission)
+                                 ├─ lance 12: exact id/bbox selection (index pushdown)
+                                 ├─ duckdb: connection-local GeoJSON/MVT rendering
+                                 └─ foyer: NVMe range cache under the object store
 ```
 
-One binary, three commands, one snapshot. Apache-2.0. DuckDB 2.0 via the
-`duckdb-go v2.20000.0-6.preview` binding (CGO; preview until the 2.0 GA).
-
-One binary, three commands (`build`, `index`, `serve`), one shard. Apache-2.0.
+One binary, two commands (`build`, `serve`), one pinned snapshot per process.
+Apache-2.0.
 
 ## Quickstart
 
-Install Go 1.25+ and `just` with `mise install`, then:
-
 ```sh
-just fixture-osm --limit 20000    # Layercake buildings, central Berlin
-just fmt-check check test
-just run                        # fixtures/osm.ducklake; HTTP :3000, Flight :50051
+mise install                                   # rust, just, python
+just setup                                     # protoc + cargo fetch
+just check test                               # fmt, clippy -D warnings, 6 regression tests
+just run -- build --source fixtures/berlin.parquet --out fixtures/berlin.lance --tag prod
+just run -- --catalog-uri fixtures --table berlin --tag prod --listen 127.0.0.1:3000
 ```
 
 ```sh
 curl localhost:3000/collections
 curl 'localhost:3000/collections/buildings/items?sources=1&limit=10'
-curl 'localhost:3000/collections/buildings/items?bbox=13.395,52.515,13.405,52.525&sources=1'
-# Human-readable API documentation: http://localhost:3000/api.html
+curl 'localhost:3000/collections/buildings/items?bbox=4.895,52.365,4.905,52.375&sources=1'
+curl 'localhost:3000/collections/buildings/tiles/12/2103/1346?sources=1'
 ```
 
-The DuckDB 2.0 library is bundled by the Go binding (CGO). For direct commands:
-
-```sh
-go run ./cmd/lakewing build \
-  --from https://data.openstreetmap.us/layercake/buildings.parquet \
-  --collection buildings --bbox=13.35,52.48,13.45,52.55 \
-  --out fixtures/berlin.ducklake --data-dir fixtures/berlin.files
-go run ./cmd/lakewing serve --shard fixtures/berlin.ducklake
-```
-
-## Materialization
-
-`build` reads [Layercake](https://layercake.openstreetmap.us/) GeoParquet with
-`type`, `id`, `geometry`, and `bbox.{xmin,ymin,xmax,ymax}` columns. It supports
-local files and DuckDB HTTP/S3 sources. `--bbox` is required; `--limit` is an
-optional development cap. Current flat property columns and older nested
-`tags` structs are preserved as JSON. Original geometry is retained; IDs are
-`type:id` so an OSM way and relation with the same numeric ID stay distinct.
-
-The resulting schema is:
-
-```text
-features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON,
-         sortkey BIGINT, xmin/ymin/xmax/ymax DOUBLE, cx DOUBLE, cy DOUBLE, name VARCHAR)
-collections(id VARCHAR)
-```
-
-Geometry is non-null, 2D CRS84 (longitude/latitude). Import uses both Parquet
-bbox statistics and exact geometry intersection, then writes ZSTD Parquet
-clustered by `--sort` (`grid` cell, `hilbert`, or `none`) with tight per-file
-bbox statistics (`xmin/ymin/xmax/ymax` min/max pruning replaces a spatial
-index). Measured on the 25M-row NW-Europe shard (25 files): `grid` keeps
-the default — city windows prune to 4–5 files vs 7–8 for `hilbert`, a
-rural window to 3 vs 4, at 3.0 vs 3.1 GiB total. `cx`/`cy`/`name` are
-build-time derivatives (centroid coordinates and
-display name) so Flight `x`/`y`/`name` projections avoid per-row geometry and
-JSON work. `--source-id` defaults to `1`. Metadata is discovered from the
-shard's actual layers. A versioned `<catalog>.manifest.json` (backend,
-schema version, source, bbox, rows, layout) is written alongside the catalog.
-
-Publication is atomic and refuses to overwrite an existing catalog: data
-files publish first (additive copy only, never deleting files another
-snapshot references), then the catalog that references them. Build a new
-snapshot and restart `serve --shard NEW_CATALOG` to switch. The serving
-host needs the matching DuckDB `spatial`/`ducklake` extensions installed;
-`build` installs them automatically. `--data-url` records the
-zone-independent data root in the catalog (an `s3://` prefix for lake
-publishes; defaults to the local data dir); each reader serves it over
-S3_DIRECT through its node's s3cache proxy, so relative Parquet paths
-resolve to cached S3 ranges everywhere. `build --content-address` names
-data files by content
-hash so unchanged snapshots upload nothing new, and every build writes a
-`<catalog>.serving.json` spatial file index beside the catalog (`index`
-recompiles it for older catalogs). Validated end to end on SeaweedFS
-(`just lake-publish` × 3, serve over S3_DIRECT): additive-only uploads
-(identical republish added zero data keys; shared files dedupe by hash),
-coexisting catalog keys, readers pinned across ref moves, snapshots
-isolated per bbox.
-
-```sh
-just fixture-nw-europe            # ~10 GB Benelux + N. France buildings
-just fixture-verify shard=fixtures/nw-europe.ducklake
-just workloads                    # saved deterministic request sets
-```
-
-`just workloads` writes hot, urban, rural, scattered, broad, empty, deep and
-mixed URL sets for `ogc_bench.py --workload`; regenerate with `--region` for a
-different shard extent.
-
-### Serving from S3
-
-Reads go over S3_DIRECT through the node-local s3cache proxy, never
-through mounts. `serve --shard` takes an `s3://` URL to the `.ducklake`
-catalog (e.g. `s3://lake/catalogs/<sha>.ducklake`) and `--data-root`
-takes the `s3://` data prefix; the catalog attaches read-only and the
-stored zone-independent `s3://` data root is used as-is. `S3_ENDPOINT`
-points DuckDB at the node-local proxy (anonymous: the proxy is the sole
-SigV4 signer); writers (build/publish) go direct to the S3 API. See
-[`docs/s3cache.md`](docs/s3cache.md) for the proxy (bounded NVMe slice
-cache, one Secret, no credentials in readers).
-Every pooled connection is switched to the attached catalog; serving reads
-resolve at startup to a frozen `read_parquet` file list over the exact
-files live at the pinned snapshot, pruned per request to candidate files
-via the published `<catalog>.serving.json` index (falling back to the full
-list, then the catalog table, on any doubt), so all SQL remains
-server-generated and identical rows serve without DuckLake's per-query
-snapshot join.
-
-Spatial queries prune by file/row-group bbox statistics, then run exact
-`ST_Intersects` only on boundary candidates (fully contained bboxes skip it).
-Page-first planning converts geometry only for the returned page. Storage
-behavior (s3cache slice reuse, S3-GET accounting, restart recovery) is
-recorded in [`docs/cache-options.md`](docs/cache-options.md).
-
-Layercake data is © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright),
-available under the [ODbL](https://opendatacommons.org/licenses/odbl/).
+Serving requires a pinned tag or version (`--tag prod`); `--uri` bypasses the
+catalog for local development only.
 
 ## HTTP API
 
 | Route | Representation |
 |---|---|
-| `/`, `/conformance` | Landing links and supported conformance classes |
-| `/collections`, `/collections/{id}` | Actual collection metadata |
+| `/collections`, `/collections/{id}` | Collection metadata + pinned snapshot |
 | `/collections/{id}/items` | `application/geo+json` FeatureCollection |
-| `/collections/{id}/items/{fid}` | Original geometry and typed properties |
-| `/collections/{id}/tiles/{z}/{x}/{y}` | Web Mercator XYZ MVT; 204 if empty |
-| `/api`, `/api.html` | OpenAPI 3.0 JSON and HTML documentation |
+| `/collections/{id}/items/{fid}` | Single feature (original geometry form) |
+| `/collections/{id}/tiles/{z}/{x}/{y}` | Web-Mercator XYZ MVT; 204 if empty |
+| `/metrics` | Prometheus exposition (`no-store`) |
 | `/healthz` | Liveness |
 
-The Features surface implements Core, GeoJSON and OpenAPI 3.0 requirements.
-Tiles are an XYZ extension, capped at 5,000 features per tile.
+Items support `bbox` (CRS84, validated), `limit` (1–10000, default 101),
+`offset` (≤ 100000), `cursor`, `sources` (or `X-Source-Ids` header; both given
+→ intersection), and `snapshot`. Unknown parameters return 400. Responses carry
+strong ETags over the exact bytes, gzip variants, and
+`Cache-Control: public, max-age=60`; `X-Lakewing-Snapshot` names the pinned
+dataset version; errors are `no-store` JSON with proper status codes.
 
-Items support `bbox`, `limit` (1–1,000, default 10), `offset`, `datetime`, and
-`sources`. Bboxes support antimeridian crossing, degenerate bounds and 3D
-bounds over 2D data. Pages are ordered by feature ID and include `self` and
-`next` links. `numberReturned` is included; `numberMatched` is omitted to avoid
-an extra count. Layercake edit timestamps are preserved as properties, not
-treated as temporal geometry, so static features match every valid datetime.
-Unsupported parameters, including `filter` and `properties`, return 400.
-
-### Source selection
-
-Supply `?sources=1,2` or `X-Source-Ids: 1,2`; Flight accepts `sources` in its
-ticket or `x-source-ids` metadata. If both are supplied, their **intersection**
-is used. Missing both, or an explicitly empty set, returns no features.
-These are data filters, not authentication. Responses include the full
-effective source set.
+**Exactness first:** `bbox` runs exact intersection in Lance — GeoArrow via
+`ST_Intersects` (RTREE pushdown), WKB via `ST_GeomFromWKB` — *before* ordered
+keyset pagination, so a page that clips a polygon-hole false positive can never
+skip or duplicate rows. Cursors are opaque tokens bound to the reader's
+snapshot and query shape: replaying a cursor against a different snapshot is
+409, against a different query 400.
 
 ## Arrow Flight
 
-`ListFlights`, `GetFlightInfo`, `GetSchema` and `DoGet` are supported. A descriptor
-is either a one-component collection path or a command containing the same
-JSON used in a `DoGet` ticket:
+`ListFlights`, `GetFlightInfo`, `PollFlightInfo`, `GetSchema`, `DoGet` —
+read-only, JSON tickets:
 
 ```json
-{"collection":"buildings","bbox":[13.35,52.48,13.45,52.55],"columns":["id","geometry","properties"],"limit":10000,"sources":[1]}
+{"collection":"buildings","bbox":[4.9,52.3,5.0,52.4],"columns":["id","geometry","properties","source_id"],"limit":10000,"sources":[1]}
 ```
 
-Default columns: `id`, `geometry` (WKB), `properties` (JSON string), `source_id`.
-Optional projections also include `x`, `y` (centroid coordinates), and `name`.
-`offset` defaults to 0; `limit` defaults to 10,000 and is capped at 100,000.
-Unknown or duplicate columns are rejected. Empty streams include their schema.
+Default columns `id`, `geometry` (original WKB — the stored MultiPolygon form is
+restored via `was_polygon`), `properties`, `source_id`; optional `x`, `y`
+(centroid) and any typed source column. Flight shares HTTP's admission
+semantics (RESOURCE_EXHAUSTED on saturation), the same exact selection, and
+streams batches with backpressure under a 30 s deadline.
 
-DuckDB rows stream as 1024-row Arrow batches via the engine's native Arrow
-export (chunk-to-batch conversion inside the driver; the streamed schema is
-validated against the Flight contract, all fields nullable). Empty streams
-still carry the schema. The service provides read-only Flight with JSON tickets.
+## Admission and budgets
 
-## Bulk access
+`--concurrency` (default 4) permits are shared by HTTP and Flight; saturation
+rejects immediately with HTTP 429 + `Retry-After: 1` or Flight
+RESOURCE_EXHAUSTED — no unbounded queueing. DuckDB runs on
+`--concurrency` pooled connections with `--duck-threads` (default 1) and
+`--duck-memory-mb` (default 512) per process; each connection owns its
+temporary page table, so requests are isolated and cancellation cannot strand
+a worker. Payloads are capped at 64 MiB per page (413 above), requests at a
+30 s deadline (504 / DEADLINE_EXCEEDED).
 
-Bulk consumers use Arrow Flight (same pinned snapshot, bulk admission
-lane) or query the published Parquet directly with any
-DuckDB. Run broad scans on the dedicated bulk pool
-(`bulk.enabled=true` in the chart), not the interactive readers.
+## Object storage + cache
 
-## Performance and verification
+`--endpoint`, `--s3-key/--s3-secret` (or unsigned reads via a signing gateway)
+flow to both the catalog and the dataset. The optional `--cache-dir` mounts a
+foyer hybrid cache under Lance's object store:
 
-`--connections` defaults to 8, shared across both protocols. Past the pool,
-up to `--max-waiters` (default 128) requests queue for `--max-wait-ms`
-(default 250) before the pool fails fast with HTTP **429 + Retry-After: 1** or
-Flight **RESOURCE_EXHAUSTED**. `--flight-concurrency` caps concurrent bulk
-queries (default: the pool size, i.e. uncapped); lower it to reserve
-connections for interactive OGC under bulk load. Heavy HTTP pages
-(`limit > 100`, `offset >= 1000`, or broad region slices) share the same bulk
-lane. `--threads` sets shared DuckDB threads for the whole process
-(default 0 = one per CPU; measured 3-5x faster than 1 on heavy pages with
-no throughput loss under concurrency — pass an explicit small value only
-to cap CPU on shared boxes) and `--memory-mb` caps shared DuckDB memory in
-MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
-DuckDB's unbounded default). Size memory with threads: many threads sorting
-huge match sets can OOM a small budget (fails loud as 500, never wrong
-rows) — the full-region sort needs ~4 GB at 8+ threads on the 25M-row
-shard. Spill files go to `--temp-dir` (SET temp_directory per connection);
-in kind this points at the ephemeral `emptyDir` (`temp.sizeLimit`), so
-pressure spills to node-local disk instead of the container layer. Repeated
-Parquet range reads are absorbed by
-the node-local s3cache slice cache, not by in-DuckDB tuning:
-there are no storage-tuning flags by design (see
-[`docs/s3cache.md`](docs/s3cache.md)). Deep `offset` pages (≥ 1000)
-run ids-first two-phase (narrow sort, join back payloads) instead of
-sorting fat rows; byte-identical to the single-phase plan.
-`--query-timeout-ms` bounds HTTP and Flight queries past their deadline
-(default 30000; 0 disables): over-deadline requests fail fast with 500 and
-the connection returns to the pool healthy. Unlike the old stack there is
-no cross-thread interrupt handle — cancellation is via context, so the
-deadline bounds client-visible latency and pool behavior, not guaranteed
-backend abort. Flight streams in 1024-row Arrow batches; bulk admission
-(`--flight-concurrency`) is the backpressure mechanism — there are no
-per-stream or process-wide byte budgets in this implementation. `/metrics`
-is `no-store` Prometheus exposition: `lakewing_http_responses_total{status}`
-plus attempts, DuckDB threads/memory, and Go runtime gauges. Alloy scrapes
-it into Mimir and ships pod logs into Loki (`just kind-obs`).
-Storage-cache benchmarks measure the s3cache
-slice cache instead: see [`docs/cache-options.md`](docs/cache-options.md) for
-the kind rig (`just seaweed-up`, `just lake-publish`,
-`just lake-serve`).
-Error responses are always `Cache-Control: no-store` and carry no ETag.
+- immutable objects only (`data/`, `_indices/`, `_deletions/`, `_versions/`);
+  tags and mutable pointers keep origin semantics
+- keys include the store prefix and endpoint, `get_or_fetch` single-flights
+  concurrent misses, and a HEAD metadata cache serves range requests without
+  re-heading the origin
+- exclusive directory lock (two processes on one dir fail fast), disk tier
+  flushed on shutdown, and `lakewing_cache_*` counters on `/metrics`
 
-GeoJSON embeds DuckDB's geometry/properties text without a server-side
-re-parse, and every response carries an `ETag` with
-`Cache-Control: public, max-age=60` (`If-None-Match` returns 304). ETags
-are content hashes over the exact bytes, and gzip variants are compressed
-per request with their own strong ETag; MVT tiles are already compact and
-skip compression. Repeated storage reads are absorbed by the node-local
-s3cache slice cache, not by per-pod memory.
+The disk tier is **per-pod**; the Helm chart gives each replica its own
+subdirectory under a node-local hostPath. Cross-pod sharing would need a
+shared cache service — see `docs/rust-architecture.md`.
 
-Use a release build. `scripts/ogc_bench.py` warms up before its timed
-phase, counts successful responses separately from overload/errors, consumes
-complete responses, and reports returned data. Prefer fixed `--requests`
-with `--workload FILE` (identical complete passes on every backend) over
-ad-hoc URLs:
+## Build
 
 ```sh
-just bench-ogc-matrix
-CONC=8 just bench-ogc -- --jitter --seed 1
-CONC=32 just bench-ogc -- --jitter --seed 2
-CONC=32 just bench-ogc -- --route tiles
+just run -- build --source <parquet-or-dir> --out <dir>.lance --tag prod
 ```
 
-Use a fresh `--seed` per jitter run: every request in a run is unique and
-warmup never overlaps measurement. Keep seeds small (1-3 on the Berlin
-fixture): larger seeds drift the bbox out of the data and measure empty
-pages instead. Defaults match the
-Berlin fixture; pass `--bbox` for another shard. These are closed-loop
-client measurements; compare successful rps, p50/p99, rejected (429) counts
-and wire throughput together. To size capacity, sweep `--connections
-4/8/16/32` against rising client concurrency and stop at the last step
-holding p99 under 100 ms with under 1% rejected requests.
+WKB parquet → GeoArrow MultiPolygon (original polygon form kept in
+`was_polygon`; nulls supported) → lance 2.2 fragments (512 MiB / 10M rows) →
+BTREE(id) + RTREE(geom) → release tag → collection metadata
+(`lakewing.collections`) written into the dataset so serves never scan for
+layers at startup.
 
-Pages carry cursor `next` links: `cursor` is an exclusive lower bound on
-feature id and takes precedence over `offset`, so deep pages skip leading
-rows through the id ordering instead of traversing them with `OFFSET`.
-Direct `offset` links keep working.
+## Deployment
 
-### Replicas
+```sh
+helm upgrade --install lakewing charts/lakewing \
+  --set serve.catalogUri=s3://lake/catalog --set serve.tag=prod \
+  --set serve.endpoint=http://s3-gateway:8080 --set serve.s3KeySecret=s3
+```
 
-Snapshots are immutable, so scale past one CPU by running one instance per
-core group against the same catalog. Each replica keeps its own pool;
-repeated storage reads are shared node-wide through the s3cache slice
-cache. Confirm with `ogc_bench.py` against one instance versus round-robined
-replicas at equal total connections.
+Optional `serve.flightListen` / `serve.otelEndpoint` (OTLP gRPC, e.g.
+`http://lgtm.monitoring:4317` — request spans include collection, examined-row
+counts and payload timings).
 
-Current loopback baselines (DuckDB 2.0 alpha, local disk): NW-Europe city
-window, 8 connections, `ogc_bench.py`: ~50 rps, p50 ~130 ms nonempty
-(large match sets sort by id — same SQL as ever); Berlin seed in kind:
-171 rps, p50 34 ms. Storage-cache behavior with S3-GET accounting lives in
-[`docs/cache-options.md`](docs/cache-options.md).
+## Verification
 
-These are not universal capacity claims; run the included tools on the target
-CPU, storage, shard size and response shape.
+```sh
+just check test                          # fmt + clippy -D warnings + regression tests
+python3 scripts/lancebench/battery.py http://127.0.0.1:3140 http://127.0.0.1:3141
+python3 scripts/lancebench/flight_check.py grpc://127.0.0.1:50071 http://127.0.0.1:3140
+python3 scripts/lancebench/load.py http://127.0.0.1:3140 http://127.0.0.1:8335 16 3
+```
 
-`just check test` runs gofmt, `go vet` and the Go unit suites (filter,
-plan, index, Flight ticket validation). `just test-duckdb` boots the pooled
-store over the fixture catalog (DuckDB 2.0 smoke: extensions, pinned
-snapshot, frozen file list, pruned query).
+The battery is a **gate** (non-zero exit on any digest mismatch). The
+regression suite (`cargo test`) covers: exact polygon-hole filtering before
+pagination, cross-source pagination with duplicate ids, cursor snapshot
+binding, strict request validation (400/404/409), per-connection isolation
+under concurrent load, DuckDB permit safety under cancellation, Flight
+schema/geometry parity with HTTP, admission exhaustion and release, and
+non-spatial datasets (bbox → 400, null geometry).
+
+Layercake data is © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright),
+available under the [ODbL](https://opendatacommons.org/licenses/odbl/).

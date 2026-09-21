@@ -4,7 +4,7 @@
 //! the pinned release train (lance 12.0.0) the serve reads.
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray};
+use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use geoarrow_array::cast::from_wkb;
@@ -218,17 +218,51 @@ impl SourceChain {
         let wkb = downcast_wkb(geom)?;
 
         let was_polygon = was_polygon_bits(wkb);
-        let wkb_typed =
-            geoarrow_array::array::WkbArray::new(wkb.clone(), std::sync::Arc::default());
-        let multi = from_wkb(&wkb_typed, multi_polygon_type())
-            .map_err(|e| arrow::error::ArrowError::InvalidArgumentError(format!("{e}")))?;
+        // geoarrow 0.8's WKB -> MultiPolygon builder mishandles null offsets.
+        // Convert valid values, then use Arrow's null-aware take to restore positions.
+        let valid = arrow::compute::filter(wkb, &arrow::compute::is_not_null(wkb)?)?;
+        let valid = valid
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        let multi = if valid.is_empty() {
+            arrow::array::new_null_array(
+                multi_polygon_type().to_field("geom", true).data_type(),
+                wkb.len(),
+            )
+        } else {
+            let wkb_typed =
+                geoarrow_array::array::WkbArray::new(valid.clone(), std::sync::Arc::default());
+            let multi = from_wkb(&wkb_typed, multi_polygon_type())
+                .map_err(|e| arrow::error::ArrowError::InvalidArgumentError(format!("{e}")))?
+                .into_array_ref();
+            if wkb.null_count() == 0 {
+                multi
+            } else {
+                let mut next = 0u32;
+                let indices = UInt32Array::from(
+                    (0..wkb.len())
+                        .map(|i| {
+                            if wkb.is_null(i) {
+                                None
+                            } else {
+                                let value = next;
+                                next += 1;
+                                Some(value)
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                arrow::compute::take(multi.as_ref(), &indices, None)?
+            }
+        };
 
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.num_columns() + 1);
         let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns() + 1);
         for (i, field) in schema.fields().iter().enumerate() {
             if i == geom_idx {
                 fields.push(multi_polygon_type().to_field("geom", true));
-                columns.push(multi.clone().into_array_ref());
+                columns.push(multi.clone());
             } else {
                 fields.push((**field).clone());
                 columns.push(batch.column(i).clone());

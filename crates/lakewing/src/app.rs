@@ -1,27 +1,52 @@
-//! Application core: catalog-resolved dataset, one items-page plan executed
-//! as lance scan (pushed candidate filter) -> duckdb exact predicate ->
-//! order/pagination/render, with the ids-first two-phase shape for deep
-//! offsets (port of the proven plan.rs/HeavyItemsSQL semantics from the
-//! archived Go serve).
+//! Shared HTTP/Flight selection and bounded local execution.
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::catalog::Catalog;
-use crate::duck::{exact_predicate, id_in_list, pushed_filter, Duck, FeatureRow};
+use crate::duck::{key_filter, quote, Duck, FeatureRow};
 use crate::lake::LanceSource;
+use crate::query::{urlencode, QueryError, RowKey, Selection};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub concurrency: usize,
+    pub duck_threads: usize,
+    pub duck_memory_mb: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            concurrency: 4,
+            duck_threads: 1,
+            duck_memory_mb: 512,
+        }
+    }
+}
+
+pub struct Admission {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.metrics.leave();
+    }
+}
 
 pub struct App {
     pub lance: Arc<LanceSource>,
     pub duck: Arc<Duck>,
     pub collections: Vec<String>,
     pub metrics: Arc<crate::metrics::Metrics>,
-    sem: Arc<tokio::sync::Semaphore>,
+    pub cache_metrics: Option<Arc<crate::cache::CacheMetrics>>,
+    sem: Arc<Semaphore>,
 }
 
 impl App {
-    /// Open via the catalog of record: `root` is a Lance Namespace root
-    /// (directory namespace), `table` resolves to the dataset location.
     pub async fn open_via_catalog(
         root: &str,
         table: &str,
@@ -29,22 +54,26 @@ impl App {
         version: Option<u64>,
         storage_options: std::collections::HashMap<String, String>,
         cache: Option<Arc<crate::cache::CachingStore>>,
+        limits: Limits,
     ) -> anyhow::Result<Self> {
         let catalog = Catalog::open(root, &storage_options).await?;
         let uri = catalog.resolve(table).await?;
-        tracing::info!(%root, table, %uri, "catalog resolved table");
-        Self::open_at(uri, tag, version, storage_options, cache).await
+        Self::open_at(uri, tag, version, storage_options, cache, limits).await
     }
 
-    /// Open directly at a dataset URI (development/benchmark bypass of the
-    /// catalog; serving should use open_via_catalog).
     pub async fn open_at(
         uri: String,
         tag: Option<String>,
         version: Option<u64>,
         storage_options: std::collections::HashMap<String, String>,
         cache: Option<Arc<crate::cache::CachingStore>>,
+        limits: Limits,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            limits.concurrency > 0 && limits.concurrency <= 256,
+            "concurrency must be 1..256"
+        );
+        let cache_metrics = cache.as_ref().map(|cache| cache.metrics.clone());
         let lance = Arc::new(
             LanceSource::open(
                 crate::lake::SourceConfig {
@@ -57,31 +86,137 @@ impl App {
             )
             .await?,
         );
-        let duck = Arc::new(Duck::open()?);
-        // Collections: distinct layer values over a narrow scan.
-        let layer_batches = lance.scan_ids("true").await?;
-        let collections = duck.distinct_layers(&layer_batches)?;
-        if collections.is_empty() {
-            anyhow::bail!("dataset has no layers");
-        }
+        let duck = Arc::new(Duck::open(
+            limits.concurrency,
+            limits.duck_threads,
+            limits.duck_memory_mb,
+        )?);
+        let collections = lance.collections().await?;
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        metrics
+            .dataset_version
+            .store(lance.version, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             lance,
             duck,
             collections,
-            metrics: Arc::new(crate::metrics::Metrics::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            metrics,
+            cache_metrics,
+            sem: Arc::new(Semaphore::new(limits.concurrency)),
         })
     }
 
-    /// Admission: acquire one of the concurrency permits (bounded wait).
-    pub async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ()> {
-        self.sem.acquire().await.map_err(|_| ())
+    pub fn admit(&self, flight: bool) -> Result<Admission, QueryError> {
+        if flight {
+            self.metrics.count_flight();
+        }
+        let permit = self
+            .sem
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| QueryError::new(429, "server overloaded"))?;
+        self.metrics.enter();
+        Ok(Admission {
+            _permit: permit,
+            metrics: self.metrics.clone(),
+        })
     }
 
-    /// XYZ MVT tile over the same ids-first candidate flow: pushed bbox
-    /// filter (RTREE on geo datasets), ordered id window, payload by id
-    /// IN, then DuckDB assembles the MVT. None = empty tile (204).
-    #[allow(clippy::too_many_arguments)]
+    pub fn validate_collection(&self, collection: &str) -> anyhow::Result<()> {
+        if self.collections.iter().any(|c| c == collection) {
+            Ok(())
+        } else {
+            Err(QueryError::new(404, "unknown collection").into())
+        }
+    }
+
+    pub async fn selected_keys(
+        &self,
+        selection: &Selection,
+        extra: usize,
+    ) -> anyhow::Result<Vec<RowKey>> {
+        self.validate_collection(&selection.collection)?;
+        if selection.limit == 0 || selection.sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = selection.filter(self.lance.geo_geom, self.lance.spatial)?;
+        let keys = self
+            .lance
+            .scan_keys_topk(&filter, selection.offset + selection.limit + extra)
+            .await?;
+        Ok(keys
+            .into_iter()
+            .skip(selection.offset)
+            .take(selection.limit + extra)
+            .collect())
+    }
+
+    pub fn payload_filter(collection: &str, keys: &[RowKey]) -> String {
+        format!("layer = {} AND {}", quote(collection), key_filter(keys))
+    }
+
+    #[tracing::instrument(name = "items", skip_all, fields(collection = selection.collection, dataset_version = self.lance.version))]
+    pub async fn items_page(&self, selection: &Selection) -> anyhow::Result<String> {
+        let mut keys = self.selected_keys(selection, 1).await?;
+        let has_next = keys.len() > selection.limit;
+        keys.truncate(selection.limit);
+        let rows = if keys.is_empty() {
+            Vec::new()
+        } else {
+            let batches = self
+                .lance
+                .scan_page(&Self::payload_filter(&selection.collection, &keys), None)
+                .await?;
+            self.duck.render_page(batches).await?
+        };
+        let features = rows
+            .iter()
+            .map(|row| render_feature(&selection.collection, row, self.lance.version))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut links = vec![
+            json!({"rel": "self", "href": selection.href(self.lance.version, None), "type": "application/geo+json"}),
+            json!({"rel": "collection", "href": format!("/collections/{}", urlencode(&selection.collection)), "type": "application/json"}),
+        ];
+        if has_next {
+            if let Some(last) = keys.last() {
+                links.push(json!({"rel": "next", "href": selection.href(self.lance.version, Some(last)), "type": "application/geo+json"}));
+            }
+        }
+        Ok(serde_json::to_string(
+            &json!({"type": "FeatureCollection", "numberReturned": features.len(), "features": features, "links": links}),
+        )?)
+    }
+
+    #[tracing::instrument(name = "item", skip_all, fields(collection, dataset_version = self.lance.version))]
+    pub async fn item(
+        &self,
+        collection: &str,
+        feature_id: &str,
+        sources: &[i64],
+    ) -> anyhow::Result<Option<String>> {
+        self.validate_collection(collection)?;
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        let filter = format!(
+            "{} AND id = {}",
+            crate::duck::pushed_filter(collection, None, sources, self.lance.geo_geom),
+            quote(feature_id)
+        );
+        let batches = self.lance.scan_page(&filter, Some(1)).await?;
+        let rows = self.duck.render_page(batches).await?;
+        rows.first()
+            .map(|row| {
+                Ok(serde_json::to_string(&render_feature(
+                    collection,
+                    row,
+                    self.lance.version,
+                )?)?)
+            })
+            .transpose()
+    }
+
+    #[tracing::instrument(name = "tile", skip_all, fields(collection, dataset_version = self.lance.version))]
     pub async fn tile(
         &self,
         collection: &str,
@@ -90,186 +225,44 @@ impl App {
         y: u32,
         sources: &[i64],
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        self.validate_collection(collection)?;
-        let bounds = crate::tiles::xyz_to_bbox(z, x, y);
-        let exact = exact_predicate(collection, Some(bounds), sources);
-        let pushed = pushed_filter(collection, Some(bounds), sources, self.lance.geo_geom);
-        let ids = self
-            .lance
-            .scan_ids_topk(&pushed, crate::tiles::TILE_LIMIT)
-            .await?;
-        if ids.is_empty() {
+        let selection = Selection::new(
+            collection.into(),
+            Some(crate::tiles::xyz_to_bbox(z, x, y)),
+            sources.to_vec(),
+            crate::tiles::TILE_LIMIT,
+            0,
+            None,
+            self.lance.version,
+        )?;
+        let keys = self.selected_keys(&selection, 0).await?;
+        if keys.is_empty() {
             return Ok(None);
         }
-        let payload_filter = format!("{pushed} AND id IN ({})", id_in_list(&ids));
-        let batches = self.lance.scan_page(&payload_filter, None, None).await?;
-        let extent = crate::tiles::mercator_extent(z, x, y);
-        let sql = crate::tiles::mvt_sql(collection, &exact, extent, self.lance.has_was_polygon);
-        self.duck.mvt(&batches, &sql, self.lance.has_was_polygon)
-    }
-
-    fn validate_collection(&self, collection: &str) -> anyhow::Result<()> {
-        if self.collections.iter().any(|c| c == collection) {
-            Ok(())
-        } else {
-            anyhow::bail!("unknown collection")
-        }
-    }
-
-    pub async fn items_page(
-        &self,
-        collection: &str,
-        bounds: Option<[f64; 4]>,
-        sources: &[i64],
-        limit: usize,
-        offset: u32,
-        cursor: Option<&str>,
-    ) -> anyhow::Result<String> {
-        self.validate_collection(collection)?;
-        let exact = exact_predicate(collection, bounds, sources);
-        let pushed = pushed_filter(collection, bounds, sources, self.lance.geo_geom);
-
-        // Always ids-first: a bounded heap selects the ordered id window
-        // during the narrow scan (no full sort of the candidate set), the
-        // payload scan is by id IN, and DuckDB only ever sees the page.
-        let pushed = match cursor {
-            Some(cursor) => format!("{pushed} AND id > {}", crate::duck::quote(cursor)),
-            None => pushed,
-        };
-        let fetch = limit + 1 + offset as usize;
-        let ids = self.lance.scan_ids_topk(&pushed, fetch).await?;
-        let ids: Vec<String> = ids
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit + 1)
-            .collect();
-        let rows: Vec<FeatureRow> = if ids.is_empty() {
-            Vec::new()
-        } else {
-            let payload_filter = format!("{pushed} AND id IN ({})", id_in_list(&ids));
-            let batches = self.lance.scan_page(&payload_filter, None, None).await?;
-            self.duck
-                .render_page(&batches, &exact, None, 0, self.lance.has_was_polygon)?
-        };
-
-        let has_next = rows.len() > limit;
-        let rows: Vec<_> = rows.into_iter().take(limit).collect();
-        let features: Vec<Value> = rows
-            .iter()
-            .map(|r| render_feature(collection, &r.id, &r.geom_json, &r.properties))
-            .collect();
-        let mut links = vec![
-            json!({"rel": "self", "href": self_href(collection, bounds, limit, offset, cursor), "type": "application/geo+json"}),
-            json!({"rel": "collection", "href": format!("/collections/{collection}"), "type": "application/json"}),
-        ];
-        if has_next {
-            if let Some(last) = rows.last() {
-                links.push(json!({
-                    "rel": "next",
-                    "href": format!(
-                        "/collections/{}/items?{bbox}cursor={}&limit={}&offset=0&sources=1",
-                        collection, urlencode(&last.id), limit,
-                        bbox = bounds
-                            .map(|[w, s, e, n]| format!("bbox={w},{s},{e},{n}&"))
-                            .unwrap_or_default()
-                    ),
-                    "type": "application/geo+json"
-                }));
-            }
-        }
-        Ok(serde_json::to_string(&json!({
-            "type": "FeatureCollection",
-            "numberReturned": features.len(),
-            "features": features,
-            "links": links,
-        }))?)
-    }
-
-    pub async fn item(
-        &self,
-        collection: &str,
-        feature_id: &str,
-        sources: &[i64],
-    ) -> anyhow::Result<Option<String>> {
-        self.validate_collection(collection)?;
-        let pushed = format!(
-            "{} AND id = {}",
-            pushed_filter(collection, None, sources, self.lance.geo_geom),
-            crate::duck::quote(feature_id)
-        );
-        let batches = self.lance.scan_page(&pushed, Some(2), None).await?;
-        let rows =
-            self.duck
-                .render_page(&batches, "TRUE", Some(1), 0, self.lance.has_was_polygon)?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(serde_json::to_string(&render_feature(
-                collection,
-                &row.id,
-                &row.geom_json,
-                &row.properties,
-            ))?)),
-            None => Ok(None),
-        }
+        let batches = self
+            .lance
+            .scan_page(&Self::payload_filter(collection, &keys), None)
+            .await?;
+        let sql = crate::tiles::mvt_sql(collection, crate::tiles::mercator_extent(z, x, y));
+        self.duck.mvt(batches, sql).await
     }
 }
 
-fn render_feature(collection: &str, id: &str, geom_json: &str, properties: &str) -> Value {
-    let geometry: Value = if geom_json.is_empty() {
+fn render_feature(collection: &str, row: &FeatureRow, version: u64) -> anyhow::Result<Value> {
+    let geometry: Value = if row.geom_json.is_empty() {
         Value::Null
     } else {
-        serde_json::from_str(geom_json).unwrap_or(Value::Null)
+        serde_json::from_str(&row.geom_json)?
     };
-    let props: Value = if properties.is_empty() {
+    let props: Value = if row.properties.is_empty() {
         json!({})
     } else {
-        serde_json::from_str(properties).unwrap_or(json!({}))
+        serde_json::from_str(&row.properties)?
     };
-    json!({
-        "type": "Feature",
-        "id": id,
-        "geometry": geometry,
-        "properties": props,
+    Ok(json!({
+        "type": "Feature", "id": row.id, "geometry": geometry, "properties": props,
         "links": [
-            {"rel": "self", "href": format!("/collections/{collection}/items/{id}?sources=1"), "type": "application/geo+json"},
-            {"rel": "collection", "href": format!("/collections/{collection}"), "type": "application/json"}
+            {"rel": "self", "href": format!("/collections/{}/items/{}?sources={}&snapshot={version}", urlencode(collection), urlencode(&row.id), row.source_id), "type": "application/geo+json"},
+            {"rel": "collection", "href": format!("/collections/{}", urlencode(collection)), "type": "application/json"}
         ]
-    })
-}
-
-fn self_href(
-    collection: &str,
-    bounds: Option<[f64; 4]>,
-    limit: usize,
-    offset: u32,
-    cursor: Option<&str>,
-) -> String {
-    let bbox = bounds
-        .map(|[w, s, e, n]| format!("bbox={w},{s},{e},{n}&"))
-        .unwrap_or_default();
-    match cursor {
-        Some(c) => format!(
-            "/collections/{}/items?{bbox}cursor={}&limit={}&offset={}&sources=1",
-            collection,
-            urlencode(c),
-            limit,
-            offset
-        ),
-        None => format!(
-            "/collections/{}/items?{bbox}limit={}&offset={}&sources=1",
-            collection, limit, offset
-        ),
-    }
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::new();
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+    }))
 }

@@ -1,146 +1,33 @@
-//! Read-only Arrow Flight over the same ids-first pages (port of the Go
-//! serve's flight contract). Tickets mirror ShardTicket
-//! {collection, bbox, columns, limit, offset, sources}; columns: id,
-//! geometry (WKB), properties, source_id, x, y, name.
+//! Read-only Flight: shared exact selection, canonical schemas and bounded streaming.
 use std::sync::Arc;
+use std::time::Duration;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::flight_service_server::FlightService;
-use arrow_flight::flight_service_server::FlightServiceServer;
+use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
 };
-use futures::StreamExt;
-use serde::Deserialize;
-use serde::Serialize;
-use tokio::sync::mpsc;
+use futures::{StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use crate::app::App;
-use crate::duck::{exact_predicate, pushed_filter};
+use crate::query::{check_snapshot, parse_sources, QueryError, Selection, MAX_OFFSET};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ShardTicket {
     pub collection: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bbox: Option<Vec<f64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<[f64; 4]>,
     pub columns: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<i64>>,
-}
-
-fn column_type(name: &str) -> Option<DataType> {
-    match name {
-        "id" | "properties" | "name" => Some(DataType::Utf8),
-        "geometry" => Some(DataType::Binary),
-        "source_id" => Some(DataType::Int64),
-        "x" | "y" => Some(DataType::Float64),
-        _ => None,
-    }
-}
-
-fn validate_columns(ticket: &ShardTicket) -> Result<Vec<String>, Status> {
-    let cols = match &ticket.columns {
-        None => vec![
-            "id".into(),
-            "geometry".into(),
-            "properties".into(),
-            "source_id".into(),
-        ],
-        Some(cols) => cols.clone(),
-    };
-    if cols.is_empty() {
-        return Err(Status::invalid_argument("columns must not be empty"));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for c in &cols {
-        if column_type(c).is_none() {
-            return Err(Status::invalid_argument(format!("unknown column {c:?}")));
-        }
-        if !seen.insert(c.clone()) {
-            return Err(Status::invalid_argument(format!("duplicate column {c:?}")));
-        }
-    }
-    Ok(cols)
-}
-
-fn ticket_schema(cols: &[String]) -> SchemaRef {
-    let fields: Vec<Field> = cols
-        .iter()
-        .map(|c| Field::new(c.clone(), column_type(c).unwrap(), true))
-        .collect();
-    Arc::new(Schema::new(fields))
-}
-
-fn ticket_bounds(ticket: &ShardTicket) -> Result<Option<[f64; 4]>, Status> {
-    match &ticket.bbox {
-        None => Ok(None),
-        Some(bbox)
-            if bbox.len() == 4
-                && bbox.iter().all(|v| v.is_finite())
-                && bbox[0] < bbox[2]
-                && bbox[1] < bbox[3] =>
-        {
-            Ok(Some([bbox[0], bbox[1], bbox[2], bbox[3]]))
-        }
-        Some(_) => Err(Status::invalid_argument("bbox must be 4 finite numbers")),
-    }
-}
-
-fn validate_ticket(ticket: &ShardTicket) -> Result<(Vec<String>, usize, usize), Status> {
-    let cols = validate_columns(ticket)?;
-    let limit = ticket.limit.unwrap_or(10_000);
-    if !(0..=100_000).contains(&limit) {
-        return Err(Status::invalid_argument("limit must be 0..100000"));
-    }
-    let offset = ticket.offset.unwrap_or(0);
-    if offset < 0 {
-        return Err(Status::invalid_argument("offset must be >= 0"));
-    }
-    ticket_bounds(ticket)?;
-    Ok((cols, limit as usize, offset as usize))
-}
-
-fn default_sources(ticket: &ShardTicket) -> Vec<i64> {
-    ticket.sources.clone().unwrap_or_else(|| vec![1])
-}
-
-fn ticket_bytes(ticket: &ShardTicket) -> Result<bytes::Bytes, Status> {
-    serde_json::to_vec(ticket)
-        .map(bytes::Bytes::from)
-        .map_err(|e| Status::internal(format!("{e}")))
-}
-
-fn descriptor_to_ticket(desc: &FlightDescriptor) -> Result<ShardTicket, Status> {
-    use arrow_flight::flight_descriptor::DescriptorType;
-    match DescriptorType::try_from(desc.r#type) {
-        Ok(DescriptorType::Path) if desc.path.len() == 1 => Ok(ShardTicket {
-            collection: desc.path[0].clone(),
-            ..Default::default()
-        }),
-        Ok(DescriptorType::Cmd) => serde_json::from_slice(&desc.cmd)
-            .map_err(|e| Status::invalid_argument(format!("bad ticket JSON: {e}"))),
-        _ => Err(Status::invalid_argument(
-            "descriptor must be a one-part collection path or a JSON command",
-        )),
-    }
-}
-
-fn endpoint_for(ticket: &ShardTicket) -> Result<FlightEndpoint, Status> {
-    Ok(FlightEndpoint {
-        ticket: Some(Ticket {
-            ticket: ticket_bytes(ticket)?,
-        }),
-        ..Default::default()
-    })
+    pub cursor: Option<String>,
+    pub snapshot: Option<u64>,
 }
 
 pub struct FlightServer {
@@ -152,77 +39,149 @@ impl FlightServer {
         Self { app }
     }
 
-    fn info_for(&self, ticket: &ShardTicket) -> Result<FlightInfo, Status> {
-        let (cols, ..) = validate_ticket(ticket)?;
-        let schema = ticket_schema(&cols);
+    fn validate(
+        &self,
+        ticket: &ShardTicket,
+    ) -> Result<(Vec<String>, SchemaRef, Selection), Status> {
+        self.app
+            .validate_collection(&ticket.collection)
+            .map_err(status)?;
+        check_snapshot(ticket.snapshot, self.app.lance.version).map_err(status)?;
+        let columns = ticket.columns.clone().unwrap_or_else(|| {
+            vec![
+                "id".into(),
+                "geometry".into(),
+                "properties".into(),
+                "source_id".into(),
+            ]
+        });
+        if columns.is_empty() || columns.len() > 256 {
+            return Err(Status::invalid_argument(
+                "columns must contain 1..256 fields",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if columns.iter().any(|c| !seen.insert(c)) {
+            return Err(Status::invalid_argument("duplicate columns"));
+        }
+        let schema = self.app.lance.flight_schema(&columns).map_err(status)?;
+        let limit = ticket.limit.unwrap_or(10_000);
+        let offset = ticket.offset.unwrap_or(0);
+        if !(0..=100_000).contains(&limit) || !(0..=MAX_OFFSET as i64).contains(&offset) {
+            return Err(Status::invalid_argument(
+                "limit and offset must be 0..100000",
+            ));
+        }
+        let sources = ticket.sources.clone().unwrap_or_else(|| vec![1]);
+        if sources.len() > 256 {
+            return Err(Status::invalid_argument(
+                "at most 256 sources may be selected",
+            ));
+        }
+        let selection = Selection::new(
+            ticket.collection.clone(),
+            ticket.bbox,
+            sources,
+            limit as usize,
+            offset as usize,
+            ticket.cursor.as_deref(),
+            self.app.lance.version,
+        )
+        .map_err(status)?;
+        // Validate even empty selections, for consistent metadata and DoGet errors.
+        selection
+            .filter(self.app.lance.geo_geom, self.app.lance.spatial)
+            .map_err(status)?;
+        Ok((columns, schema, selection))
+    }
+
+    fn info_for(&self, mut ticket: ShardTicket) -> Result<FlightInfo, Status> {
+        let (_, schema, _) = self.validate(&ticket)?;
+        ticket.snapshot = Some(self.app.lance.version);
+        let bytes = ticket_bytes(&ticket)?;
         Ok(FlightInfo {
             schema: encode_schema(&schema)?,
             flight_descriptor: Some(FlightDescriptor {
                 r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
-                cmd: ticket_bytes(ticket)?,
+                cmd: bytes.clone(),
                 ..Default::default()
             }),
-            endpoint: vec![endpoint_for(ticket)?],
+            endpoint: vec![FlightEndpoint {
+                ticket: Some(Ticket { ticket: bytes }),
+                ..Default::default()
+            }],
+            total_records: -1,
+            total_bytes: -1,
+            ordered: true,
             ..Default::default()
         })
     }
+}
 
-    /// Run the ticket as an ids-first page and return its batches in the
-    /// ticket's projected schema.
-    async fn batches(&self, ticket: &ShardTicket) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
-        let (cols, limit, offset) = validate_ticket(ticket)?;
-        if self.app.collections.iter().all(|c| c != &ticket.collection) {
-            return Err(Status::invalid_argument("unknown collection"));
+fn status(error: anyhow::Error) -> Status {
+    if let Some(error) = error.downcast_ref::<QueryError>() {
+        match error.status {
+            400 => Status::invalid_argument(&error.message),
+            404 => Status::not_found(&error.message),
+            409 => Status::failed_precondition(&error.message),
+            413 | 429 => Status::resource_exhausted(&error.message),
+            504 => Status::deadline_exceeded(&error.message),
+            _ => Status::internal(&error.message),
         }
-        let bounds = ticket_bounds(ticket)?;
-        let sources = default_sources(ticket);
-        let exact = exact_predicate(&ticket.collection, bounds, &sources);
-        let pushed = pushed_filter(
-            &ticket.collection,
-            bounds,
-            &sources,
-            self.app.lance.geo_geom,
-        );
+    } else {
+        tracing::error!(%error, "Flight query failed");
+        Status::internal("internal query error")
+    }
+}
 
-        let fetch = limit + offset;
-        let ids = self
-            .app
-            .lance
-            .scan_ids_topk(&pushed, fetch)
-            .await
-            .map_err(|e| Status::internal(format!("{e}")))?;
-        let ids: Vec<String> = ids.into_iter().skip(offset).take(limit).collect();
-        if ids.is_empty() {
-            return Ok((ticket_schema(&cols), Vec::new()));
-        }
-        let payload = format!("{pushed} AND id IN ({})", crate::duck::id_in_list(&ids));
-        let batches = self
-            .app
-            .lance
-            .scan_flight(&payload, &cols)
-            .await
-            .map_err(|e| Status::internal(format!("{e}")))?;
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| ticket_schema(&cols));
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let _ = rows;
-        let _ = &exact;
-        Ok((schema, batches))
+fn apply_sources(
+    ticket: &mut ShardTicket,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<(), Status> {
+    if let Some(raw) = metadata.get("x-source-ids") {
+        let raw = raw
+            .to_str()
+            .map_err(|_| Status::invalid_argument("invalid x-source-ids"))?;
+        let selected = parse_sources(Some(raw)).map_err(status)?;
+        ticket.sources = Some(match ticket.sources.take() {
+            None => selected,
+            Some(sources) => sources
+                .into_iter()
+                .filter(|s| selected.contains(s))
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn ticket_bytes(ticket: &ShardTicket) -> Result<bytes::Bytes, Status> {
+    serde_json::to_vec(ticket)
+        .map(bytes::Bytes::from)
+        .map_err(|e| Status::internal(e.to_string()))
+}
+
+fn descriptor_to_ticket(desc: FlightDescriptor) -> Result<ShardTicket, Status> {
+    use arrow_flight::flight_descriptor::DescriptorType;
+    match DescriptorType::try_from(desc.r#type) {
+        Ok(DescriptorType::Path) if desc.path.len() == 1 => Ok(ShardTicket {
+            collection: desc.path[0].clone(),
+            ..Default::default()
+        }),
+        Ok(DescriptorType::Cmd) => serde_json::from_slice(&desc.cmd)
+            .map_err(|e| Status::invalid_argument(format!("bad ticket JSON: {e}"))),
+        _ => Err(Status::invalid_argument(
+            "descriptor must be a collection path or JSON command",
+        )),
     }
 }
 
 fn encode_schema(schema: &SchemaRef) -> Result<bytes::Bytes, Status> {
-    // arrow-flight 58 pins the same arrow-ipc as our arrow workspace dep,
-    // so arrow::ipc::writer::IpcWriteOptions is the concrete type behind
-    // SchemaAsIpc.
     let options = arrow::ipc::writer::IpcWriteOptions::default();
-    let result: arrow_flight::SchemaResult = arrow_flight::SchemaAsIpc {
+    let result: SchemaResult = arrow_flight::SchemaAsIpc {
         pair: (schema, &options),
     }
     .try_into()
-    .map_err(|e| Status::internal(format!("schema ipc: {e:?}")))?;
+    .map_err(|e| Status::internal(format!("schema IPC: {e}")))?;
     Ok(result.schema)
 }
 
@@ -247,49 +206,41 @@ impl FlightService for FlightServer {
         &self,
         request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        if !request.into_inner().expression.is_empty() {
+        if !request.get_ref().expression.is_empty() {
             return Err(Status::invalid_argument("criteria must be empty"));
         }
-        let infos: Result<Vec<FlightInfo>, Status> = self
+        let infos = self
             .app
             .collections
             .iter()
             .map(|c| {
-                self.info_for(&ShardTicket {
+                self.info_for(ShardTicket {
                     collection: c.clone(),
                     ..Default::default()
                 })
             })
-            .collect();
-        let infos = infos?;
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            for info in infos {
-                if tx.send(Ok(info)).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        )))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Response::new(Box::pin(futures::stream::iter(
+            infos.into_iter().map(Ok),
+        ))))
     }
 
     async fn get_flight_info(
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let ticket = descriptor_to_ticket(&request.into_inner())?;
-        Ok(Response::new(self.info_for(&ticket)?))
+        let (metadata, _, desc) = request.into_parts();
+        let mut ticket = descriptor_to_ticket(desc)?;
+        apply_sources(&mut ticket, &metadata)?;
+        Ok(Response::new(self.info_for(ticket)?))
     }
 
     async fn poll_flight_info(
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<arrow_flight::PollInfo>, Status> {
-        let info = self.get_flight_info(request).await?;
         Ok(Response::new(arrow_flight::PollInfo {
-            info: Some(info.into_inner()),
+            info: Some(self.get_flight_info(request).await?.into_inner()),
             ..Default::default()
         }))
     }
@@ -298,10 +249,12 @@ impl FlightService for FlightServer {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let ticket = descriptor_to_ticket(&request.into_inner())?;
-        let (cols, ..) = validate_ticket(&ticket)?;
+        let (metadata, _, desc) = request.into_parts();
+        let mut ticket = descriptor_to_ticket(desc)?;
+        apply_sources(&mut ticket, &metadata)?;
+        let (_, schema, _) = self.validate(&ticket)?;
         Ok(Response::new(SchemaResult {
-            schema: encode_schema(&ticket_schema(&cols))?,
+            schema: encode_schema(&schema)?,
         }))
     }
 
@@ -309,26 +262,58 @@ impl FlightService for FlightServer {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let ticket: ShardTicket = serde_json::from_slice(&request.into_inner().ticket)
+        let (metadata, _, raw) = request.into_parts();
+        if raw.ticket.len() > 64 * 1024 {
+            return Err(Status::invalid_argument("ticket exceeds 64 KiB"));
+        }
+        let mut ticket: ShardTicket = serde_json::from_slice(&raw.ticket)
             .map_err(|e| Status::invalid_argument(format!("bad ticket JSON: {e}")))?;
-        let (cols, ..) = validate_ticket(&ticket)?;
-        let (_schema, batches) = self.batches(&ticket).await?;
-        let schema = ticket_schema(&cols);
-        let (batch_tx, batch_rx) =
-            mpsc::channel::<Result<RecordBatch, arrow_flight::error::FlightError>>(4);
-        tokio::spawn(async move {
-            for batch in batches {
-                if batch_tx.send(Ok(batch)).await.is_err() {
-                    break;
+        apply_sources(&mut ticket, &metadata)?;
+        let (columns, schema, selection) = self.validate(&ticket)?;
+        let permit = self.app.admit(true).map_err(|e| status(e.into()))?;
+        let span = tracing::info_span!(
+            "flight.do_get",
+            collection = ticket.collection,
+            dataset_version = self.app.lance.version
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let prepare = async {
+            let keys = self
+                .app
+                .selected_keys(&selection, 0)
+                .await
+                .map_err(status)?;
+            self.app
+                .lance
+                .scan_flight(&App::payload_filter(&ticket.collection, &keys), &columns)
+                .await
+                .map_err(status)
+        };
+        let batches = tokio::time::timeout_at(deadline, prepare.instrument(span.clone()))
+            .await
+            .map_err(|_| Status::deadline_exceeded("query deadline exceeded"))??;
+        let batches =
+            futures::stream::try_unfold((batches, permit), move |(mut batches, permit)| {
+                let span = span.clone();
+                async move {
+                    let next = tokio::time::timeout_at(deadline, batches.try_next())
+                        .await
+                        .map_err(|_| {
+                            arrow_flight::error::FlightError::from(Status::deadline_exceeded(
+                                "query deadline exceeded",
+                            ))
+                        })?
+                        .map_err(|e| arrow_flight::error::FlightError::from(status(e)))?;
+                    Ok(next.map(|batch| (batch, (batches, permit))))
                 }
-            }
-        });
+                .instrument(span)
+            });
         let encoder = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(tokio_stream::wrappers::ReceiverStream::new(batch_rx));
-        Ok(Response::new(Box::pin(encoder.map(|item| {
-            item.map_err(|e| Status::internal(format!("{e}")))
-        }))))
+            .build(batches);
+        Ok(Response::new(Box::pin(
+            encoder.map(|item| item.map_err(Status::from)),
+        )))
     }
 
     async fn do_put(
@@ -337,21 +322,18 @@ impl FlightService for FlightServer {
     ) -> Result<Response<Self::DoPutStream>, Status> {
         Err(Status::permission_denied("read-only"))
     }
-
     async fn do_exchange(
         &self,
         _: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
         Err(Status::permission_denied("read-only"))
     }
-
     async fn do_action(
         &self,
         _: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         Err(Status::unimplemented("no actions"))
     }
-
     async fn list_actions(
         &self,
         _: Request<Empty>,
@@ -363,14 +345,10 @@ impl FlightService for FlightServer {
 pub type ResponseStream<T> =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-/// Serve Flight on `addr` until the process ends.
 pub async fn serve(app: Arc<App>, addr: &str) -> anyhow::Result<()> {
-    let listener = tonic::transport::Server::builder()
+    tonic::transport::Server::builder()
         .add_service(FlightServiceServer::new(FlightServer::new(app)))
-        .serve(
-            addr.parse()
-                .map_err(|e| anyhow::anyhow!("flight listen {addr}: {e:?}"))?,
-        );
-    listener.await?;
+        .serve(addr.parse()?)
+        .await?;
     Ok(())
 }

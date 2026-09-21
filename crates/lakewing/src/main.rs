@@ -13,26 +13,21 @@ mod flight;
 mod http_cache;
 mod lake;
 mod metrics;
+mod otel;
+mod query;
+#[cfg(test)]
+mod tests;
 mod tiles;
 
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("build") {
         return run_build(args[1..].to_vec()).await;
     }
     serve_main(args.into_iter()).await
-}
-
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
 }
 
 async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> {
@@ -46,10 +41,23 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
     let mut version: Option<u64> = None;
     let mut listen = "127.0.0.1:3000".to_string();
     let mut flight_listen: Option<String> = None;
+    let mut otel_endpoint: Option<String> = None;
     let mut cache_dir: Option<String> = None;
     let mut cache_bytes: usize = 512 * 1024 * 1024;
-    while let Some(flag) = args.next() {
-        let mut value = || args.next().expect("flag needs a value");
+    let mut concurrency: usize = 4;
+    let mut duck_threads: usize = 1;
+    let mut duck_memory_mb: usize = 512;
+    while let Some(arg) = args.next() {
+        // Accept both `--flag value` and `--flag=value`.
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+            None => (arg, None),
+        };
+        let value = || {
+            inline
+                .or_else(|| args.next())
+                .unwrap_or_else(|| panic!("flag {flag} needs a value"))
+        };
         match flag.as_str() {
             "--catalog-uri" => catalog_root = Some(value()),
             "--table" => table = value(),
@@ -61,8 +69,12 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
             "--version" => version = value().parse().ok(),
             "--listen" => listen = value(),
             "--flight-listen" => flight_listen = Some(value()),
+            "--otel-endpoint" => otel_endpoint = Some(value()),
             "--cache-dir" => cache_dir = Some(value()),
             "--cache-bytes" => cache_bytes = value().parse().unwrap_or(cache_bytes),
+            "--concurrency" => concurrency = value().parse().unwrap_or(concurrency),
+            "--duck-threads" => duck_threads = value().parse().unwrap_or(duck_threads),
+            "--duck-memory-mb" => duck_memory_mb = value().parse().unwrap_or(duck_memory_mb),
             other => anyhow::bail!("unknown flag {other}"),
         }
     }
@@ -84,23 +96,52 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
             }
         }
     }
+    let _telemetry = otel::init(otel_endpoint.as_deref())?;
     let cache = match &cache_dir {
-        Some(dir) => Some(Arc::new(cache::CachingStore::new(
-            // Placeholder inner store: lance replaces it through the
-            // WrappingObjectStore hook when it constructs the real store.
-            Arc::new(object_store::memory::InMemory::new()),
-            cache::build_cache(dir, cache_bytes).await?,
-            "lakewing-cache",
-        ))),
+        Some(dir) => Some(Arc::new(
+            cache::CachingStore::open(
+                dir,
+                cache_bytes,
+                64 * 1024 * 1024,
+                endpoint.as_deref().unwrap_or("default-endpoint"),
+            )
+            .await?,
+        )),
         None => None,
     };
+    let cache_handle = cache.clone();
     let app = Arc::new(match (catalog_root, uri) {
         (Some(root), _) => {
-            app::App::open_via_catalog(&root, &table, tag, version, storage_options, cache).await?
+            app::App::open_via_catalog(
+                &root,
+                &table,
+                tag,
+                version,
+                storage_options,
+                cache,
+                app::Limits {
+                    concurrency,
+                    duck_threads,
+                    duck_memory_mb,
+                },
+            )
+            .await?
         }
         (None, Some(uri)) => {
             tracing::warn!("direct --uri open bypasses the catalog; prefer --catalog-uri");
-            app::App::open_at(uri, tag, version, storage_options, cache).await?
+            app::App::open_at(
+                uri,
+                tag,
+                version,
+                storage_options,
+                cache,
+                app::Limits {
+                    concurrency,
+                    duck_threads,
+                    duck_memory_mb,
+                },
+            )
+            .await?
         }
         (None, None) => anyhow::bail!("--catalog-uri (or dev --uri) is required"),
     });
@@ -119,10 +160,16 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
             }
         });
     }
-    api::serve(app, &listen).await
+    let result = api::serve(app, &listen).await;
+    // Flush the disk tier before exit so restarts reuse warm bytes.
+    if let Some(cache) = cache_handle {
+        let _ = cache.close().await;
+    }
+    result
 }
 
 async fn run_build(args: Vec<String>) -> anyhow::Result<()> {
+    let _telemetry = otel::init(None)?;
     let mut source = String::new();
     let mut out = String::new();
     let mut tag = "prod".to_string();

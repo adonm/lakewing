@@ -1,5 +1,4 @@
 # Default values for lakewing.
-
 replicaCount: 2
 
 image:
@@ -17,15 +16,21 @@ serve:
   # credentials from an existing secret or unsigned reads (gateway signs).
   endpoint: ""          # e.g. http://s3-gateway:8080 (empty = cloud S3)
   s3KeySecret: ""       # existing secret name with s3-key / s3-secret keys
-  unsigned: false       # true when a signing gateway fronts S3
+  # Admission: HTTP + Flight share these permits; saturation rejects fast
+  # (HTTP 429 + Retry-After, Flight RESOURCE_EXHAUSTED).
+  concurrency: 4
+  duckThreads: 1        # DuckDB worker threads per permit
+  duckMemoryMb: 512     # per-process DuckDB memory limit
+  # Optional Arrow Flight port (read-only; shares admission).
+  flightListen: ""
+  # Optional OTLP/gRPC trace collector (e.g. http://lgtm:4317).
+  otelEndpoint: ""
+  # Node-local NVMe range cache; one directory per pod (see templates).
   cacheDir: /nvme/lakewing
   cacheBytes: "8589934592"  # 8 GiB disk tier
-  # Concurrency permits (admission): 429 + Retry-After when saturated.
-  concurrency: 4
 
-# Per-node NVMe cache directory. When set, every replica mounts the same
-# hostPath; the foyer cache is per-pod (not node-shared) — the documented
-# tradeoff vs the archived Go s3cache proxy.
+# Node-local parent directory; each pod gets <path>/<pod-name> so the
+# single-process foyer disk tiers never share files.
 cacheHostPath: /mnt/nvme/lakewing
 
 resources:

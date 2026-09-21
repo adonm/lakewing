@@ -83,7 +83,7 @@ fn base_headers(mut response: poem::Response, etag_value: &str) -> poem::Respons
 /// (identity only, matching the Go contract).
 pub fn success(
     headers: &HeaderMap,
-    metrics: &Metrics,
+    _metrics: &Metrics,
     body: Vec<u8>,
     content_type: &str,
     gz: bool,
@@ -94,7 +94,6 @@ pub fn success(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if etag_matches(if_none_match, &identity) {
-        metrics.count(304);
         let response = base_headers(
             Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
@@ -111,7 +110,6 @@ pub fn success(
         if let Some(gzipped) = gzip(&body) {
             let gz_etag = etag(&gzipped);
             if etag_matches(if_none_match, &gz_etag) {
-                metrics.count(304);
                 return base_headers(
                     Response::builder()
                         .status(StatusCode::NOT_MODIFIED)
@@ -119,7 +117,6 @@ pub fn success(
                     &gz_etag,
                 );
             }
-            metrics.count(200);
             let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .content_type(content_type)
@@ -130,7 +127,6 @@ pub fn success(
             return base_headers(response, &gz_etag);
         }
     }
-    metrics.count(200);
     base_headers(
         Response::builder()
             .status(StatusCode::OK)
@@ -141,8 +137,7 @@ pub fn success(
 }
 
 /// Empty-tile response: 204 with cache headers and no body.
-pub fn no_content(metrics: &Metrics) -> Response {
-    metrics.count(204);
+pub fn no_content(_metrics: &Metrics) -> Response {
     let mut response = Response::builder().status(StatusCode::NO_CONTENT).finish();
     let headers = response.headers_mut();
     headers.insert(header::VARY, HeaderValue::from_static(VARY));

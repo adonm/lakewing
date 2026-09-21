@@ -32,23 +32,14 @@ pub fn mercator_extent(z: u8, x: u32, y: u32) -> [f64; 4] {
 
 /// Single-scan MVT assembly over the loaded candidates (lw_page), matching
 /// the archived Go tiles::MVTSQL.
-pub fn mvt_sql(collection: &str, exact: &str, extent: [f64; 4], was_polygon: bool) -> String {
+pub fn mvt_sql(collection: &str, extent: [f64; 4]) -> String {
     let [w, s, e, n] = extent;
-    let geom_expr = if was_polygon {
-        "CASE WHEN lw_wp.was_polygon THEN (ST_Dump(ST_GeomFromWKB(lw_page.geom)))[1].geom ELSE ST_GeomFromWKB(lw_page.geom) END"
-    } else {
-        "ST_GeomFromWKB(lw_page.geom)"
-    };
-    let from = if was_polygon {
-        "lw_page JOIN lw_wp USING (id)"
-    } else {
-        "lw_page"
-    };
+    let geom_expr = crate::duck::GEOMETRY_SQL;
     format!(
         "SELECT ST_AsMVT(t, {}) FROM (SELECT lw_page.id, ST_AsMVTGeom(\
          ST_Transform({geom_expr}, 'EPSG:4326', 'EPSG:3857', always_xy := true), \
          ST_Extent(ST_MakeEnvelope({w}, {s}, {e}, {n})), 4096, 64, true) AS geom \
-         FROM {from} WHERE lw_page.id IS NOT NULL AND {exact} ORDER BY lw_page.id LIMIT 5000) t \
+          FROM lw_page ORDER BY lw_page.id, source_id LIMIT 5000) t \
          WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom) HAVING count(*) > 0",
         crate::duck::quote(collection)
     )
