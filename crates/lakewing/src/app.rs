@@ -16,6 +16,8 @@ pub struct Limits {
     pub duck_memory_mb: usize,
     /// Rendered-response cache budget in bytes; 0 disables the cache.
     pub response_cache_bytes: usize,
+    pub lance_index_cache_bytes: usize,
+    pub lance_metadata_cache_bytes: usize,
 }
 
 impl Default for Limits {
@@ -24,7 +26,9 @@ impl Default for Limits {
             concurrency: 4,
             duck_threads: 1,
             duck_memory_mb: 512,
-            response_cache_bytes: 256 * 1024 * 1024,
+            response_cache_bytes: 0,
+            lance_index_cache_bytes: 256 * 1024 * 1024,
+            lance_metadata_cache_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -85,6 +89,8 @@ impl App {
                     tag,
                     version,
                     storage_options,
+                    index_cache_bytes: limits.lance_index_cache_bytes,
+                    metadata_cache_bytes: limits.lance_metadata_cache_bytes,
                 },
                 cache,
             )
@@ -189,6 +195,7 @@ impl App {
             return Ok(Vec::new());
         }
         let fetch = selection.offset + selection.limit + extra;
+        let filter = selection.filter(self.lance.geo_geom, self.lance.spatial)?;
         // Coarse-bbox split plan: a bbox at least COARSE_BBOX_DEG2 wide
         // makes the single exact filter enumerate and take every matching
         // row through the RTREE prefilter; the split serves contained
@@ -232,12 +239,7 @@ impl App {
             merged.dedup();
             merged
         } else {
-            self.lance
-                .scan_keys_topk(
-                    &selection.filter(self.lance.geo_geom, self.lance.spatial)?,
-                    fetch,
-                )
-                .await?
+            self.lance.scan_keys_topk(&filter, fetch).await?
         };
         Ok(keys
             .into_iter()

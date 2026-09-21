@@ -5,6 +5,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{FlightDescriptor, Ticket};
 use futures::{StreamExt, TryStreamExt};
+use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use poem::{Endpoint, Request};
 use serde_json::Value;
@@ -79,6 +80,7 @@ impl Fixture {
             tag: "prod".into(),
             max_rows_per_file: 3,
             max_bytes_per_file: 1024 * 1024,
+            indexes: Default::default(),
         })
         .await
         .unwrap();
@@ -459,7 +461,7 @@ fn app_limits(response_cache_bytes: usize) -> crate::app::Limits {
 
 /// Index usage is pinned, not assumed: the tile/bbox plan must prefilter
 /// through the RTREE, the id IN payload and point lookups through the
-/// BTREE — and a filter with no indexed terms must touch neither.
+/// BTREE; categorical filters use bitmaps and bbox comparisons use zonemaps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tile_and_ogc_queries_use_their_indexes() {
     let fixture = Fixture::new().await;
@@ -497,17 +499,170 @@ async fn tile_and_ogc_queries_use_their_indexes() {
         "point lookup must probe the BTREE:\n{plan}"
     );
 
-    // Negative control: no indexed terms -> a plain scan plan.
-    let layer_only = crate::duck::pushed_filter("buildings", None, &[2], true);
+    let sources = crate::duck::pushed_filter("buildings", None, &[2], true);
     let plan = app
         .lance
-        .explain(&layer_only, &["layer", "source_id"])
+        .explain(&sources, &["layer", "source_id"])
         .await
         .unwrap();
     assert!(
-        !plan.contains("ScalarIndexQuery"),
-        "layer/source-only filter must not touch an index:\n{plan}"
+        plan.contains("@source_id_bitmap(Bitmap)"),
+        "source filter must probe the bitmap:\n{plan}"
     );
+    let plan = app
+        .lance
+        .explain("xmin >= 4 AND xmax <= 6", &["id"])
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("@xmin_zonemap(ZoneMap)") && plan.contains("@xmax_zonemap(ZoneMap)"),
+        "bbox comparisons must prune with zonemaps:\n{plan}"
+    );
+    let plan = app.lance.explain("score > 0", &["id"]).await.unwrap();
+    assert!(
+        !plan.contains("ScalarIndexQuery"),
+        "unindexed negative control:\n{plan}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retuning_indexes_preserves_pinned_results_and_data_files() {
+    let fixture = Fixture::new().await;
+    let pinned = fixture.app(&fixture.geo, 2).await;
+    let mut dataset = Dataset::open(&fixture.geo).await.unwrap();
+    let files = dataset
+        .get_fragments()
+        .iter()
+        .flat_map(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let original_version = dataset.version().version;
+    let config = crate::indexes::IndexConfig {
+        btree_page_rows: 128,
+        rtree_page_rows: 64,
+        zonemap_rows: 64,
+        ..Default::default()
+    };
+    crate::indexes::install(&mut dataset, &config, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.version().version,
+        original_version,
+        "install is idempotent without --replace"
+    );
+    crate::indexes::install(&mut dataset, &config, true)
+        .await
+        .unwrap();
+    let updated = dataset.version().version;
+    assert!(updated > original_version);
+    assert_eq!(
+        dataset.tags().get_version("prod").await.unwrap(),
+        original_version
+    );
+    assert_eq!(
+        dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|f| f
+                .metadata()
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        files
+    );
+    let stats: Value =
+        serde_json::from_str(&dataset.index_statistics("xmin_zonemap").await.unwrap()).unwrap();
+    assert_eq!(stats["indices"][0]["rows_per_zone"], 64);
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    let stats: Value =
+        serde_json::from_str(&dataset.index_statistics("geom_idx").await.unwrap()).unwrap();
+    assert_eq!(stats["indices"][0]["page_size"], 64);
+    let names = dataset.load_indices().await.unwrap();
+    assert!(
+        !names.iter().any(|i| i.name == "layer_bitmap"),
+        "singleton layer needs no bitmap"
+    );
+    let tuned = App::open_at(
+        fixture.geo.clone(),
+        None,
+        Some(updated),
+        Default::default(),
+        None,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    for bounds in [
+        None,
+        Some([4., 4., 6., 6.]),
+        Some([4.1, 4.1, 4.2, 4.2]),
+        Some([-1., -1., 11., 11.]),
+        Some([5.5, 0., 6., 10.]),
+    ] {
+        let selection = crate::query::Selection::new(
+            "buildings".into(),
+            bounds,
+            vec![2, 3],
+            10,
+            0,
+            None,
+            updated,
+        )
+        .unwrap();
+        let expected = pinned
+            .lance
+            .scan_keys_topk(&selection.filter(true, true).unwrap(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            tuned.selected_keys(&selection, 0).await.unwrap(),
+            expected,
+            "retuned exact/split selection for {bounds:?}"
+        );
+    }
+    // Install on a geometry-free multi-collection dataset too.
+    let plain = fixture.batch.project(&[0, 1, 2, 4, 9]).unwrap();
+    let mut columns = plain.columns().to_vec();
+    columns[1] = Arc::new(StringArray::from(vec![
+        "buildings",
+        "roads",
+        "buildings",
+        "roads",
+        "roads",
+    ]));
+    let plain = RecordBatch::try_new(plain.schema(), columns).unwrap();
+    let uri = fixture
+        ._dir
+        .path()
+        .join("categorical.lance")
+        .to_string_lossy()
+        .into_owned();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(plain.clone())], plain.schema()),
+        &uri,
+        None,
+    )
+    .await
+    .unwrap();
+    crate::indexes::install(&mut dataset, &config, false)
+        .await
+        .unwrap();
+    let mut scanner = dataset.scan();
+    scanner.filter("layer = 'roads' AND source_id = 2").unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("@layer_bitmap(Bitmap)") && plan.contains("@source_id_bitmap(Bitmap)"),
+        "{plan}"
+    );
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 3);
 }
 
 /// Coarse-envelope spatial shapes against the real fixture (opt-in via

@@ -13,11 +13,8 @@ use geoarrow_schema::GeoArrowType;
 use geoarrow_schema::{Dimension, MultiPolygonType};
 use lance::dataset::refs::Ref;
 use lance::dataset::WriteParams;
-use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use lance_file::version::LanceFileVersion;
-use lance_index::scalar::ScalarIndexParams;
-use lance_index::IndexType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 
 pub struct BuildConfig {
@@ -29,6 +26,7 @@ pub struct BuildConfig {
     pub tag: String,
     pub max_rows_per_file: usize,
     pub max_bytes_per_file: usize,
+    pub indexes: crate::indexes::IndexConfig,
 }
 
 /// Build the dataset. Mirrors the layout the parity gates verified:
@@ -36,6 +34,11 @@ pub struct BuildConfig {
 /// promoted, `was_polygon` records the original form), BTREE on id,
 /// RTREE on geom.
 pub async fn build(cfg: BuildConfig) -> anyhow::Result<()> {
+    cfg.indexes.validate()?;
+    anyhow::ensure!(
+        cfg.max_rows_per_file > 0 && cfg.max_bytes_per_file > 0,
+        "fragment limits must be positive"
+    );
     let started = std::time::Instant::now();
     let files = discover(&cfg.source)?;
     if files.is_empty() {
@@ -68,26 +71,7 @@ pub async fn build(cfg: BuildConfig) -> anyhow::Result<()> {
         "wrote dataset"
     );
 
-    dataset
-        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
-        .name("id_idx".to_string())
-        .await?;
-    tracing::info!("built BTREE index on id");
-    dataset
-        .create_index_builder(&["geom"], IndexType::RTree, &ScalarIndexParams::default())
-        .name("geom_idx".to_string())
-        .await?;
-    tracing::info!("built RTREE index on geom");
-    // Zonemaps on the bbox columns: the coarse-split selection plan scans
-    // these columns directly, and zonemaps prune its pages per fragment —
-    // coarse tiles over sparse regions stop paying full-column scans.
-    for column in ["xmin", "ymin", "xmax", "ymax"] {
-        dataset
-            .create_index_builder(&[column], IndexType::ZoneMap, &ScalarIndexParams::default())
-            .name(format!("{column}_zonemap"))
-            .await?;
-    }
-    tracing::info!("built ZONEMAP indexes on the bbox columns");
+    crate::indexes::install(&mut dataset, &cfg.indexes, false).await?;
 
     if !cfg.tag.is_empty() {
         let version = dataset.version().version;

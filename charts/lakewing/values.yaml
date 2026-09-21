@@ -28,9 +28,18 @@ serve:
   # Node-local NVMe range cache; one directory per pod (see templates).
   cacheDir: /nvme/lakewing
   cacheBytes: "8589934592"  # 8 GiB disk tier
+  cacheMemoryBytes: "67108864"  # 64 MiB raw data/index bytes
+  cacheMetadataBytes: "2097152"  # 2 MiB immutable HEAD metadata
   # Block alignment for immutable ranges: overlapping queries reuse cached
   # bytes (0 = exact ranges).
   cacheBlockBytes: "262144"  # 256 KiB
+  cacheIndexBlockBytes: "65536"  # 64 KiB for small index probes (0 = exact)
+  cacheAlignMaxBlocks: 4
+  cacheMaxRangeBytes: "8388608"  # bypass larger sequential reads
+  cacheFetchConcurrency: 16  # global cache-fill GET/HEAD limit
+  # Decoded Lance caches are separate RAM budgets, not part of foyer.
+  lanceIndexCacheBytes: "268435456"  # 256 MiB
+  lanceMetadataCacheBytes: "67108864"  # 64 MiB
   # Rendered-response cache (opt-in; the default posture optimizes serving
   # over cached data instead of caching rendered responses).
   responseCacheBytes: "0"

@@ -33,6 +33,8 @@ spec:
             - --duck-threads={{ .Values.serve.duckThreads }}
             - --duck-memory-mb={{ .Values.serve.duckMemoryMb }}
             - --response-cache-bytes={{ .Values.serve.responseCacheBytes }}
+            - --lance-index-cache-bytes={{ .Values.serve.lanceIndexCacheBytes }}
+            - --lance-metadata-cache-bytes={{ .Values.serve.lanceMetadataCacheBytes }}
             {{- if .Values.serve.flightListen }}
             - --flight-listen={{ .Values.serve.flightListen }}
             {{- end }}
@@ -42,7 +44,13 @@ spec:
             {{- if .Values.serve.cacheDir }}
             - --cache-dir={{ .Values.serve.cacheDir }}
             - --cache-bytes={{ .Values.serve.cacheBytes }}
+            - --cache-memory-bytes={{ .Values.serve.cacheMemoryBytes }}
+            - --cache-metadata-bytes={{ .Values.serve.cacheMetadataBytes }}
             - --cache-block-bytes={{ .Values.serve.cacheBlockBytes }}
+            - --cache-index-block-bytes={{ .Values.serve.cacheIndexBlockBytes }}
+            - --cache-align-max-blocks={{ .Values.serve.cacheAlignMaxBlocks }}
+            - --cache-max-range-bytes={{ .Values.serve.cacheMaxRangeBytes }}
+            - --cache-fetch-concurrency={{ .Values.serve.cacheFetchConcurrency }}
             {{- end }}
             {{- if .Values.serve.endpoint }}
             - --endpoint={{ .Values.serve.endpoint }}
@@ -53,8 +61,9 @@ spec:
             {{- else if not .Values.serve.endpoint }}
             # No endpoint and no credentials: cloud S3 with ambient credentials.
             {{- end }}
-          {{- if .Values.serve.s3KeySecret }}
+          {{- if or .Values.serve.s3KeySecret .Values.serve.cacheDir }}
           env:
+            {{- if .Values.serve.s3KeySecret }}
             - name: S3_KEY
               valueFrom:
                 secretKeyRef:
@@ -65,13 +74,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.serve.s3KeySecret }}
                   key: s3-secret
-          {{- end }}
-          {{- if .Values.serve.cacheDir }}
-          env:
+            {{- end }}
+            {{- if .Values.serve.cacheDir }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- end }}
           {{- end }}
           ports:
             - name: http

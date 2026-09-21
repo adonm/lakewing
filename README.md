@@ -22,7 +22,7 @@ OSM Layercake GeoParquet (WKB)
                                  └─ foyer: NVMe range cache under the object store
 ```
 
-One binary, two commands (`build`, `serve`), one pinned snapshot per process.
+One binary: serve (the default), `build`, and `index`; one pinned snapshot per reader.
 Apache-2.0.
 
 ## Quickstart
@@ -30,7 +30,7 @@ Apache-2.0.
 ```sh
 mise install                                   # rust, just, python
 just setup                                     # protoc + cargo fetch
-just check test                               # fmt, clippy -D warnings, 6 regression tests
+just check test                               # fmt, clippy -D warnings, regressions
 just run -- build --source fixtures/berlin.parquet --out fixtures/berlin.lance --tag prod
 just run -- --catalog-uri fixtures --table berlin --tag prod --listen 127.0.0.1:3000
 ```
@@ -109,13 +109,18 @@ foyer hybrid cache under Lance's object store:
 
 - immutable objects only (`data/`, `_indices/`, `_deletions/`, `_versions/`);
   tags and mutable pointers keep origin semantics
-- **block-aligned** ranges (`--cache-block-bytes`, default 256 KiB): a read is
+- **block-aligned** data ranges (`--cache-block-bytes`, default 256 KiB) and
+  index ranges (`--cache-index-block-bytes`, default 64 KiB): a read is
   served from the fixed blocks covering it, so overlapping queries — payload
   takes, adjacent tiles — reuse cached bytes instead of missing on exact-range
-  key mismatches; ranges ≥ 4 blocks fetch as one exact GET
+  key mismatches; ranges ≥ `--cache-align-max-blocks` (default 4) blocks use
+  one exact GET; ranges above `--cache-max-range-bytes` (default 8 MiB)
+  bypass admission
 - `get_or_fetch` single-flights concurrent misses; a HEAD metadata cache serves
   ranged requests without re-heading the origin
-- exclusive directory lock, disk tier flushed on shutdown, and
+- configurable RAM/HEAD budgets and a global cache-fill concurrency limit;
+  single-block hits return zero-copy slices
+- exclusive directory lock, disk tier flushed on normal cache close, and
   `lakewing_cache_*` counters (including requested-vs-fetched bytes) on
   `/metrics`
 
@@ -127,6 +132,10 @@ A rendered-response cache is available but **opt-in**
 (`--response-cache-bytes`, default 0): the default posture optimizes the
 serving path and data cache rather than caching rendered responses.
 
+See [cache and index tuning](docs/tuning.md) for every budget, measurement
+counters, and the equal-budget sweep. `lakewing --help` lists the controls;
+invalid numeric settings fail startup instead of silently selecting defaults.
+
 ## Build
 
 ```sh
@@ -135,9 +144,22 @@ just run -- build --source <parquet-or-dir> --out <dir>.lance --tag prod
 
 WKB parquet → GeoArrow MultiPolygon (original polygon form kept in
 `was_polygon`; nulls supported) → lance 2.2 fragments (512 MiB / 10M rows) →
-BTREE(id) + RTREE(geom) + zonemaps on the bbox columns → release tag →
-collection metadata (`lakewing.collections`) written into the dataset so
-serves never scan for layers at startup.
+BTREE(id) + RTREE(geom) + bbox zonemaps + selective layer/source bitmaps →
+release tag. Collection discovery reads `lakewing.collections` when supplied
+by a publisher, otherwise it scans only the layer column at startup.
+
+Tune an existing dataset without rewriting its data files:
+
+```sh
+just run -- index --uri <dir>.lance --tag tuned --zonemap-rows 2048
+# Retune existing named indexes as well:
+just run -- index --uri <dir>.lance --tag tuned-v2 --replace \
+  --btree-page-rows 2048 --rtree-page-rows 1024 --zonemap-rows 1024
+```
+
+`index` operates on the latest snapshot with a single writer and creates a
+new tag only after success. Existing tags and pinned readers retain their
+snapshot. The same index parameters are available on `build`.
 
 ## Deployment
 
@@ -154,7 +176,7 @@ counts and payload timings).
 ## Verification
 
 ```sh
-just check test                          # fmt + clippy -D warnings + 9 regression tests
+just check test                          # fmt + clippy -D warnings + regressions
 python3 scripts/lancebench/battery.py http://127.0.0.1:3140 http://127.0.0.1:3141
 python3 scripts/lancebench/flight_check.py grpc://127.0.0.1:50071 http://127.0.0.1:3140
 python3 scripts/lancebench/load.py http://127.0.0.1:3140 none 16 3
@@ -168,8 +190,10 @@ under concurrent load, DuckDB permit safety under cancellation, the 64 MiB
 payload budget failing closed, Flight schema/geometry parity with HTTP,
 admission exhaustion and release, non-spatial datasets (bbox → 400, null
 geometry), rendered-response-cache repeats (opt-in mode), block-aligned
-range reuse across overlapping reads, and pinned index usage for
-tile/bbox (RTREE) and id point/IN (BTREE) plans.
+range reuse, EOF handling, miss coalescing, disk recovery, store isolation,
+and pinned RTREE/BTREE/bitmap/zonemap plans. Retuning tests compare complete
+key windows with exact reference filters and verify original data files and
+tag versions are preserved.
 
 Layercake data is © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright),
 available under the [ODbL](https://opendatacommons.org/licenses/odbl/).
