@@ -188,11 +188,57 @@ impl App {
         if selection.limit == 0 || selection.sources.is_empty() {
             return Ok(Vec::new());
         }
-        let filter = selection.filter(self.lance.geo_geom, self.lance.spatial)?;
-        let keys = self
-            .lance
-            .scan_keys_topk(&filter, selection.offset + selection.limit + extra)
-            .await?;
+        let fetch = selection.offset + selection.limit + extra;
+        // Coarse-bbox split plan: a bbox at least COARSE_BBOX_DEG2 wide
+        // makes the single exact filter enumerate and take every matching
+        // row through the RTREE prefilter; the split serves contained
+        // features from a plain column scan (no index row-address
+        // materialization, no geometry math — bbox inside the envelope
+        // implies intersection) and pays the exact RTREE check only on the
+        // thin boundary band. Branches are disjoint by construction.
+        let coarse = selection
+            .bounds
+            .is_some_and(|[w, s, e, n]| (e - w) * (n - s) >= crate::duck::COARSE_BBOX_DEG2)
+            && self.lance.has_bbox_columns;
+        let keys = if coarse {
+            let bounds = selection.bounds.unwrap();
+            tracing::debug!(?bounds, "coarse split selection plan");
+            let contained = self
+                .lance
+                .scan_keys_topk(
+                    &selection.append_cursor(crate::duck::contained_filter(
+                        &selection.collection,
+                        bounds,
+                        &selection.sources,
+                    )),
+                    fetch,
+                )
+                .await?;
+            let straddler = self
+                .lance
+                .scan_keys_topk(
+                    &selection.append_cursor(crate::duck::straddler_filter(
+                        &selection.collection,
+                        bounds,
+                        &selection.sources,
+                        self.lance.geo_geom,
+                    )),
+                    fetch,
+                )
+                .await?;
+            let mut merged = contained;
+            merged.extend(straddler);
+            merged.sort_unstable();
+            merged.dedup();
+            merged
+        } else {
+            self.lance
+                .scan_keys_topk(
+                    &selection.filter(self.lance.geo_geom, self.lance.spatial)?,
+                    fetch,
+                )
+                .await?
+        };
         Ok(keys
             .into_iter()
             .skip(selection.offset)

@@ -28,8 +28,12 @@ serve:
   # Node-local NVMe range cache; one directory per pod (see templates).
   cacheDir: /nvme/lakewing
   cacheBytes: "8589934592"  # 8 GiB disk tier
-  # Rendered-response cache (warm repeats served from memory; 0 disables).
-  responseCacheBytes: "268435456"  # 256 MiB
+  # Block alignment for immutable ranges: overlapping queries reuse cached
+  # bytes (0 = exact ranges).
+  cacheBlockBytes: "262144"  # 256 KiB
+  # Rendered-response cache (opt-in; the default posture optimizes serving
+  # over cached data instead of caching rendered responses).
+  responseCacheBytes: "0"
 
 # Node-local parent directory; each pod gets <path>/<pod-name> so the
 # single-process foyer disk tiers never share files.

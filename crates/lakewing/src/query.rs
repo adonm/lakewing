@@ -115,8 +115,13 @@ impl Selection {
         if self.bounds.is_some() && !spatial {
             return Err(QueryError::new(400, "bbox requires a geometry column").into());
         }
-        let mut filter =
-            crate::duck::pushed_filter(&self.collection, self.bounds, &self.sources, geo);
+        let filter = crate::duck::pushed_filter(&self.collection, self.bounds, &self.sources, geo);
+        Ok(self.append_cursor(filter))
+    }
+
+    /// Keyset lower bound on the (id, source_id) window — shared by the
+    /// single and coarse-split selection filters.
+    pub fn append_cursor(&self, mut filter: String) -> String {
         if let Some(after) = &self.after {
             let id = crate::duck::quote(&after.id);
             filter.push_str(&format!(
@@ -124,7 +129,7 @@ impl Selection {
                 after.source_id
             ));
         }
-        Ok(filter)
+        filter
     }
 
     pub fn href(&self, version: u64, after: Option<&RowKey>) -> String {

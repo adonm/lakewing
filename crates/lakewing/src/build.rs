@@ -78,6 +78,16 @@ pub async fn build(cfg: BuildConfig) -> anyhow::Result<()> {
         .name("geom_idx".to_string())
         .await?;
     tracing::info!("built RTREE index on geom");
+    // Zonemaps on the bbox columns: the coarse-split selection plan scans
+    // these columns directly, and zonemaps prune its pages per fragment —
+    // coarse tiles over sparse regions stop paying full-column scans.
+    for column in ["xmin", "ymin", "xmax", "ymax"] {
+        dataset
+            .create_index_builder(&[column], IndexType::ZoneMap, &ScalarIndexParams::default())
+            .name(format!("{column}_zonemap"))
+            .await?;
+    }
+    tracing::info!("built ZONEMAP indexes on the bbox columns");
 
     if !cfg.tag.is_empty() {
         let version = dataset.version().version;

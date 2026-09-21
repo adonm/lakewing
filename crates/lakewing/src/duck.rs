@@ -207,6 +207,55 @@ pub fn pushed_filter(
     filter
 }
 
+/// Bbox queries at least this large take the coarse split plan
+/// (contained plain scan + exact straddler branch): a coarse envelope
+/// makes the single ST_Intersects filter enumerate and take every matching
+/// row through the RTREE prefilter — measured 37s on the 25M fixture for a
+/// 5x7-degree envelope vs ~4s split. Fine queries keep the single filter
+/// (the RTREE prefilter is fastest when its envelope is selective).
+pub const COARSE_BBOX_DEG2: f64 = 1.0;
+
+/// Coarse branch 1: features whose bbox is inside the envelope. A nonempty
+/// geometry inside its bbox inside the envelope necessarily intersects the
+/// envelope, so no geometry math is needed — and this plain column scan
+/// never materializes index row addresses, so it stays O(page I/O).
+pub fn contained_filter(collection: &str, bounds: [f64; 4], sources: &[i64]) -> String {
+    if sources.is_empty() {
+        return "false".into();
+    }
+    let [w, s, e, n] = bounds;
+    format!(
+        "{} AND xmin >= {w} AND xmax <= {e} AND ymin >= {s} AND ymax <= {n}",
+        layer_sources(collection, sources)
+    )
+}
+
+/// Coarse branch 2: features whose bbox crosses the envelope edge (overlap
+/// but not contained) — the exact geometry check only applies to this thin
+/// band, and the bbox-column refine runs before the id take.
+pub fn straddler_filter(collection: &str, bounds: [f64; 4], sources: &[i64], geo: bool) -> String {
+    if sources.is_empty() {
+        return "false".into();
+    }
+    let [w, s, e, n] = bounds;
+    let geom = if geo { "geom" } else { "ST_GeomFromWKB(geom)" };
+    format!(
+        "{} AND xmax >= {w} AND xmin <= {e} AND ymax >= {s} AND ymin <= {n} \
+         AND NOT (xmin >= {w} AND xmax <= {e} AND ymin >= {s} AND ymax <= {n}) \
+         AND ST_Intersects({geom}, ST_GeomFromText('POLYGON (({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))'))",
+        layer_sources(collection, sources)
+    )
+}
+
+fn layer_sources(collection: &str, sources: &[i64]) -> String {
+    let sources = sources
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("layer = {} AND source_id IN ({sources})", quote(collection))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,7 @@ spec:
             {{- if .Values.serve.cacheDir }}
             - --cache-dir={{ .Values.serve.cacheDir }}
             - --cache-bytes={{ .Values.serve.cacheBytes }}
+            - --cache-block-bytes={{ .Values.serve.cacheBlockBytes }}
             {{- end }}
             {{- if .Values.serve.endpoint }}
             - --endpoint={{ .Values.serve.endpoint }}

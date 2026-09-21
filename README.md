@@ -96,11 +96,10 @@ temporary page table, so requests are isolated and cancellation cannot strand
 a worker. Payloads are capped at 64 MiB per page (413 above), requests at a
 30 s deadline (504 / DEADLINE_EXCEEDED).
 
-Warm repeats of a successful page or tile are served from the bounded
-rendered-response cache (`--response-cache-bytes`, default 256 MiB, 0
-disables) keyed by the pinned snapshot plus the canonical selection — they
-skip rendering and admission entirely. Hit/miss counters are on `/metrics`
-(`lakewing_response_cache_*`).
+Warm repeats of a successful page or tile can be served from the opt-in
+rendered-response cache (`--response-cache-bytes`, default 0 = off) keyed by
+the pinned snapshot plus the canonical selection. Hit/miss counters are on
+`/metrics` (`lakewing_response_cache_*`).
 
 ## Object storage + cache
 
@@ -110,15 +109,23 @@ foyer hybrid cache under Lance's object store:
 
 - immutable objects only (`data/`, `_indices/`, `_deletions/`, `_versions/`);
   tags and mutable pointers keep origin semantics
-- keys include the store prefix and endpoint, `get_or_fetch` single-flights
-  concurrent misses, and a HEAD metadata cache serves range requests without
-  re-heading the origin
-- exclusive directory lock (two processes on one dir fail fast), disk tier
-  flushed on shutdown, and `lakewing_cache_*` counters on `/metrics`
+- **block-aligned** ranges (`--cache-block-bytes`, default 256 KiB): a read is
+  served from the fixed blocks covering it, so overlapping queries — payload
+  takes, adjacent tiles — reuse cached bytes instead of missing on exact-range
+  key mismatches; ranges ≥ 4 blocks fetch as one exact GET
+- `get_or_fetch` single-flights concurrent misses; a HEAD metadata cache serves
+  ranged requests without re-heading the origin
+- exclusive directory lock, disk tier flushed on shutdown, and
+  `lakewing_cache_*` counters (including requested-vs-fetched bytes) on
+  `/metrics`
 
 The disk tier is **per-pod**; the Helm chart gives each replica its own
 subdirectory under a node-local hostPath. Cross-pod sharing would need a
 shared cache service — see `docs/rust-architecture.md`.
+
+A rendered-response cache is available but **opt-in**
+(`--response-cache-bytes`, default 0): the default posture optimizes the
+serving path and data cache rather than caching rendered responses.
 
 ## Build
 
@@ -128,9 +135,9 @@ just run -- build --source <parquet-or-dir> --out <dir>.lance --tag prod
 
 WKB parquet → GeoArrow MultiPolygon (original polygon form kept in
 `was_polygon`; nulls supported) → lance 2.2 fragments (512 MiB / 10M rows) →
-BTREE(id) + RTREE(geom) → release tag → collection metadata
-(`lakewing.collections`) written into the dataset so serves never scan for
-layers at startup.
+BTREE(id) + RTREE(geom) + zonemaps on the bbox columns → release tag →
+collection metadata (`lakewing.collections`) written into the dataset so
+serves never scan for layers at startup.
 
 ## Deployment
 
@@ -160,8 +167,9 @@ binding, strict request validation (400/404/409), per-connection isolation
 under concurrent load, DuckDB permit safety under cancellation, the 64 MiB
 payload budget failing closed, Flight schema/geometry parity with HTTP,
 admission exhaustion and release, non-spatial datasets (bbox → 400, null
-geometry), and rendered-response-cache repeats (identical bytes, ETag
-conditionals on cached entries, source isolation, disabled mode).
+geometry), rendered-response-cache repeats (opt-in mode), block-aligned
+range reuse across overlapping reads, and pinned index usage for
+tile/bbox (RTREE) and id point/IN (BTREE) plans.
 
 Layercake data is © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright),
 available under the [ODbL](https://opendatacommons.org/licenses/odbl/).

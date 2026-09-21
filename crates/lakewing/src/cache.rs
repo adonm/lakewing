@@ -28,14 +28,20 @@ use object_store::{
 };
 
 /// CachingStore wraps the real object store and serves range reads from a
-/// foyer cache keyed by (path, start, end). Range alignment is Lance's
-/// concern (it batches column-page-aligned reads); we cache exactly what
-/// is asked for and let foyer's LRU handle the working set.
+/// foyer cache. Immutable-object ranges are cached **block-aligned**
+/// (default 256 KiB grid): a read is served from the fixed blocks covering
+/// it, so overlapping-but-different queries (e.g. take-scattered payload
+/// rows, adjacent column pages) reuse cached bytes instead of missing on
+/// exact-range key mismatches. Ranges at least 4 blocks wide are fetched
+/// as one exact GET (large sequential reads must not shard into per-block
+/// origin requests). Lance's concern stays on coalescing; block reuse and
+/// LRU eviction are ours.
 pub struct CachingStore {
     inner: Arc<dyn OSStore>,
     cache: HybridCache<String, Bytes>,
     metadata: foyer::Cache<String, (ObjectMeta, Attributes)>,
     scheme: String,
+    block: u64,
     pub metrics: Arc<CacheMetrics>,
     _lock: Arc<std::fs::File>,
 }
@@ -48,6 +54,7 @@ pub struct CacheMetrics {
     origin_ranges: AtomicU64,
     origin_bytes: AtomicU64,
     origin_heads: AtomicU64,
+    requested_bytes: AtomicU64,
     bypass_get_opts: AtomicU64,
 }
 
@@ -61,6 +68,7 @@ impl CacheMetrics {
             ("origin_ranges", &self.origin_ranges),
             ("origin_bytes", &self.origin_bytes),
             ("origin_heads", &self.origin_heads),
+            ("requested_bytes", &self.requested_bytes),
             ("bypass_get_opts", &self.bypass_get_opts),
         ] {
             out.push_str(&format!(
@@ -93,11 +101,16 @@ impl CachingStore {
         dir: &str,
         disk_bytes: usize,
         memory_bytes: usize,
+        block_bytes: u64,
         identity: &str,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             disk_bytes >= 64 * 1024 * 1024 && memory_bytes > 0,
             "cache needs >=64 MiB disk and positive memory capacity"
+        );
+        anyhow::ensure!(
+            block_bytes == 0 || block_bytes >= 4096,
+            "cache block must be 0 (exact ranges) or >= 4096 bytes"
         );
         std::fs::create_dir_all(dir)?;
         let lock = std::fs::OpenOptions::new()
@@ -126,6 +139,7 @@ impl CachingStore {
             cache,
             metadata,
             scheme: identity.to_string(),
+            block: block_bytes,
             metrics: Arc::default(),
             _lock: Arc::new(lock),
         })
@@ -136,13 +150,82 @@ impl CachingStore {
             .expect("range key")
     }
 
+    /// Cached HEAD (ObjectMeta + attributes): one origin HEAD per object,
+    /// then memory-resident. Shared by the ranged-`get_opts` path (envelope
+    /// construction) and block alignment (object-size clamping).
+    async fn object_meta(
+        &self,
+        location: &Path,
+    ) -> StoreResult<foyer::CacheEntry<String, (ObjectMeta, Attributes)>> {
+        let key = serde_json::to_string(&(&self.scheme, location.as_ref())).expect("metadata key");
+        let store = self.inner.clone();
+        let path = location.clone();
+        let metrics = self.metrics.clone();
+        self.metadata
+            .get_or_fetch(&key, move || async move {
+                metrics.origin_heads.fetch_add(1, Ordering::Relaxed);
+                let result = store
+                    .get_opts(
+                        &path,
+                        GetOptions {
+                            head: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                Ok::<_, object_store::Error>((result.meta, result.attributes))
+            })
+            .await
+            .map_err(|error| object_store::Error::Generic {
+                store: "foyer",
+                source: Box::new(error),
+            })
+    }
+
+    /// Serve one immutable range: block-aligned when blocks are enabled and
+    /// the range is under 4 blocks (larger reads fetch as one exact GET so
+    /// sequential scans don't shard into per-block origin requests).
+    ///
+    /// Block keys live on a fixed grid clamped to the object size
+    /// (`block_start .. min(block_start + block, size)`), so any request
+    /// touching a block shares one entry regardless of its own edges.
     async fn range(&self, location: &Path, range: Range<u64>) -> StoreResult<Bytes> {
         // Lance data, index, deletion and numbered manifest objects are immutable.
         // Tags, namespace metadata and arbitrary objects always retain origin semantics.
         if !immutable(location) || range.start >= range.end {
             return self.inner.get_range(location, range).await;
         }
+        let len = range.end - range.start;
+        self.metrics
+            .requested_bytes
+            .fetch_add(len, Ordering::Relaxed);
         self.metrics.lookups.fetch_add(1, Ordering::Relaxed);
+        if self.block == 0 || len >= self.block * 4 {
+            return self.exact(location, range).await;
+        }
+        let size = self.object_meta(location).await?.value().0.size;
+        if range.start >= size {
+            // Delegate to the origin for its canonical out-of-range error.
+            return self.inner.get_range(location, range).await;
+        }
+        let bs = range.start - range.start % self.block;
+        let be = (range.end.div_ceil(self.block) * self.block).min(size);
+        let mut span = bytes::BytesMut::with_capacity((be - bs) as usize);
+        let mut offset = bs;
+        while offset < be {
+            let block = self
+                .exact(location, offset..(offset + self.block).min(size))
+                .await?;
+            span.extend_from_slice(&block);
+            offset += self.block;
+        }
+        Ok(span
+            .freeze()
+            .slice((range.start - bs) as usize..(range.end - bs) as usize))
+    }
+
+    /// One cache entry per exact range, single-flighted via get_or_fetch.
+    async fn exact(&self, location: &Path, range: Range<u64>) -> StoreResult<Bytes> {
         let key = self.key(location, &range);
         let store = self.inner.clone();
         let location = location.clone();
@@ -210,31 +293,7 @@ impl ObjectStore for CachingStore {
             && options.extensions.is_empty();
         if eligible {
             if let Some(get_range) = options.range.as_ref() {
-                let key = serde_json::to_string(&(&self.scheme, location.as_ref()))
-                    .expect("metadata key");
-                let store = self.inner.clone();
-                let path = location.clone();
-                let metrics = self.metrics.clone();
-                let meta = self
-                    .metadata
-                    .get_or_fetch(&key, move || async move {
-                        metrics.origin_heads.fetch_add(1, Ordering::Relaxed);
-                        let result = store
-                            .get_opts(
-                                &path,
-                                GetOptions {
-                                    head: true,
-                                    ..Default::default()
-                                },
-                            )
-                            .await?;
-                        Ok::<_, object_store::Error>((result.meta, result.attributes))
-                    })
-                    .await
-                    .map_err(|e| object_store::Error::Generic {
-                        store: "foyer",
-                        source: Box::new(e),
-                    })?;
+                let meta = self.object_meta(location).await?;
                 let (meta, attributes) = meta.value();
                 let range =
                     get_range
@@ -313,6 +372,7 @@ impl WrappingObjectStore for CachingStore {
             cache: self.cache.clone(),
             metadata: self.metadata.clone(),
             scheme: serde_json::to_string(&(&self.scheme, store_prefix)).expect("store identity"),
+            block: self.block,
             metrics: self.metrics.clone(),
             _lock: self._lock.clone(),
         })
@@ -351,4 +411,81 @@ async fn build_cache(
         .build()
         .await?;
     Ok(cache)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn block_alignment_reuses_overlapping_ranges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        // 32 KiB pattern object under an immutable prefix.
+        let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+        inner
+            .put(&Path::from("data/blocks.bin"), payload.clone().into())
+            .await
+            .unwrap();
+        let mut store = CachingStore::open(
+            dir.path().to_str().unwrap(),
+            64 * 1024 * 1024,
+            1024 * 1024,
+            4096,
+            "test",
+        )
+        .await
+        .unwrap();
+        store.inner = inner.clone();
+        let path = Path::from("data/blocks.bin");
+        let expect = |r: Range<u64>| payload[r.start as usize..r.end as usize].to_vec();
+        let origin_ranges = || store.metrics.origin_ranges.load(Ordering::Relaxed);
+
+        // First read spans two blocks: 2 origin fetches, amplification visible.
+        let got = store.get_range(&path, 1000..5000).await.unwrap();
+        assert_eq!(got.to_vec(), expect(1000..5000));
+        assert_eq!(origin_ranges(), 2);
+
+        // Overlapping-but-different range: the same blocks serve it — no new
+        // origin fetch. Exact-range caching misses here.
+        let got = store.get_range(&path, 3000..7000).await.unwrap();
+        assert_eq!(got.to_vec(), expect(3000..7000));
+        assert_eq!(origin_ranges(), 2);
+
+        // A third block: exactly one new fetch.
+        let got = store.get_range(&path, 8192..9000).await.unwrap();
+        assert_eq!(got.to_vec(), expect(8192..9000));
+        assert_eq!(origin_ranges(), 3);
+
+        // Ranges >= 4 blocks fetch as one exact GET (no per-block sharding of
+        // large sequential reads), and repeat exactly.
+        let got = store.get_range(&path, 0..16_384).await.unwrap();
+        assert_eq!(got.to_vec(), expect(0..16_384));
+        assert_eq!(origin_ranges(), 4);
+        let got = store.get_range(&path, 0..16_384).await.unwrap();
+        assert_eq!(got.to_vec(), expect(0..16_384));
+        assert_eq!(origin_ranges(), 4);
+
+        // Exact-range mode (block == 0) keeps the previous behavior: an
+        // overlapping-but-different range is a fresh origin fetch.
+        let mut store = CachingStore::open(
+            tempfile::TempDir::new().unwrap().path().to_str().unwrap(),
+            64 * 1024 * 1024,
+            1024 * 1024,
+            0,
+            "test",
+        )
+        .await
+        .unwrap();
+        store.inner = inner;
+        let got = store.get_range(&path, 1000..5000).await.unwrap();
+        assert_eq!(got.to_vec(), expect(1000..5000));
+        let got = store.get_range(&path, 3000..7000).await.unwrap();
+        assert_eq!(got.to_vec(), expect(3000..7000));
+        assert_eq!(
+            store.metrics.origin_ranges.load(Ordering::Relaxed),
+            2,
+            "exact-range mode must not reuse overlapping reads"
+        );
+    }
 }

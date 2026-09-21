@@ -457,6 +457,129 @@ fn app_limits(response_cache_bytes: usize) -> crate::app::Limits {
     }
 }
 
+/// Index usage is pinned, not assumed: the tile/bbox plan must prefilter
+/// through the RTREE, the id IN payload and point lookups through the
+/// BTREE — and a filter with no indexed terms must touch neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tile_and_ogc_queries_use_their_indexes() {
+    let fixture = Fixture::new().await;
+    let app = fixture.app(&fixture.geo, 2).await;
+
+    // Tile/bbox shape: exact ST_Intersects on the geometry column.
+    let bounds = crate::tiles::xyz_to_bbox(12, 2103, 1346);
+    let spatial = crate::duck::pushed_filter("buildings", Some(bounds), &[2], true);
+    let plan = app.lance.explain(&spatial, &["id", "geom"]).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery")
+            && plan.contains("@geom_idx(RTree)")
+            && plan.contains("Intersect("),
+        "tile/bbox query must prefilter through the RTREE:\n{plan}"
+    );
+
+    // Payload shape: exact id IN window from the selection phase.
+    let payload = format!(
+        "{} AND id IN ('a','b','c')",
+        crate::duck::pushed_filter("buildings", None, &[2], true)
+    );
+    let plan = app.lance.explain(&payload, &["id", "geom"]).await.unwrap();
+    assert!(
+        plan.matches("@id_idx(BTree)").count() == 3 && plan.contains("OR("),
+        "id IN payload must probe the BTREE per key:\n{plan}"
+    );
+
+    let point = format!(
+        "{} AND id = 'a'",
+        crate::duck::pushed_filter("buildings", None, &[2], true)
+    );
+    let plan = app.lance.explain(&point, &["id", "geom"]).await.unwrap();
+    assert!(
+        plan.contains("@id_idx(BTree)"),
+        "point lookup must probe the BTREE:\n{plan}"
+    );
+
+    // Negative control: no indexed terms -> a plain scan plan.
+    let layer_only = crate::duck::pushed_filter("buildings", None, &[2], true);
+    let plan = app
+        .lance
+        .explain(&layer_only, &["layer", "source_id"])
+        .await
+        .unwrap();
+    assert!(
+        !plan.contains("ScalarIndexQuery"),
+        "layer/source-only filter must not touch an index:\n{plan}"
+    );
+}
+
+/// Coarse-envelope spatial shapes against the real fixture (opt-in via
+/// LAKEWING_BIG_FIXTURE; ignored by default): measures selection cost of
+/// (1) the combined exact filter, (2) contained-only bbox columns,
+/// (3) the straddler band without geometry math, (4) the straddler band
+/// with ST_Intersects. Guides the coarse-query plan split.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "set LAKEWING_BIG_FIXTURE to the .lance dir of the 25M fixture"]
+async fn big_fixture_spatial_shapes() {
+    let Ok(uri) = std::env::var("LAKEWING_BIG_FIXTURE") else {
+        return;
+    };
+    static LOGGING: std::sync::Once = std::sync::Once::new();
+    LOGGING.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .try_init();
+    });
+    let app = App::open_at(
+        uri,
+        Some("prod".into()),
+        None,
+        Default::default(),
+        None,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    // A z6-class envelope over the whole fixture extent.
+    let [w, s, e, n] = [3.0f64, 47.0, 8.0, 54.0];
+    let contained = format!(
+        "layer = 'buildings' AND source_id IN (1) AND xmin >= {w} AND xmax <= {e} AND ymin >= {s} AND ymax <= {n}"
+    );
+    let straddler_bbox = format!(
+        "layer = 'buildings' AND source_id IN (1) AND xmax >= {w} AND xmin <= {e} AND ymax >= {s} AND ymin <= {n} \
+         AND NOT (xmin >= {w} AND xmax <= {e} AND ymin >= {s} AND ymax <= {n})"
+    );
+    let straddler_exact = format!(
+        "{straddler_bbox} AND ST_Intersects(geom, ST_GeomFromText('POLYGON (({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))'))"
+    );
+    let combined_single = format!(
+        "layer = 'buildings' AND source_id IN (1) AND ST_Intersects(geom, ST_GeomFromText('POLYGON (({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))'))"
+    );
+    let shapes = [
+        ("contained-bbox-columns", contained.as_str()),
+        ("straddler-bbox-only", straddler_bbox.as_str()),
+        ("straddler-with-intersects", straddler_exact.as_str()),
+        ("combined-single", combined_single.as_str()),
+    ];
+    for (name, filter) in shapes {
+        if std::env::var("PLANS").is_ok() {
+            println!(
+                "=== {name} PLAN ===\n{}",
+                app.lance
+                    .explain(filter, &["id", "source_id"])
+                    .await
+                    .unwrap()
+            );
+        }
+        let started = std::time::Instant::now();
+        let keys = app.lance.scan_keys_topk(filter, 5000).await.unwrap();
+        println!(
+            "{name}: {:?} ({} keys: first={:?})",
+            started.elapsed(),
+            keys.len(),
+            keys.first()
+        );
+    }
+}
+
 async fn etag_of(ep: &impl Endpoint, path: &str) -> String {
     let response = ep
         .get_response(Request::builder().uri(path.parse().unwrap()).finish())

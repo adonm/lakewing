@@ -28,6 +28,8 @@ pub struct LanceSource {
     pub spatial: bool,
     pub geo_geom: bool,
     pub has_was_polygon: bool,
+    /// Coarse-bbox split plan requires the bbox columns.
+    pub has_bbox_columns: bool,
 }
 
 impl LanceSource {
@@ -70,6 +72,9 @@ impl LanceSource {
             .field("geom")
             .is_some_and(|f| !matches!(f.data_type(), DataType::Binary | DataType::LargeBinary));
         let has_was_polygon = schema.field("was_polygon").is_some();
+        let has_bbox_columns = ["xmin", "ymin", "xmax", "ymax"]
+            .iter()
+            .all(|name| schema.field(name).is_some());
         let version = dataset.version().version;
         Ok(Self {
             dataset: Arc::new(dataset),
@@ -77,6 +82,7 @@ impl LanceSource {
             spatial,
             geo_geom,
             has_was_polygon,
+            has_bbox_columns,
         })
     }
 
@@ -89,6 +95,16 @@ impl LanceSource {
         // streams per batch.
         scanner.batch_size(8192);
         Ok(scanner)
+    }
+
+    /// Physical plan for a filter (index prefilter vs refine vs scan) —
+    /// used by tests to pin index usage for tile/bbox/id queries instead
+    /// of assuming it.
+    #[cfg(test)]
+    pub async fn explain(&self, filter: &str, columns: &[&str]) -> anyhow::Result<String> {
+        let mut scanner = self.scanner(filter)?;
+        scanner.project(columns)?;
+        Ok(scanner.explain_plan(true).await?)
     }
 
     pub async fn collections(&self) -> anyhow::Result<Vec<String>> {

@@ -53,27 +53,43 @@ poem (OGC REST) + arrow-flight (read-only)
   never the collection — pinned by `payload_budget_fails_closed`. Flight
   streams the same payload lazily (per-batch budget) with no intermediate
   collect.
-- **foyer under Lance, immutable-only**: `get_ranges`/ranged `get_opts` on
-  immutable prefixes (`data/`, `_indices/`, `_deletions/`, `_versions/`) are
-  served from a hybrid cache; `get_or_fetch` single-flights concurrent
-  misses; a small HEAD metadata cache answers ranged gets without origin
-  HEADs. Keys include the store prefix + endpoint (cache identity is not
-  conflated across stores). The cache directory takes an exclusive lock, and
-  shutdown flushes the disk tier. Tags/mutable pointers always go to origin.
-  Per-pod by design; a shared cache would be a separate service.
-- **Rendered-response cache (warm path)**: successful geo+json/MVT bodies
-  are stored in a bounded foyer memory cache (`--response-cache-bytes`,
-  default 256 MiB; 0 disables) keyed by (pinned snapshot, canonical
-  selection). A warm repeat skips Lance, DuckDB, JSON assembly and ETag
-  recompute entirely and bypasses admission (hits hold no worker); keys are
-  built from each selection's canonical href, so query/header source
-  intersections share entries but distinct effective sources never collide.
-  Entries cannot go stale within a process (dataset version is pinned;
-  publication restarts the process), and `Cache-Control: public` already
-  invited exactly this reuse at clients/CDNs. Errors and entries above
-  16 MiB are never stored; first-touch herds may render redundantly while
-  the origin-level range cache single-flights the storage reads beneath.
-  Hit/miss counters are exported on `/metrics`.
+- **foyer under Lance, immutable-only, block-aligned**: `get_ranges`/ranged
+  `get_opts` on immutable prefixes (`data/`, `_indices/`, `_deletions/`,
+  `_versions/`) are served from a hybrid cache on a **fixed block grid**
+  (`--cache-block-bytes`, default 256 KiB; 0 = exact ranges). A read is
+  served from the blocks covering it, so overlapping-but-different queries
+  (take-scattered payload rows, adjacent tiles) reuse cached bytes instead
+  of missing on exact-range key mismatches — pinned by a unit test. Ranges
+  ≥ 4 blocks fetch as one exact GET (large sequential reads don't shard).
+  `get_or_fetch` single-flights concurrent block misses; a HEAD metadata
+  cache (shared by alignment clamping and ranged gets) answers without
+  origin HEADs; keys include the store prefix + endpoint; the cache
+  directory takes an exclusive lock and shutdown flushes the disk tier.
+  Tags/mutable pointers always go to origin. Per-pod by design; a shared
+  cache would be a separate service. Counters on `/metrics` include
+  `lakewing_cache_{lookups,memory_hits,disk_hits,origin_ranges,origin_bytes,
+  origin_heads,requested_bytes}_total` — `origin_bytes`/`requested_bytes`
+  exposes the amplification tradeoff.
+- **Spatial indexes, tile serving**: BTREE(id) + RTREE(geom) + zonemaps on
+  the bbox columns (build side). Plan usage is *pinned by tests*, not
+  assumed: tile/bbox queries prefilter through `@geom_idx(RTree)`, payload
+  `id IN` windows probe `@id_idx(BTree)`, and non-spatial filters touch no
+  index. Coarse envelopes (bbox ≥ 1°², i.e. z8-and-out tiles) take a
+  **split selection plan**: contained features (bbox inside the envelope —
+  intersection implied, no geometry math) come from a plain column scan
+  that never materializes index row addresses, and only the thin boundary
+  band pays the exact RTREE check; the branches are disjoint and merged.
+  Measured on the 25.36M fixture: a z6 tile went from the 30 s deadline
+  (504) to **4.5 s cold / 2.1 s warm**; z7/z8 tiles are **~0.6 s**; a
+  wide-bbox page from 504 to 2.2 s; fine queries (z10 1.15 s, z12 0.29 s,
+  CITY 25 ms) are unchanged by design, and the z12 Amsterdam tile stays
+  byte-identical to the archived Go serve
+  (`"e1f393cf272fc35b-244593"`). Why the split exists: the single exact
+  filter on a coarse envelope enumerates every match through the RTREE
+  prefilter and then takes their ids through the index stream — 37 s for a
+  5°×7° envelope on the fixture (release build); the contained scan is
+  0.7 s and the straddler band 0.4 s (columns) / 3.3 s (with the exact
+  RTREE check).
 - **The one known scaling hole (tracked, not hidden)**: ordered key selection
   still scans the matching id/source set in Lance (bounded max-heap; the
   pinned lance 12 `order_by` sorts candidates — `scanner.rs` pushes no limit
@@ -82,6 +98,16 @@ poem (OGC REST) + arrow-flight (read-only)
   index-ordered scan or a (page, cursor) mapping maintained at build time;
   both are viable follow-ups once profiling shows where page time actually
   goes.
+
+- **Rendered-response cache is opt-in** (`--response-cache-bytes`, default
+  0 = off): when enabled, successful geo+json/MVT bodies are stored in a
+  bounded foyer memory cache keyed by (pinned snapshot, canonical
+  selection href) — warm repeats skip all local work and bypass admission.
+  The default posture deliberately optimizes the serving path over cached
+  *data* instead, so repeat requests still exercise selection and
+  rendering against warm storage. Opt-in measurements (256 MiB): battery
+  warm repeats 0.3–4.8 ms; warm 16-thread mix 3258 RPS / p50 3.3 ms (vs
+  8.8 RPS / p50 1506 ms when rendering repeats).
 
 ## Performance targets (framing, not promises)
 
@@ -96,26 +122,28 @@ not comparable to filtered-vector-search shapes; they measure the selection
 scaling hole above. Measured numbers live in the tables below; every claim
 there is from a specific recorded run, not a target.
 
-## Benchmark (v7 gate, full 25.36M-row GeoArrow fixture)
+## Benchmark (default posture, full 25.36M-row GeoArrow fixture)
 
 `scripts/lancebench/battery.py` — canonical-JSON equality **gate** (non-zero
-exit on mismatch). The battery warms once then times repeats, so with the
-rendered-response cache (v7) it measures the warm path; first-render numbers
-are measured separately on unique pages.
+exit on mismatch). Default serve (no response cache, block-aligned data
+cache), single process on local NVMe; fine spatial queries ride the RTREE
+single-filter path, coarse (z8-and-out) tiles the split plan.
 
-| query | Go serve (DuckLake/parquet) | Rust v6 first-render | Rust v7 warm |
-| --- | --- | --- | --- |
-| ITEM (BTREE) | 35 ms | 6.1 ms | **0.3 ms** |
-| CITY (bbox, RTREE) | 49 ms | 24.9 ms | **4.3 ms** |
-| FULL page (101 of 25.36M) | **495 ms** | 633 ms | **4.8 ms** |
-| DEEP (offset 50k) | 4008 ms | 770 ms | **2.3 ms** |
+| query | Go serve (DuckLake/parquet) | Rust local (default) |
+| --- | --- | --- |
+| ITEM (BTREE) | 35 ms | **6.1 ms** |
+| CITY (bbox, RTREE) | 49 ms | **25–29 ms** |
+| FULL page (101 of 25.36M) | **495 ms** | 620–635 ms |
+| DEEP (offset 50k) | 4008 ms | **770–790 ms** |
+| tile z12 (Amsterdam, byte-identical) | — | 0.29–0.37 s |
+| tile z10 | — | 1.15–1.25 s |
+| tile z8 / z7 (coarse split) | — | **~0.6 s** |
+| tile z6 (coarse split) | deadline 504 | **4.5 s cold / 2.1 s warm** |
 
-Unique deep pages (cold response-cache entries, e.g. `offset=77001`) still
-render in ~860 ms — first-render cost is unchanged; the response cache only
-removes the *repeat* work. Warm 16-thread load over the 4-query mix
-(`load.py BASE none 16 3`): **3258 RPS, p50 3.3 ms, p95 7.1 ms, zero digest
-mismatches** — the same warm mix ran at 8.8 RPS / p50 1506 ms before the
-response cache (rendering, not storage, was the warm bottleneck). Selective
+With `--response-cache-bytes` opt-in the battery measures warm repeats
+(ITEM 0.3 ms, CITY 4.3 ms, FULL 4.8 ms, DEEP 2.3 ms) and a warm 16-thread
+mix reaches 3258 RPS / p50 3.3 ms — but that is cached responses, not
+serving performance; first-render costs are the table above. Selective
 first-render classes sit inside the Enterprise selective band; the FULL/DEEP
 *first-render* class is the selection-scaling hole below.
 
@@ -152,16 +180,20 @@ Steps: parquet → GeoArrow multipolygon conversion (polygons promoted,
 `was_polygon` from the WKB type word, **null geometries supported** via an
 index-based take — geoarrow 0.8's builder mishandles null offsets, so
 lakewing never feeds it nulls) → lance 12 write (2.2 storage, 512 MiB
-fragments / 10M rows per file) → BTREE(id) + RTREE(geom) → tag →
-`lakewing.collections` metadata (serves list collections without a startup
-scan; older datasets fall back to a layer-only scan once at open).
+fragments / 10M rows per file) → BTREE(id) + RTREE(geom) + **zonemaps on
+xmin/ymin/xmax/ymax** (prune the coarse-split contained scan per page; the
+25M fixture predates them — its contained scan is a full-column read) →
+tag → `lakewing.collections` metadata (serves list collections without a
+startup scan; older datasets fall back to a layer-only scan once at open).
 
 ## Observability
 
 - `/metrics`: response counters by status, requests/flight requests, in-flight
-  gauge, latency histogram (5ms..30s buckets), pinned dataset version, and
-  (with a cache) `lakewing_cache_{lookups,memory_hits,disk_hits,origin_ranges,
-  origin_bytes,origin_heads,bypass_get_opts}_total`.
+  gauge, latency histogram (5ms..30s buckets), pinned dataset version,
+  `lakewing_response_cache_{hits,misses}_total`, and (with a cache)
+  `lakewing_cache_{lookups,memory_hits,disk_hits,origin_ranges,origin_bytes,
+  origin_heads,requested_bytes,bypass_get_opts}_total` — `origin_bytes` over
+  `requested_bytes` exposes block-alignment amplification.
 - `--otel-endpoint` (OTLP **gRPC**, normally :4317): one subscriber (fmt +
   OTLP layer; no double-init), request spans over both protocols with
   `collection`, `dataset_version`, `examined` (rows the selection scan
@@ -181,16 +213,24 @@ port-forwards, so the S3 endpoint is `127.0.0.1:8334` (the forwarded
 
 ## Open follow-ups (honest list)
 
+- Coarse straddler cost: the split's boundary branch still pays an RTREE
+  envelope evaluation (3.3 s release on the fixture for a 5°×7° envelope);
+  a bbox-band scan (0.4 s) with the exact geometry check done in DuckDB on
+  the band rows would shave z6-class tiles toward ~1.5 s, at the cost of
+  window-extension semantics for pathological all-boundary shapes.
 - Selection scaling (first-render FULL/DEEP): index-ordered retrieval or a
   build-time (page, cursor) map; profile `lance.select.examined` first. The
   lance 12 BTREE serves equality/range *prefilters* but `order_by` still
   sorts candidates (no index-ordered early termination), so the heap stands.
-- Rig runs post-v7: re-record S3+foyer first-render/warm numbers plus the
+- Fixture rebuild with bbox-column zonemaps (the 25M fixture predates
+  them); then re-check the coarse-split threshold (z10 may want the split
+  once the contained scan prunes).
+- Rig runs post-v8: re-record S3+foyer first-render/warm numbers plus the
   concurrent herd matrix with origin-delta attribution (the rig and the
   metered endpoints are wired; the runs need the kind cluster up).
-- Response-cache first-touch herd: concurrent misses may render the same
-  page redundantly (origin reads are single-flighted beneath; render dedup
-  would need a per-key inflight map).
+- Response-cache first-touch herd (opt-in mode): concurrent misses may
+  render the same page redundantly (origin reads are single-flighted
+  beneath; render dedup would need a per-key inflight map).
 - Cross-pod/node-shared cache comparison at matched budgets, if per-pod NVMe
   misses show up in the herd matrix.
 - Managed publication: builder currently writes `--out` and tags; namespace

@@ -45,10 +45,13 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
     let mut otel_endpoint: Option<String> = None;
     let mut cache_dir: Option<String> = None;
     let mut cache_bytes: usize = 512 * 1024 * 1024;
+    let mut cache_block_bytes: u64 = 256 * 1024;
     let mut concurrency: usize = 4;
     let mut duck_threads: usize = 1;
     let mut duck_memory_mb: usize = 512;
-    let mut response_cache_bytes: usize = 256 * 1024 * 1024;
+    // Response caching is opt-in: the default posture optimizes the serving
+    // path over cached *data* (block-aligned foyer ranges under Lance).
+    let mut response_cache_bytes: usize = 0;
     while let Some(arg) = args.next() {
         // Accept both `--flag value` and `--flag=value`.
         let (flag, inline) = match arg.split_once('=') {
@@ -74,6 +77,9 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
             "--otel-endpoint" => otel_endpoint = Some(value()),
             "--cache-dir" => cache_dir = Some(value()),
             "--cache-bytes" => cache_bytes = value().parse().unwrap_or(cache_bytes),
+            "--cache-block-bytes" => {
+                cache_block_bytes = value().parse().unwrap_or(cache_block_bytes)
+            }
             "--concurrency" => concurrency = value().parse().unwrap_or(concurrency),
             "--duck-threads" => duck_threads = value().parse().unwrap_or(duck_threads),
             "--duck-memory-mb" => duck_memory_mb = value().parse().unwrap_or(duck_memory_mb),
@@ -108,6 +114,7 @@ async fn serve_main(mut args: std::vec::IntoIter<String>) -> anyhow::Result<()> 
                 dir,
                 cache_bytes,
                 64 * 1024 * 1024,
+                cache_block_bytes,
                 endpoint.as_deref().unwrap_or("default-endpoint"),
             )
             .await?,
