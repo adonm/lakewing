@@ -483,7 +483,7 @@ impl s3s::route::S3Route for StatsRoute {
         *method == hyper::http::Method::GET && uri.path() == "/_pgvs3/stats"
     }
     async fn call(&self, _req: S3Request<s3s::Body>) -> S3Result<S3Response<s3s::Body>> {
-        let line = format!("{}\n", db::cache_stats_line());
+        let line = format!("{}\n{}\n", db::cache_stats_line(), db::stage_stats_line());
         Ok(S3Response::new(s3s::Body::from(bytes::Bytes::from(line))))
     }
 }
@@ -495,6 +495,17 @@ pub struct ServeConfig {
 }
 
 pub async fn serve(pool: PgPool, cfg: ServeConfig) -> Result<()> {
+    // Keep the chunk index hot: a cold btree leaf was ~1/3 of a cold small
+    // GET on Aurora (EXPLAIN I/O timings), and the index is tiny next to
+    // shared_buffers (344 MB vs 13.5 GB). Best-effort, in the background.
+    let warm = pool.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_prewarm").execute(&warm).await;
+        match sqlx::query_scalar::<_, i64>("SELECT pg_prewarm('s3p.chunks_pkey')").fetch_one(&warm).await {
+            Ok(blocks) => eprintln!("pgvs3: prewarmed s3p.chunks_pkey ({blocks} blocks)"),
+            Err(e) => eprintln!("pgvs3: prewarm skipped: {e}"),
+        }
+    });
     let s3 = PgS3 {
         pool,
         mpus: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -514,7 +525,7 @@ pub async fn serve(pool: PgPool, cfg: ServeConfig) -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tick.tick().await;
-            eprintln!("{}", crate::db::cache_stats_line());
+            eprintln!("{}\n{}", crate::db::cache_stats_line(), crate::db::stage_stats_line());
         }
     });
     loop {

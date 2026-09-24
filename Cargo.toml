@@ -12,3 +12,10 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Identical codegen to release, symbols kept: perf/flamegraph need them.
+# cargo build --profile profiling -> target/profiling/pgvs3
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+

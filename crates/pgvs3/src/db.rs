@@ -6,8 +6,10 @@
 //! cache) and Aurora, purely to remove round trips. Objects are immutable by
 //! convention, so cache entries are populated at publish and dropped at
 //! delete; repeat reads (parquet footers, hot ranges) reach PostgreSQL zero
-//! times. Uncached rows fetch in ONE query (`no = ANY(...)`), served via a
-//! bounded channel into the response body.
+//! times. Uncached rows fetch in parallel parts (PGVS3_SPLIT_BYTES, default
+//! 1 MiB, SPLIT_INFLIGHT per request on separate pool connections): one Aurora
+//! connection moves ~420-500 MB/s warm (per TLS flow) and ~300 MB/s cold
+//! (storage per backend), so large spans fan out across the pool.
 //!
 //! Write path: deliberately single-threaded per process — one binary COPY
 //! stream at a time (a global flush permit), rows cut across multipart part
@@ -44,22 +46,32 @@ const COPY_HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\x00\x00\x00\x00\x00\x00\x00\x00"
 const COPY_TRAILER: &[u8] = &[0xFF, 0xFF];
 const SEND_BATCH: usize = 4 << 20;
 
-/// Sliced pieces for the pass-through path (span form; rows may arrive in any
-/// order — the forwarder reorders).
-const GET_ROWS_SQL: &str = "SELECT c.no, \
-       CASE WHEN $2::int8 <= c.no::int8 * $3 \
-                 AND $2::int8 + $4::int8 - 1 >= (c.no::int8 + 1) * $3 - 1 \
-            THEN c.data \
-            ELSE substring(c.data \
-              FROM (GREATEST($2::int8, c.no::int8 * $3) - c.no::int8 * $3)::int4 + 1 \
-              FOR GREATEST(LEAST($2::int8 + $4::int8 - 1, (c.no::int8 + 1) * $3 - 1) \
-                           - GREATEST($2::int8, c.no::int8 * $3) + 1, 0)::int4) \
-       END AS piece \
-FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $5 AND c.no <= $6";
+/// Whole rows for a contiguous `no` range (cheaper than `= ANY` on Aurora:
+/// 1.74 vs 2.02 ms server time per warm 8 MiB span).
+const GET_RANGE_SQL: &str =
+    "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3";
 
-/// Whole rows for the admitted path (cached in full; slices computed in Rust).
+/// Whole rows for scattered `no`s (cache misses interleaved with hits).
 const GET_ROWS_FULL_SQL: &str =
     "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no = ANY($2::int4[])";
+
+/// Parts in flight per request, each on its own pool connection.
+const SPLIT_INFLIGHT: usize = 8;
+/// Pass-through parts never buffer more than ~8 MiB each.
+const STREAM_PART_MAX_ROWS: usize = 1024;
+
+/// Rows per parallel part (PGVS3_SPLIT_BYTES, default 1 MiB; 0 disables
+/// splitting: one query per span, the pre-split behaviour, for A/B runs).
+fn split_rows() -> Option<usize> {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        let bytes = std::env::var("PGVS3_SPLIT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1 << 20);
+        (bytes > 0).then(|| bytes.div_ceil(ROW_BYTES as usize))
+    })
+}
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     // Bitmap heap scans hand the row-span TIDs to PostgreSQL 18's async
@@ -73,25 +85,29 @@ pub async fn connect(url: &str) -> Result<PgPool> {
     // PGVS3_DURABLE=1 to require synchronous commits.
     let durable = std::env::var_os("PGVS3_DURABLE").is_some();
     Ok(PgPoolOptions::new()
-        .max_connections(64)
+        // Parallel parts (SPLIT_INFLIGHT per request) multiply connection
+        // demand; Aurora allows ~1700 and sqlx opens connections lazily.
+        .max_connections(256)
         .after_connect(move |conn, _meta| {
             Box::pin(async move {
-                // Sorts of slice rows carry the payload; never let them spill
-                // (the generic plan badly misestimates range row counts).
-                sqlx::query("SET work_mem = '64MB'").execute(&mut *conn).await?;
-                // Deeper bitmap read-stream prefetch on network storage.
-                let _ = sqlx::query("SET effective_io_concurrency = 32").execute(&mut *conn).await;
-                if !indexscan {
-                    sqlx::query("SET enable_indexscan = off").execute(&mut *conn).await?;
-                }
-                if !durable {
-                    let _ = sqlx::query("SET synchronous_commit = off").execute(&mut *conn).await;
-                }
-                // PG18 read-stream combine width (pages per async op): wider
-                // suiting network storage. io_method/io_workers are
-                // postmaster-scoped and absent from Aurora's parameter-group
-                // surface entirely — io_combine_limit is the live knob.
-                let _ = sqlx::query("SET io_combine_limit = 64").execute(&mut *conn).await;
+                // Whole session setup in one round trip (simple-query batch).
+                // work_mem keeps bitmap TID maps exact; effective_io_concurrency
+                // deepens bitmap read-stream prefetch (no measured gain past 32
+                // on Aurora).
+                let sets: &'static str = match (indexscan, durable) {
+                    (false, false) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
+                                       SET enable_indexscan = off; SET synchronous_commit = off;",
+                    (false, true) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
+                                      SET enable_indexscan = off;",
+                    (true, false) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
+                                      SET synchronous_commit = off;",
+                    (true, true) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32;",
+                };
+                // No io_combine_limit: PG18 clamps it to the postmaster-level
+                // io_max_combine_limit (commands/variable.c assign hook; 168 kB
+                // on Aurora, 128 kB stock), so a session SET above that is a
+                // silent no-op. Raising it needs a parameter-group change.
+                sqlx::Executor::execute(&mut *conn, sets).await?;
                 Ok(())
             })
         })
@@ -369,27 +385,34 @@ fn row_get(file_id: i64, no: i32) -> Option<Bytes> {
 // versus local cache/decode/assembly, and pass-through stream time. Read via
 // `stage_stats_line` (the stats route and the log timer print it).
 // ---------------------------------------------------------------------------
-static SQL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Small path: wall time per request and of its (parallel) fetch phase.
 static SMALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FETCH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SMALL_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STREAM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STREAM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per part query, both paths: count and pool-acquire wait (summed, so it can
+// exceed wall time under concurrency; growth means the pool is the limit).
+static PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `small total=.. sql=.. local=.. | stream=.. n=.. | served=..MiB`
+/// `small total=.. fetch=.. local=.. | stream=.. | parts=.. wait(sum)=.. | served=..`
 pub fn stage_stats_line() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let ms = |us: u64| us as f64 / 1e3;
     let total = SMALL_US.load(Relaxed);
-    let sql = SQL_US.load(Relaxed);
+    let fetch = FETCH_US.load(Relaxed);
     format!(
-        "perf: small total={:.0}ms sql={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | served={}MiB",
+        "perf: small total={:.0}ms fetch={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | parts={} wait(sum)={:.0}ms | served={}MiB",
         ms(total),
-        ms(sql),
-        ms(total.saturating_sub(sql)),
+        ms(fetch),
+        ms(total.saturating_sub(fetch)),
         SMALL_N.load(Relaxed),
         ms(STREAM_US.load(Relaxed)),
         STREAM_N.load(Relaxed),
+        PARTS.load(Relaxed),
+        ms(WAIT_US.load(Relaxed)),
         SERVED.load(Relaxed) / 1024 / 1024,
     )
 }
@@ -509,7 +532,9 @@ pub async fn get_body(
         SERVED.fetch_add(smeta.len() as u64, Relaxed);
         Ok(Some((smeta, PieceBody::OneShot(out.freeze()))))
     } else {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+        // Room for SPLIT_INFLIGHT parts of row pieces, so part fetches keep
+        // flowing while the body drains.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1024);
         tokio::spawn(async move {
             if let Err(e) = stream_pass_through(&pool, &m, start, end, first_row, last_row, &tx).await {
                 let _ = tx.send(Err(io_err(e))).await;
@@ -526,37 +551,60 @@ pub enum PieceBody {
     Streamed(PieceStream),
 }
 
-/// Whole-row gather for small spans: 2Q cache first, one query for misses.
+/// Whole-row gather for small spans: cache first, then the misses as parallel
+/// parts (split_rows each, SPLIT_INFLIGHT at a time).
 async fn gather_rows(pool: &PgPool, m: &Meta, first_row: i32, nrows: usize) -> Result<Vec<Bytes>> {
     let mut rows: Vec<Option<Bytes>> = vec![None; nrows];
     let mut missing: Vec<i32> = Vec::new();
-    for i in 0..nrows {
+    for (i, slot) in rows.iter_mut().enumerate() {
         let no = first_row + i as i32;
-        if let Some(r) = row_get(m.file_id, no) {
-            rows[i] = Some(r);
-        } else {
-            missing.push(no);
+        match row_get(m.file_id, no) {
+            Some(r) => *slot = Some(r),
+            None => missing.push(no),
         }
     }
     if !missing.is_empty() {
         let t0 = std::time::Instant::now();
-        let got = sqlx::query(GET_ROWS_FULL_SQL)
-            .bind(m.file_id)
-            .bind(&missing[..])
-            .fetch_all(pool)
-            .await?;
-        SQL_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-        for r in got {
-            let no: i32 = r.get("no");
-            let raw = r.try_get_raw("data")?;
-            let data = Bytes::copy_from_slice(raw.as_bytes().unwrap_or(&[]));
-            row_put(m.file_id, no, data.clone());
-            if let Some(slot) = rows.get_mut((no - first_row) as usize) {
-                *slot = Some(data);
+        let file_id = m.file_id;
+        // Owned per-part `no` lists: futures over borrowed slices are
+        // higher-ranked and trip the Send check of spawned callers.
+        let chunks = missing.chunks(split_rows().unwrap_or(usize::MAX)).map(<[i32]>::to_vec);
+        let mut parts = futures::stream::iter(chunks)
+            .map(|nos| async move { fetch_part(pool, file_id, &nos).await })
+            .buffer_unordered(SPLIT_INFLIGHT);
+        while let Some(part) = parts.next().await {
+            for (no, data) in part? {
+                row_put(m.file_id, no, data.clone());
+                if let Some(slot) = rows.get_mut((no - first_row) as usize) {
+                    *slot = Some(data);
+                }
             }
         }
+        FETCH_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(rows.into_iter().map(|p| p.unwrap_or_default()).collect())
+}
+
+/// One part query on its own pool connection; `nos` ascending. Contiguous
+/// runs use the range predicate, scattered misses `= ANY`.
+async fn fetch_part(pool: &PgPool, file_id: i64, nos: &[i32]) -> Result<Vec<(i32, Bytes)>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let t0 = std::time::Instant::now();
+    let mut conn = pool.acquire().await?;
+    WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+    PARTS.fetch_add(1, Relaxed);
+    let (lo, hi) = (nos[0], nos[nos.len() - 1]);
+    let got = if (hi - lo + 1) as usize == nos.len() {
+        sqlx::query(GET_RANGE_SQL).bind(file_id).bind(lo).bind(hi).fetch_all(&mut *conn).await?
+    } else {
+        sqlx::query(GET_ROWS_FULL_SQL).bind(file_id).bind(nos).fetch_all(&mut *conn).await?
+    };
+    let mut out = Vec::with_capacity(got.len());
+    for r in got {
+        let raw = r.try_get_raw("data")?;
+        out.push((r.get("no"), Bytes::copy_from_slice(raw.as_bytes().unwrap_or(&[]))));
+    }
+    Ok(out)
 }
 
 /// Effective `[start, end]` inclusive for a request (mirrors the old SQL clamp).
@@ -568,9 +616,10 @@ fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
     }
 }
 
-/// Large-span path: stream sliced pieces straight from the database (never
-/// touches the cache). Rows arrive in `no` order only by plan luck (bitmap
-/// scans do not preserve it), so a tiny reorder buffer restores byte order.
+/// Large-span path (never touches the cache): the span splits into parts
+/// fetched SPLIT_INFLIGHT at a time on separate connections and emitted in
+/// submission order (`buffered`); each part is sorted locally (bitmap heap
+/// scans do not guarantee `no` order) and its edge rows sliced to the range.
 async fn stream_pass_through(
     pool: &PgPool,
     m: &Meta,
@@ -599,33 +648,28 @@ async fn stream_pass_inner(
     last_row: i32,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<()> {
-    let mut stream = sqlx::query(GET_ROWS_SQL)
-        .bind(m.file_id)
-        .bind(start)
-        .bind(ROW_BYTES)
-        .bind(end - start + 1)
-        .bind(first_row)
-        .bind(last_row)
-        .fetch(pool);
-    let mut pending: HashMap<i32, Bytes> = HashMap::new();
-    let mut next = first_row;
-    while let Some(row) = stream.next().await {
-        let row = row?;
-        let no: i32 = row.get("no");
-        let raw = row.try_get_raw("piece")?;
-        pending.insert(no, Bytes::copy_from_slice(raw.as_bytes().unwrap_or(&[])));
-        while let Some(p) = pending.remove(&next) {
-            if !p.is_empty() && tx.send(Ok(p)).await.is_err() {
+    let (step, inflight) = match split_rows() {
+        Some(n) => (n.min(STREAM_PART_MAX_ROWS), SPLIT_INFLIGHT),
+        None => (STREAM_PART_MAX_ROWS, 1), // A/B baseline: one query at a time
+    };
+    let file_id = m.file_id;
+    let ranges = (first_row..=last_row)
+        .step_by(step)
+        .map(move |lo| (lo..=(lo + step as i32 - 1).min(last_row)).collect::<Vec<i32>>());
+    let mut parts = futures::stream::iter(ranges)
+        .map(|nos| async move { fetch_part(pool, file_id, &nos).await })
+        .buffered(inflight);
+    while let Some(part) = parts.next().await {
+        let mut part = part?;
+        part.sort_unstable_by_key(|(no, _)| *no);
+        for (no, data) in part {
+            let row_start = i64::from(no) * ROW_BYTES;
+            let lo = start.max(row_start) - row_start;
+            let hi = end.min(row_start + data.len() as i64 - 1) - row_start;
+            if hi >= lo && tx.send(Ok(data.slice(lo as usize..=hi as usize))).await.is_err() {
                 return Ok(());
             }
-            next += 1;
         }
-    }
-    while let Some(p) = pending.remove(&next) {
-        if !p.is_empty() && tx.send(Ok(p)).await.is_err() {
-            return Ok(());
-        }
-        next += 1;
     }
     Ok(())
 }
