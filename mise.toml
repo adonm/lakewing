@@ -1,5 +1,5 @@
-# Toolchain pins. The only prereq: `mise install` (auto-runs on first use).
-# Services (Postgres, optional SeaweedFS origin) run via `just dev-db` / `just dev-origin` with Docker.
+# Toolchain pins: `mise install` (runs on first use). Local PostgreSQL runs
+# in Docker via `just dev-db`.
 [tools]
 just = "1"
 rust = "stable"
@@ -7,10 +7,9 @@ uv = "0.12.1"
 python = "3.12.14"
 duckdb = "1.5.5"
 
-# Python duckdb wheels for the TPC-H harness (the CLI pin is under [tools];
-# this is the interpreter module the harness imports). Pinned per line so every
-# host resolves identically: `just tpch` (stable) / `just tpch2` (2.0 pre).
-# The dev-build pin is a date-stamped nightly; bump when 2.0 GA lands.
+# Python duckdb wheels the benchmark harness imports (the CLI pin is under
+# [tools]): stable for `just tpch`, the 2.0 pre-release for everything else.
+# The pre-release pin is a date-stamped nightly; bump when 2.0 GA lands.
 [env]
 DUCKDB_PY_STABLE = "1.5.5"
 DUCKDB_PY_PRE = "2.0.0.dev2609222040"
