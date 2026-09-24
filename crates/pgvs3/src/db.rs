@@ -93,7 +93,7 @@ pub async fn connect(url: &str) -> Result<PgPool> {
         // Aurora) showed up as 10-13 ms average acquire wait per part (~40% of
         // fetch time) in the c7gn A/B; at 32 SpatialBench's burst still waited
         // 5-8 ms per part, so keep DuckDB's in-flight GETs covered.
-        .min_connections(64)
+        .min_connections(pool_min())
         // sqlx pings every connection on acquire by default (sqlx-core 0.8.6
         // pool/options.rs) - a full Aurora round trip per GET. Broken
         // connections still surface on use and get recycled.
@@ -130,20 +130,88 @@ pub async fn connect(url: &str) -> Result<PgPool> {
         .await?)
 }
 
+/// Storage layout this binary reads and writes (schema.sql); bumped only by
+/// breaking layout changes.
+pub const LAYOUT_VERSION: i32 = 2;
+
+/// Create the layout if absent, and fail closed on any other version rather
+/// than misread it. Serialized across gateways by an advisory lock, so
+/// concurrent first starts do not race the DDL.
 pub async fn init(pool: &PgPool) -> Result<()> {
-    // PGVS3_UNLOGGED=1: skip WAL on the chunk table (bulk of all bytes).
-    // Opt-in: unlogged tables are writer-scoped and their crash semantics are
-    // deployment-specific. Objects stay logged (metadata + etags).
-    let schema = if std::env::var_os("PGVS3_UNLOGGED").is_some() {
-        SCHEMA.replace(
-            "CREATE TABLE IF NOT EXISTS s3p.chunks",
-            "CREATE UNLOGGED TABLE IF NOT EXISTS s3p.chunks",
-        )
-    } else {
-        SCHEMA.to_owned()
-    };
-    sqlx::raw_sql(&schema).execute(pool).await?;
+    const LOCK: i64 = 0x7067_7673; // "pgvs"
+    let mut conn = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)").bind(LOCK).execute(&mut *conn).await?;
+    let result = init_locked(&mut conn).await;
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)").bind(LOCK).execute(&mut *conn).await;
+    result
+}
+
+async fn init_locked(conn: &mut sqlx::PgConnection) -> Result<()> {
+    let chunks: bool = sqlx::query_scalar("SELECT to_regclass('s3p.chunks') IS NOT NULL")
+        .fetch_one(&mut *conn)
+        .await?;
+    if chunks {
+        let found: Option<i32> = if sqlx::query_scalar::<_, bool>("SELECT to_regclass('s3p.layout') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?
+        {
+            sqlx::query_scalar("SELECT max(version) FROM s3p.layout").fetch_one(&mut *conn).await?
+        } else {
+            Some(1) // v1 predates the marker (unpartitioned s3p.chunks)
+        };
+        match found {
+            Some(v) if v == LAYOUT_VERSION => {}
+            Some(v) => anyhow::bail!(
+                "s3p holds storage layout v{v}; this pgvs3 reads v{LAYOUT_VERSION} \
+                 (migrate the data, or point it at a fresh database)"
+            ),
+            None => anyhow::bail!("s3p.layout is empty: refusing to guess the storage layout"),
+        }
+    }
+    sqlx::raw_sql(SCHEMA).execute(&mut *conn).await?;
+    sqlx::query("INSERT INTO s3p.layout (version) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM s3p.layout)")
+        .bind(LAYOUT_VERSION)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
+}
+
+/// Warm connections per gateway (PGVS3_POOL_MIN, default 64: measured
+/// wait-free for one DuckDB worker's bursts). Every gateway holds this many
+/// Aurora backends open, so large fleets should lower it.
+fn pool_min() -> u32 {
+    std::env::var("PGVS3_POOL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+}
+
+/// Load the chunk primary-key indexes into shared_buffers when they are small
+/// beside it (a cold btree leaf was ~1/3 of a cold small GET on Aurora).
+/// Past ~10% of shared_buffers (the index is ~0.4% of the data, so multi-TB)
+/// they are left to the buffer manager: prewarming on every gateway start
+/// would evict the working set. Returns the blocks loaded, or None if skipped.
+pub async fn prewarm_index(pool: &PgPool) -> Result<Option<i64>> {
+    let _ = sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_prewarm").execute(pool).await;
+    let idx: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT i.indexrelid::regclass::text, pg_relation_size(i.indexrelid) \
+         FROM pg_partition_tree('s3p.chunks') p JOIN pg_index i ON i.indrelid = p.relid \
+         WHERE p.isleaf AND i.indisprimary",
+    )
+    .fetch_all(pool)
+    .await?;
+    let budget: i64 =
+        sqlx::query_scalar("SELECT setting::int8 * 8192 / 10 FROM pg_settings WHERE name = 'shared_buffers'")
+            .fetch_one(pool)
+            .await?;
+    if idx.iter().map(|(_, bytes)| bytes).sum::<i64>() > budget {
+        return Ok(None);
+    }
+    let mut blocks = 0;
+    for (name, _) in &idx {
+        blocks += sqlx::query_scalar::<_, i64>("SELECT pg_prewarm($1::regclass)")
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+    }
+    Ok(Some(blocks))
 }
 
 #[derive(Debug, Clone)]
@@ -955,22 +1023,26 @@ pub async fn abort_upload(pool: &PgPool, upload_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Unreferenced chunk files with ids in [$1, $2): a loose index scan (one PK
-/// probe per distinct file, not per row) anti-joined against everything that
-/// can own a file: published objects (single file or parts) and recorded
-/// upload parts.
-const ORPHANS_SQL: &str = "\
-WITH RECURSIVE f(file_id) AS ( \
-    SELECT min(file_id) FROM s3p.chunks WHERE file_id >= $1 AND file_id < $2 \
-  UNION ALL \
-    SELECT (SELECT min(c.file_id) FROM s3p.chunks c WHERE c.file_id > f.file_id AND c.file_id < $2) \
-    FROM f WHERE f.file_id IS NOT NULL \
-) \
-SELECT f.file_id FROM f \
-WHERE f.file_id IS NOT NULL \
-  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f.file_id) \
-  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f.file_id) \
-  AND f.file_id NOT IN (SELECT unnest(parts) FROM s3p.objects WHERE parts IS NOT NULL)";
+/// Unreferenced chunk files of one partition with ids in [$1, $2): a loose
+/// index scan (one probe of that partition's primary key per distinct file,
+/// not per row; per partition because a scan of the parent would probe all
+/// 32 per step) anti-joined, all by index, against everything that can own a
+/// file: published objects (single file, or parts via GIN) and upload parts.
+fn orphans_sql(partition: &str) -> String {
+    format!(
+        "WITH RECURSIVE f(file_id) AS ( \
+             SELECT min(file_id) FROM {partition} WHERE file_id >= $1 AND file_id < $2 \
+           UNION ALL \
+             SELECT (SELECT min(c.file_id) FROM {partition} c WHERE c.file_id > f.file_id AND c.file_id < $2) \
+             FROM f WHERE f.file_id IS NOT NULL \
+         ) \
+         SELECT f.file_id FROM f \
+         WHERE f.file_id IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f.file_id) \
+           AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts @> ARRAY[f.file_id]) \
+           AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f.file_id)"
+    )
+}
 
 /// Reap chunk files nothing references once provably older than `grace`: a
 /// PUT whose publish never ran (its rows commit before the object row), or a
@@ -991,14 +1063,25 @@ pub async fn sweep_orphans(pool: &PgPool, grace: Duration, from: i64) -> Result<
         Some(h) if h > from => h,
         _ => return Ok((0, 0, from)),
     };
+    // Partition names come from the catalog (regclass text, already quoted).
+    let partitions: Vec<String> =
+        sqlx::query_scalar("SELECT relid::regclass::text FROM pg_partition_tree('s3p.chunks') WHERE isleaf")
+            .fetch_all(pool)
+            .await?;
     let mut tx = pool.begin().await?;
     // The loose scan wants index probes; gateway sessions default to bitmaps.
     sqlx::query("SET LOCAL enable_indexscan = on").execute(&mut *tx).await?;
-    let orphans: Vec<i64> = sqlx::query_scalar(ORPHANS_SQL)
-        .bind(from)
-        .bind(horizon)
-        .fetch_all(&mut *tx)
-        .await?;
+    let mut orphans: Vec<i64> = Vec::new();
+    for partition in &partitions {
+        let sql = orphans_sql(partition);
+        let found: Vec<i64> = sqlx::query_scalar(&sql)
+            .bind(from)
+            .bind(horizon)
+            .persistent(false)
+            .fetch_all(&mut *tx)
+            .await?;
+        orphans.extend(found);
+    }
     tx.commit().await?;
     let mut rows = 0;
     for id in &orphans {

@@ -83,6 +83,14 @@ per the notes in `teardown-rig.sh`; that script tears it down.
   are.
 - Row math is arithmetic, not catalog lookups: byte range → row span
   `[off/8120, (off+len-1)/8120]`; `no int4` allows objects up to ~17 TB.
+- `s3p.chunks` is **hash-partitioned by `file_id`, 32 ways**: one relation
+  caps at `MaxBlockNumber` (`0xFFFFFFFE`, `storage/block.h`) × 8 KB = 32 TiB,
+  concurrent writers (one per PUT / multipart part, adjacent `file_id`s) land
+  on 32 heaps and index right edges instead of one, and every GET
+  (`file_id = $1`) prunes to exactly one partition. `toast_tuple_target` is
+  set per partition (partitioned parents take no storage parameters).
+- The layout is versioned (`s3p.layout`, `db::LAYOUT_VERSION`): a gateway
+  refuses to serve a layout it was not built for.
 
 Why not TOASTed big values? A 1996-byte `TOAST_MAX_CHUNK_SIZE` layout has the
 same page density (4 tuples/page) but 4× the rows, a second relation + toast
