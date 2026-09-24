@@ -4,8 +4,12 @@
 set -euo pipefail
 P=${AWS_PROFILE:-platform-dev}
 
-aws rds delete-db-instance --profile "$P" --db-instance-identifier pgvs3-perf-1 \
-  --skip-final-snapshot --delete-automated-backups
+# Every instance in the cluster: the writer's name changed when it moved AZs.
+for db in $(aws rds describe-db-clusters --profile "$P" --db-cluster-identifier pgvs3-perf \
+              --query 'DBClusters[0].DBClusterMembers[].DBInstanceIdentifier' --output text); do
+  aws rds delete-db-instance --profile "$P" --db-instance-identifier "$db" \
+    --skip-final-snapshot --delete-automated-backups
+done
 aws rds delete-db-cluster --profile "$P" --db-cluster-identifier pgvs3-perf --skip-final-snapshot
 aws ec2 terminate-instances --profile "$P" --instance-ids i-037e91b323d000a1b
 aws ec2 delete-key-pair --profile "$P" --key-name pgvs3-perf-key
