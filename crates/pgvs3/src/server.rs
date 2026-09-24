@@ -473,6 +473,21 @@ impl S3 for PgS3 {
     }
 }
 
+/// Debug endpoint: `GET /_pgvs3/stats` returns the cache telemetry line so
+/// harnesses snapshot it on demand (the 60s log cadence misses short runs).
+struct StatsRoute;
+
+#[async_trait::async_trait]
+impl s3s::route::S3Route for StatsRoute {
+    fn is_match(&self, method: &hyper::http::Method, uri: &hyper::http::Uri, _: &hyper::http::HeaderMap, _: &mut hyper::http::Extensions) -> bool {
+        *method == hyper::http::Method::GET && uri.path() == "/_pgvs3/stats"
+    }
+    async fn call(&self, _req: S3Request<s3s::Body>) -> S3Result<S3Response<s3s::Body>> {
+        let line = format!("{}\n", db::cache_stats_line());
+        Ok(S3Response::new(s3s::Body::from(bytes::Bytes::from(line))))
+    }
+}
+
 pub struct ServeConfig {
     pub addr: String,
     pub access_key: String,
@@ -486,6 +501,7 @@ pub async fn serve(pool: PgPool, cfg: ServeConfig) -> Result<()> {
     };
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(SimpleAuth::from_single(cfg.access_key.as_str(), cfg.secret_key.as_str()));
+    builder.set_route(StatsRoute);
     let service = builder.build();
 
     let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;

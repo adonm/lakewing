@@ -22,6 +22,7 @@ writes a JSON record. Example:
 import argparse
 import json
 import os
+import subprocess
 import time
 
 import duckdb
@@ -121,6 +122,21 @@ def main() -> None:
         total = sum(times.values())
         print(f"[{args.stack}] pass {p + 1}: total {total:.1f}s")
         print("  " + "  ".join(f"Q{q}={times[q]:.2f}" for q in queries))
+
+    # Gateway cache telemetry (signed debug route) — the tuning surface for
+    # PGVS3_ADMIT_BYTES / PGVS3_CACHE_MIB, captured per run.
+    try:
+        st = subprocess.run(
+            ["curl", "-s", "--aws-sigv4", "aws:amz:us-east-1:s3",
+             "--user", "cachebench:cachebench-local-only",
+             "http://127.0.0.1:8014/_pgvs3/stats"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if st:
+            record["gateway_stats"] = st
+            print("gateway:", st)
+    except Exception:
+        pass
 
     out = args.out or f".tmp/pgvs3/tpch-{args.stack}-sf{args.sf:g}.json"
     with open(out, "w") as f:
