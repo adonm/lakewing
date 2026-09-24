@@ -1,0 +1,24 @@
+[package]
+name = "pgvs3"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["tls"]
+# TLS to PostgreSQL (rustls + ring). Required against Aurora (server rejects
+# plaintext); disable with --no-default-features for local plaintext-only use.
+tls = ["sqlx/tls-rustls"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+object_store = { version = "0.13.2", features = ["aws"] }
+sha2 = "0.10"
+s3s = "0.16"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

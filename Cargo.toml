@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/pgvs3"]
+
+# pgvs3: lowest-overhead S3-compatible service backed by PostgreSQL byte rows.
+
+# Fast + small: fat LTO and a single codegen unit inline across crates at the
+# cost of build time; symbols stripped. `panic = "abort"` would shave a few %
+# more but a panic would take the whole service down with it.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+

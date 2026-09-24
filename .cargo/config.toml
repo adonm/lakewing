@@ -1,0 +1,9 @@
+# Keep peak build load modest on shared workstations: cargo defaults to
+# every logical core, which saturates machines that also run clusters and
+# services. Half the cores is barely slower for this crate.
+#
+# Per-host codegen: memcpy/CRC/hash paths gain SIMD. Binaries are built where
+# they run (dev box, rig); not portable across CPU generations by design.
+[build]
+jobs = 8
+rustflags = ["-C", "target-cpu=native"]
