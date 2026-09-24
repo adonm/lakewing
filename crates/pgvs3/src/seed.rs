@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 
 use crate::db;
 
@@ -43,7 +42,7 @@ pub struct SeedConfig {
     pub tasks: usize,
 }
 
-pub async fn run(pool: &PgPool, cfg: SeedConfig) -> Result<()> {
+pub async fn run(pool: &db::Pool, cfg: SeedConfig) -> Result<()> {
     db::init(pool).await?;
     let object_bytes = cfg.object_mib * 1024 * 1024;
     let n_objects = ((cfg.gigabytes * 1024.0 * 1024.0 * 1024.0) as usize).div_ceil(object_bytes);

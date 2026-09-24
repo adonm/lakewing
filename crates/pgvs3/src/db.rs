@@ -29,10 +29,12 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use futures::{Stream, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row, Transaction};
+use tokio_postgres::types::Type;
+use tokio_postgres::{Client, Row, Transaction};
+
+pub use crate::pg::Pool;
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
 
@@ -75,7 +77,7 @@ fn split_rows() -> Option<usize> {
     })
 }
 
-pub async fn connect(url: &str) -> Result<PgPool> {
+pub async fn connect(url: &str) -> Result<Pool> {
     // Bitmap heap scans hand the row-span TIDs to PostgreSQL 18's async
     // read-stream prefetch: cold >RAM range reads measured 5x faster than
     // one-page-at-a-time index scans (256KiB GET p50 14.1ms -> 2.8ms), with no
@@ -86,48 +88,44 @@ pub async fn connect(url: &str) -> Result<PgPool> {
     // sha256-idempotent, so commit-ack loss only ever replays a PUT. Set
     // PGVS3_DURABLE=1 to require synchronous commits.
     let durable = std::env::var_os("PGVS3_DURABLE").is_some();
-    Ok(PgPoolOptions::new()
-        // Parallel parts multiply connection demand; Aurora allows ~1700.
-        .max_connections(256)
-        // Warm pool: cold-pool setup (TCP + TLS + SCRAM + session SETs to
-        // Aurora) showed up as 10-13 ms average acquire wait per part (~40% of
-        // fetch time) in the c7gn A/B; at 32 SpatialBench's burst still waited
-        // 5-8 ms per part, so keep DuckDB's in-flight GETs covered.
-        .min_connections(pool_min())
-        // sqlx pings every connection on acquire by default (sqlx-core 0.8.6
-        // pool/options.rs) - a full Aurora round trip per GET. Broken
-        // connections still surface on use and get recycled.
-        .test_before_acquire(false)
-        .after_connect(move |conn, _meta| {
-            Box::pin(async move {
-                // work_mem keeps bitmap TID maps exact; effective_io_concurrency
-                // deepens bitmap read-stream prefetch (no measured gain past 32
-                // on Aurora). The rest bounds what a dead or wedged gateway can
-                // leave holding locks server-side: a vanished client is noticed
-                // in ~1 min (Aurora's keepalive defaults: ~16 min), and a
-                // transaction left idle (only ever a bug here) is killed.
-                sqlx::Executor::execute(
-                    &mut *conn,
-                    "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
-                     SET tcp_keepalives_idle = 30; SET tcp_keepalives_interval = 10; \
-                     SET tcp_keepalives_count = 3; SET idle_in_transaction_session_timeout = '5min';",
-                )
-                .await?;
-                if !indexscan {
-                    sqlx::Executor::execute(&mut *conn, "SET enable_indexscan = off").await?;
-                }
-                if !durable {
-                    sqlx::Executor::execute(&mut *conn, "SET synchronous_commit = off").await?;
-                }
-                // No io_combine_limit: PG18 clamps it to the postmaster-level
-                // io_max_combine_limit (commands/variable.c assign hook; 168 kB
-                // on Aurora, 128 kB stock), so a session SET above that is a
-                // silent no-op. Raising it needs a parameter-group change.
-                Ok(())
-            })
-        })
-        .connect(url)
-        .await?)
+    // work_mem keeps bitmap TID maps exact; effective_io_concurrency deepens
+    // bitmap read-stream prefetch (no measured gain past 32 on Aurora). The
+    // rest bounds what a dead or wedged gateway can leave holding locks
+    // server-side: a vanished client is noticed in ~1 min (Aurora's keepalive
+    // defaults: ~16 min), and a transaction left idle (only ever a bug here)
+    // is killed.
+    let mut session = String::from(
+        "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
+         SET tcp_keepalives_idle = 30; SET tcp_keepalives_interval = 10; \
+         SET tcp_keepalives_count = 3; SET idle_in_transaction_session_timeout = '5min';",
+    );
+    if !indexscan {
+        session.push_str(" SET enable_indexscan = off;");
+    }
+    if !durable {
+        session.push_str(" SET synchronous_commit = off;");
+    }
+    // No io_combine_limit: PG18 clamps it to the postmaster-level
+    // io_max_combine_limit (commands/variable.c assign hook; 168 kB on Aurora,
+    // 128 kB stock), so a session SET above that is a silent no-op. Raising it
+    // needs a parameter-group change.
+    Pool::connect(
+        url,
+        crate::pg::Options {
+            // Warm pool: cold-pool setup (TCP + TLS + SCRAM + session SETs to
+            // Aurora) showed up as 10-13 ms average acquire wait per part
+            // (~40% of fetch time) in the c7gn A/B; at 32 SpatialBench's burst
+            // still waited 5-8 ms per part, so keep DuckDB's in-flight GETs
+            // covered.
+            min: pool_min(),
+            // Parallel parts multiply connection demand; Aurora allows ~1700.
+            max: 256,
+            session,
+            range_sql: GET_RANGE_SQL,
+            range_types: &[Type::INT8, Type::INT4, Type::INT4],
+        },
+    )
+    .await
 }
 
 /// Storage layout this binary reads and writes (schema.sql); bumped only by
@@ -137,25 +135,23 @@ pub const LAYOUT_VERSION: i32 = 2;
 /// Create the layout if absent, and fail closed on any other version rather
 /// than misread it. Serialized across gateways by an advisory lock, so
 /// concurrent first starts do not race the DDL.
-pub async fn init(pool: &PgPool) -> Result<()> {
+pub async fn init(pool: &Pool) -> Result<()> {
     const LOCK: i64 = 0x7067_7673; // "pgvs"
-    let mut conn = pool.acquire().await?;
-    sqlx::query("SELECT pg_advisory_lock($1)").bind(LOCK).execute(&mut *conn).await?;
-    let result = init_locked(&mut conn).await;
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)").bind(LOCK).execute(&mut *conn).await;
+    let conn = pool.get().await?;
+    conn.query_typed("SELECT pg_advisory_lock($1)", &[(&LOCK, Type::INT8)]).await?;
+    let result = init_locked(&conn).await;
+    let _ = conn.query_typed("SELECT pg_advisory_unlock($1)", &[(&LOCK, Type::INT8)]).await;
     result
 }
 
-async fn init_locked(conn: &mut sqlx::PgConnection) -> Result<()> {
-    let chunks: bool = sqlx::query_scalar("SELECT to_regclass('s3p.chunks') IS NOT NULL")
-        .fetch_one(&mut *conn)
-        .await?;
+async fn init_locked(client: &Client) -> Result<()> {
+    let chunks: bool =
+        client.query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[]).await?.try_get(0)?;
     if chunks {
-        let found: Option<i32> = if sqlx::query_scalar::<_, bool>("SELECT to_regclass('s3p.layout') IS NOT NULL")
-            .fetch_one(&mut *conn)
-            .await?
-        {
-            sqlx::query_scalar("SELECT max(version) FROM s3p.layout").fetch_one(&mut *conn).await?
+        let marked: bool =
+            client.query_typed_one("SELECT to_regclass('s3p.layout') IS NOT NULL", &[]).await?.try_get(0)?;
+        let found: Option<i32> = if marked {
+            client.query_typed_one("SELECT max(version) FROM s3p.layout", &[]).await?.try_get(0)?
         } else {
             Some(1) // v1 predates the marker (unpartitioned s3p.chunks)
         };
@@ -168,10 +164,12 @@ async fn init_locked(conn: &mut sqlx::PgConnection) -> Result<()> {
             None => anyhow::bail!("s3p.layout is empty: refusing to guess the storage layout"),
         }
     }
-    sqlx::raw_sql(SCHEMA).execute(&mut *conn).await?;
-    sqlx::query("INSERT INTO s3p.layout (version) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM s3p.layout)")
-        .bind(LAYOUT_VERSION)
-        .execute(&mut *conn)
+    client.batch_execute(SCHEMA).await?;
+    client
+        .query_typed(
+            "INSERT INTO s3p.layout (version) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM s3p.layout)",
+            &[(&LAYOUT_VERSION, Type::INT4)],
+        )
         .await?;
     Ok(())
 }
@@ -179,7 +177,7 @@ async fn init_locked(conn: &mut sqlx::PgConnection) -> Result<()> {
 /// Warm connections per gateway (PGVS3_POOL_MIN, default 64: measured
 /// wait-free for one DuckDB worker's bursts). Every gateway holds this many
 /// Aurora backends open, so large fleets should lower it.
-fn pool_min() -> u32 {
+fn pool_min() -> usize {
     std::env::var("PGVS3_POOL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
 }
 
@@ -188,28 +186,34 @@ fn pool_min() -> u32 {
 /// Past ~10% of shared_buffers (the index is ~0.4% of the data, so multi-TB)
 /// they are left to the buffer manager: prewarming on every gateway start
 /// would evict the working set. Returns the blocks loaded, or None if skipped.
-pub async fn prewarm_index(pool: &PgPool) -> Result<Option<i64>> {
-    let _ = sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_prewarm").execute(pool).await;
-    let idx: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT i.indexrelid::regclass::text, pg_relation_size(i.indexrelid) \
-         FROM pg_partition_tree('s3p.chunks') p JOIN pg_index i ON i.indrelid = p.relid \
-         WHERE p.isleaf AND i.indisprimary",
-    )
-    .fetch_all(pool)
-    .await?;
-    let budget: i64 =
-        sqlx::query_scalar("SELECT setting::int8 * 8192 / 10 FROM pg_settings WHERE name = 'shared_buffers'")
-            .fetch_one(pool)
-            .await?;
+pub async fn prewarm_index(pool: &Pool) -> Result<Option<i64>> {
+    let conn = pool.get().await?;
+    let _ = conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm").await;
+    let mut idx: Vec<(String, i64)> = Vec::new();
+    for r in conn
+        .query_typed(
+            "SELECT i.indexrelid::regclass::text, pg_relation_size(i.indexrelid) \
+             FROM pg_partition_tree('s3p.chunks') p JOIN pg_index i ON i.indrelid = p.relid \
+             WHERE p.isleaf AND i.indisprimary",
+            &[],
+        )
+        .await?
+    {
+        idx.push((r.try_get(0)?, r.try_get(1)?));
+    }
+    let budget: i64 = conn
+        .query_typed_one("SELECT setting::int8 * 8192 / 10 FROM pg_settings WHERE name = 'shared_buffers'", &[])
+        .await?
+        .try_get(0)?;
     if idx.iter().map(|(_, bytes)| bytes).sum::<i64>() > budget {
         return Ok(None);
     }
     let mut blocks = 0;
     for (name, _) in &idx {
-        blocks += sqlx::query_scalar::<_, i64>("SELECT pg_prewarm($1::regclass)")
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
+        blocks += conn
+            .query_typed_one("SELECT pg_prewarm($1::regclass)", &[(name, Type::TEXT)])
+            .await?
+            .try_get::<_, i64>(0)?;
     }
     Ok(Some(blocks))
 }
@@ -262,8 +266,8 @@ impl SliceMeta {
     }
 }
 
-/// Streamed slice pieces, in `no` order. Bounded channel back to the fetching
-/// task, so at most a few row batches are ever in flight.
+/// Streamed slice pieces, in `no` order: one buffer per part through a
+/// bounded channel back to the fetching task, so at most two parts queue.
 pub struct PieceStream {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
 }
@@ -403,31 +407,30 @@ fn span_bucket(span: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Metadata lookup, cached (a repeat open costs no round trip).
-pub async fn meta(pool: &PgPool, bucket: &str, key: &str) -> Result<Option<Meta>> {
+pub async fn meta(pool: &Pool, bucket: &str, key: &str) -> Result<Option<Meta>> {
     if let Some(m) = meta_cache().lock().unwrap().map.get(&(bucket.to_owned(), key.to_owned())) {
         return Ok(Some(m.clone()));
     }
-    let row = sqlx::query(
-        "SELECT file_id, size, etag, EXTRACT(EPOCH FROM created_at)::float8 AS created_epoch, \
-                parts, part_ends \
-         FROM s3p.objects WHERE bucket = $1 AND key = $2",
-    )
-    .bind(bucket)
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
-    let meta = row.map(|r| Meta {
-        file_id: r.get("file_id"),
-        size: r.get("size"),
-        etag: r.get("etag"),
-        created_at: epoch(r.get::<f64, _>("created_epoch")),
-        parts: r.get("parts"),
-        part_ends: r.get("part_ends"),
-    });
-    if let Some(m) = &meta {
-        meta_put(bucket, key, m.clone());
-    }
-    Ok(meta)
+    let row = pool
+        .get()
+        .await?
+        .query_typed_opt(
+            "SELECT file_id, size, etag, EXTRACT(EPOCH FROM created_at)::float8, parts, part_ends \
+             FROM s3p.objects WHERE bucket = $1 AND key = $2",
+            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+        )
+        .await?;
+    let Some(r) = row else { return Ok(None) };
+    let meta = Meta {
+        file_id: r.try_get(0)?,
+        size: r.try_get(1)?,
+        etag: r.try_get(2)?,
+        created_at: epoch(r.try_get(3)?),
+        parts: r.try_get(4)?,
+        part_ends: r.try_get(5)?,
+    };
+    meta_put(bucket, key, meta.clone());
+    Ok(Some(meta))
 }
 
 /// Serve `[start, end]` of an object. Spans up to ONESHOT_MAX take the fast
@@ -435,7 +438,7 @@ pub async fn meta(pool: &PgPool, bucket: &str, key: &str) -> Result<Option<Meta>
 /// buffer, no channel hop, no task; larger spans stream through in ordered
 /// parts.
 pub async fn get_body(
-    pool: PgPool,
+    pool: Pool,
     bucket: String,
     key: String,
     first: i64,
@@ -461,11 +464,10 @@ pub async fn get_body(
         let fetched = fetch_pieces(&pool, &pieces).await?;
         FETCH_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
         let mut out = BytesMut::with_capacity(smeta.len() as usize);
-        for (p, mut rows) in pieces.iter().zip(fetched) {
-            rows.sort_unstable_by_key(|(no, _)| *no);
-            for (no, data) in &rows {
-                if let Some(s) = row_slice(p.base, *no, data, start, end) {
-                    out.extend_from_slice(&s);
+        for (p, rows) in pieces.iter().zip(&fetched) {
+            for (no, row) in rows {
+                if let Some(s) = row_slice(p.base, *no, row.try_get(1)?, start, end) {
+                    out.extend_from_slice(s);
                 }
             }
         }
@@ -475,9 +477,9 @@ pub async fn get_body(
         SERVED.fetch_add(smeta.len() as u64, Relaxed);
         Ok(Some((smeta, PieceBody::OneShot(out.freeze()))))
     } else {
-        // Room for SPLIT_INFLIGHT parts of row pieces, so part fetches keep
+        // One buffer per part (<= 8 MiB); two queued keep part fetches
         // flowing while the body drains.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
         tokio::spawn(async move {
             if let Err(e) = stream_pass_through(&pool, &m, start, end, &tx).await {
                 let _ = tx.send(Err(io_err(e))).await;
@@ -520,18 +522,18 @@ fn plan(m: &Meta, start: i64, end: i64, step: usize) -> Vec<Piece> {
 }
 
 /// The part of row `no` of a segment at `base` inside object bytes `[start, end]`.
-fn row_slice(base: i64, no: i32, data: &Bytes, start: i64, end: i64) -> Option<Bytes> {
+fn row_slice(base: i64, no: i32, data: &[u8], start: i64, end: i64) -> Option<&[u8]> {
     let row_start = base + i64::from(no) * ROW_BYTES;
     let lo = start.max(row_start) - row_start;
     let hi = end.min(row_start + data.len() as i64 - 1) - row_start;
-    (hi >= lo).then(|| data.slice(lo as usize..=hi as usize))
+    (hi >= lo).then(|| &data[lo as usize..=hi as usize])
 }
 
 /// All pieces' rows, fetched SPLIT_INFLIGHT at a time, returned in piece order.
-async fn fetch_pieces(pool: &PgPool, pieces: &[Piece]) -> Result<Vec<Vec<(i32, Bytes)>>> {
-    let mut out = vec![Vec::new(); pieces.len()];
+async fn fetch_pieces(pool: &Pool, pieces: &[Piece]) -> Result<Vec<Vec<(i32, Row)>>> {
+    let mut out: Vec<Vec<(i32, Row)>> = (0..pieces.len()).map(|_| Vec::new()).collect();
     let mut fetched = futures::stream::iter(pieces.iter().copied().enumerate())
-        .map(|(i, p)| async move { fetch_part(pool, p.file_id, p.lo, p.hi).await.map(|rows| (i, rows)) })
+        .map(|(i, p)| async move { fetch_part(pool, p).await.map(|rows| (i, rows)) })
         .buffer_unordered(SPLIT_INFLIGHT);
     while let Some(r) = fetched.next().await {
         let (i, rows) = r?;
@@ -548,19 +550,23 @@ fn part_ranges(first_row: i32, last_row: i32, step: usize) -> impl Iterator<Item
         .map(move |lo| (lo, lo.saturating_add(step as i32 - 1).min(last_row)))
 }
 
-/// One contiguous row-range query on its own pool connection.
-async fn fetch_part(pool: &PgPool, file_id: i64, lo: i32, hi: i32) -> Result<Vec<(i32, Bytes)>> {
+/// One contiguous row-range query on its own pool connection (the prepared
+/// GET_RANGE_SQL), rows sorted by `no`. Each row's bytes stay in the
+/// connection's receive buffer until the caller copies them out.
+async fn fetch_part(pool: &Pool, p: Piece) -> Result<Vec<(i32, Row)>> {
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
-    let mut conn = pool.acquire().await?;
+    let conn = pool.get().await?;
     WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
     PARTS.fetch_add(1, Relaxed);
-    let got = sqlx::query(GET_RANGE_SQL).bind(file_id).bind(lo).bind(hi).fetch_all(&mut *conn).await?;
-    let mut out = Vec::with_capacity(got.len());
-    for r in got {
-        let raw = r.try_get_raw("data")?;
-        out.push((r.get("no"), Bytes::copy_from_slice(raw.as_bytes().unwrap_or(&[]))));
+    let rows = conn.query(conn.range(), &[&p.file_id, &p.lo, &p.hi]).await?;
+    drop(conn);
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push((r.try_get(0)?, r));
     }
+    // Bitmap heap scans return TID order, not `no` order.
+    out.sort_unstable_by_key(|(no, _)| *no);
     Ok(out)
 }
 
@@ -578,7 +584,7 @@ fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
 /// submission order (`buffered`); each piece is sorted locally (bitmap heap
 /// scans do not guarantee `no` order) and its edge rows sliced to the range.
 async fn stream_pass_through(
-    pool: &PgPool,
+    pool: &Pool,
     m: &Meta,
     start: i64,
     end: i64,
@@ -595,7 +601,7 @@ async fn stream_pass_through(
 }
 
 async fn stream_pass_inner(
-    pool: &PgPool,
+    pool: &Pool,
     m: &Meta,
     start: i64,
     end: i64,
@@ -606,24 +612,26 @@ async fn stream_pass_inner(
         None => (STREAM_PART_MAX_ROWS, 1), // A/B baseline: one query at a time
     };
     let mut parts = futures::stream::iter(plan(m, start, end, step))
-        .map(|p| async move { fetch_part(pool, p.file_id, p.lo, p.hi).await.map(|rows| (p, rows)) })
+        .map(|p| async move { fetch_part(pool, p).await.map(|rows| (p, rows)) })
         .buffered(inflight);
     while let Some(r) = parts.next().await {
-        let (p, mut rows) = r?;
-        rows.sort_unstable_by_key(|(no, _)| *no);
-        for (no, data) in rows {
-            if let Some(s) = row_slice(p.base, no, &data, start, end) {
-                if tx.send(Ok(s)).await.is_err() {
-                    return Ok(());
-                }
+        let (p, rows) = r?;
+        let mut buf = BytesMut::with_capacity(rows.len() * ROW_BYTES as usize);
+        for (no, row) in &rows {
+            if let Some(s) = row_slice(p.base, *no, row.try_get(1)?, start, end) {
+                buf.extend_from_slice(s);
             }
+        }
+        drop(rows);
+        if tx.send(Ok(buf.freeze())).await.is_err() {
+            return Ok(());
         }
     }
     Ok(())
 }
 
 /// Buffered variant (tests, bench floor).
-pub async fn get(pool: &PgPool, bucket: &str, key: &str, first: i64, last: i64, suffix: i64) -> Result<Option<Slice>> {
+pub async fn get(pool: &Pool, bucket: &str, key: &str, first: i64, last: i64, suffix: i64) -> Result<Option<Slice>> {
     let Some((meta, body)) =
         get_body(pool.clone(), bucket.to_owned(), key.to_owned(), first, last, suffix).await?
     else {
@@ -664,7 +672,7 @@ pub struct Slice {
 /// bench; the server streams request bodies through the same writer). The
 /// ETag is the caller's sha256 (idempotent retries); visibility is atomic via
 /// `publish`.
-pub async fn put(pool: &PgPool, bucket: &str, key: &str, data: &[u8], etag: &[u8]) -> Result<()> {
+pub async fn put(pool: &Pool, bucket: &str, key: &str, data: &[u8], etag: &[u8]) -> Result<()> {
     let writer = ChunkWriter::start(pool.clone()).await?;
     let file_id = writer.file_id;
     for chunk in data.chunks(SEND_BATCH) {
@@ -689,22 +697,23 @@ pub enum IngestMsg {
 }
 
 impl ChunkWriter {
-    pub async fn start(pool: PgPool) -> Result<Self> {
+    pub async fn start(pool: Pool) -> Result<Self> {
         Self::begin(pool, None).await
     }
 
     /// A multipart part: its rows and its `upload_parts` record commit in one
     /// transaction, so a part is either fully recorded or absent.
-    pub async fn start_part(pool: PgPool, upload_id: String, part_no: i32) -> Result<Self> {
+    pub async fn start_part(pool: Pool, upload_id: String, part_no: i32) -> Result<Self> {
         Self::begin(pool, Some((upload_id, part_no))).await
     }
 
-    async fn begin(pool: PgPool, part: Option<(String, i32)>) -> Result<Self> {
-        let file_id: i64 =
-            sqlx::query("SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))")
-                .fetch_one(&pool)
-                .await?
-                .get(0);
+    async fn begin(pool: Pool, part: Option<(String, i32)>) -> Result<Self> {
+        let file_id: i64 = pool
+            .get()
+            .await?
+            .query_typed_one("SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))", &[])
+            .await?
+            .try_get(0)?;
         let (tx, rx) = tokio::sync::mpsc::channel::<IngestMsg>(8);
         let done = tokio::spawn(ingest_writer(pool, file_id, part, rx));
         Ok(Self {
@@ -765,7 +774,7 @@ where
 }
 
 async fn ingest_writer(
-    pool: PgPool,
+    pool: Pool,
     file_id: i64,
     part: Option<(String, i32)>,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
@@ -774,13 +783,14 @@ async fn ingest_writer(
     // bounded channel backpressures the request body at COPY speed.
     let t0 = std::time::Instant::now();
 
-    let mut tx = pool.begin().await?;
-    let mut sink = tx.copy_in_raw(COPY_SQL).await?;
-    sink.send(&COPY_HEADER[..]).await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let mut sink = std::pin::pin!(tx.copy_in::<_, Bytes>(COPY_SQL).await?);
+    sink.send(Bytes::from_static(COPY_HEADER)).await?;
 
     let mut hasher = Sha256::new();
     let mut pending: Vec<u8> = Vec::with_capacity(ROW_BYTES as usize * (ROW_BATCH + 1));
-    let mut frame: Vec<u8> = Vec::with_capacity(SEND_BATCH);
+    let mut frame = BytesMut::with_capacity(SEND_BATCH);
     let mut next_no = 0i32;
     let mut total = 0i64;
     while let Some(msg) = rx.recv().await {
@@ -797,44 +807,41 @@ async fn ingest_writer(
             next_no += (whole / ROW_BYTES as usize) as i32;
             pending.drain(..whole);
             if frame.len() >= SEND_BATCH {
-                sink.send(&frame[..]).await?;
-                frame.clear();
+                sink.send(frame.split().freeze()).await?;
             }
         }
     }
     if !pending.is_empty() {
         frame_rows(file_id, next_no, &pending, &mut frame);
     }
-    frame.extend_from_slice(&COPY_TRAILER);
-    sink.send(&frame[..]).await?;
-    sink.finish().await?;
+    frame.extend_from_slice(COPY_TRAILER);
+    sink.send(frame.split().freeze()).await?;
+    sink.as_mut().finish().await?;
     let sum = hasher.finalize().to_vec();
     // A multipart part records itself in the same transaction as its rows; a
     // re-sent part replaces the earlier attempt, rows included. Unpublished
     // rows are invisible: objects appear atomically at publish / Complete.
     if let Some((upload_id, part_no)) = &part {
-        let old: Option<i64> = sqlx::query_scalar(
-            "DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2 RETURNING file_id",
-        )
-        .bind(upload_id)
-        .bind(part_no)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let old = tx
+            .query_typed_opt(
+                "DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2 RETURNING file_id",
+                &[(upload_id, Type::TEXT), (part_no, Type::INT4)],
+            )
+            .await?;
         if let Some(old) = old {
-            sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
-                .bind(old)
-                .execute(&mut *tx)
-                .await?;
+            let old: i64 = old.try_get(0)?;
+            tx.query_typed("DELETE FROM s3p.chunks WHERE file_id = $1", &[(&old, Type::INT8)]).await?;
         }
-        sqlx::query(
+        tx.query_typed(
             "INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256) VALUES ($1, $2, $3, $4, $5)",
+            &[
+                (upload_id, Type::TEXT),
+                (part_no, Type::INT4),
+                (&file_id, Type::INT8),
+                (&total, Type::INT8),
+                (&sum, Type::BYTEA),
+            ],
         )
-        .bind(upload_id)
-        .bind(part_no)
-        .bind(file_id)
-        .bind(total)
-        .bind(&sum)
-        .execute(&mut *tx)
         .await?;
     }
     tx.commit().await?;
@@ -849,15 +856,16 @@ async fn ingest_writer(
 /// Publish an object row: pointer-swap on overwrite (old rows reap after the
 /// swap), then refresh the meta cache. This is the visibility boundary.
 pub async fn publish(
-    pool: &PgPool,
+    pool: &Pool,
     bucket: &str,
     key: &str,
     file_id: i64,
     size: i64,
     etag: &[u8],
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    swap_object(&mut tx, bucket, key, file_id, size, etag, None).await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    swap_object(&tx, bucket, key, file_id, size, etag, None).await?;
     tx.commit().await?;
     publish_cache(bucket, key, file_id, size, etag, None);
     Ok(())
@@ -866,7 +874,7 @@ pub async fn publish(
 /// Point (bucket, key) at new storage inside `tx` and reap the storage of any
 /// object it replaces (all of its files: the single file or every part).
 async fn swap_object(
-    tx: &mut Transaction<'_, sqlx::Postgres>,
+    tx: &Transaction<'_>,
     bucket: &str,
     key: &str,
     file_id: i64,
@@ -874,40 +882,40 @@ async fn swap_object(
     etag: &[u8],
     parts: Option<(&[i64], &[i64])>,
 ) -> Result<()> {
-    let old = sqlx::query("SELECT file_id, parts FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE")
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&mut **tx)
+    let old = tx
+        .query_typed_opt(
+            "SELECT file_id, parts FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE",
+            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+        )
         .await?;
-    sqlx::query(
+    let (ids, ends) = parts.unzip();
+    tx.query_typed(
         "INSERT INTO s3p.objects (bucket, key, file_id, size, etag, parts, part_ends) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size, \
            etag = EXCLUDED.etag, parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, created_at = now()",
+        &[
+            (&bucket, Type::TEXT),
+            (&key, Type::TEXT),
+            (&file_id, Type::INT8),
+            (&size, Type::INT8),
+            (&etag, Type::BYTEA),
+            (&ids, Type::INT8_ARRAY),
+            (&ends, Type::INT8_ARRAY),
+        ],
     )
-    .bind(bucket)
-    .bind(key)
-    .bind(file_id)
-    .bind(size)
-    .bind(etag)
-    .bind(parts.map(|(ids, _)| ids))
-    .bind(parts.map(|(_, ends)| ends))
-    .execute(&mut **tx)
     .await?;
     if let Some(r) = old {
-        reap(tx, r.get("file_id"), r.get("parts")).await?;
+        reap(tx, r.try_get(0)?, r.try_get(1)?).await?;
     }
     Ok(())
 }
 
 /// Delete every chunk row of an unpublished object's files.
-async fn reap(tx: &mut Transaction<'_, sqlx::Postgres>, file_id: i64, parts: Option<Vec<i64>>) -> Result<()> {
+async fn reap(tx: &Transaction<'_>, file_id: i64, parts: Option<Vec<i64>>) -> Result<()> {
     let mut dead = parts.unwrap_or_default();
     dead.push(file_id);
-    sqlx::query("DELETE FROM s3p.chunks WHERE file_id = ANY($1)")
-        .bind(&dead)
-        .execute(&mut **tx)
-        .await?;
+    tx.query_typed("DELETE FROM s3p.chunks WHERE file_id = ANY($1)", &[(&dead, Type::INT8_ARRAY)]).await?;
     Ok(())
 }
 
@@ -928,7 +936,7 @@ fn publish_cache(bucket: &str, key: &str, file_id: i64, size: i64, etag: &[u8], 
 }
 
 /// Binary COPY framing: stream header once per stream, then row tuples.
-fn frame_rows(file_id: i64, first_no: i32, data: &[u8], out: &mut Vec<u8>) {
+fn frame_rows(file_id: i64, first_no: i32, data: &[u8], out: &mut BytesMut) {
     let nrows = data.len().div_ceil(ROW_BYTES as usize);
     for i in 0..nrows {
         let start = i * ROW_BYTES as usize;
@@ -943,16 +951,18 @@ fn frame_rows(file_id: i64, first_no: i32, data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-pub async fn delete(pool: &PgPool, bucket: &str, key: &str) -> Result<bool> {
-    let mut tx = pool.begin().await?;
-    let old = sqlx::query("DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id, parts")
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&mut *tx)
+pub async fn delete(pool: &Pool, bucket: &str, key: &str) -> Result<bool> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let old = tx
+        .query_typed_opt(
+            "DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id, parts",
+            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+        )
         .await?;
     let found = old.is_some();
     if let Some(r) = old {
-        reap(&mut tx, r.get("file_id"), r.get("parts")).await?;
+        reap(&tx, r.try_get(0)?, r.try_get(1)?).await?;
     }
     tx.commit().await?;
     meta_invalidate(bucket, key);
@@ -960,21 +970,24 @@ pub async fn delete(pool: &PgPool, bucket: &str, key: &str) -> Result<bool> {
 }
 
 /// Start (or re-attach, for a retried Create) the multipart upload of a key.
-pub async fn create_upload(pool: &PgPool, bucket: &str, key: &str) -> Result<String> {
-    Ok(sqlx::query_scalar(
-        "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) \
-         ON CONFLICT (bucket, key) DO UPDATE SET bucket = EXCLUDED.bucket RETURNING upload_id",
-    )
-    .bind(bucket)
-    .bind(key)
-    .fetch_one(pool)
-    .await?)
+pub async fn create_upload(pool: &Pool, bucket: &str, key: &str) -> Result<String> {
+    Ok(pool
+        .get()
+        .await?
+        .query_typed_one(
+            "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) \
+             ON CONFLICT (bucket, key) DO UPDATE SET bucket = EXCLUDED.bucket RETURNING upload_id",
+            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+        )
+        .await?
+        .try_get(0)?)
 }
 
-pub async fn upload_exists(pool: &PgPool, upload_id: &str) -> Result<bool> {
-    Ok(sqlx::query("SELECT 1 FROM s3p.uploads WHERE upload_id = $1")
-        .bind(upload_id)
-        .fetch_optional(pool)
+pub async fn upload_exists(pool: &Pool, upload_id: &str) -> Result<bool> {
+    Ok(pool
+        .get()
+        .await?
+        .query_typed_opt("SELECT 1 FROM s3p.uploads WHERE upload_id = $1", &[(&upload_id, Type::TEXT)])
         .await?
         .is_some())
 }
@@ -988,22 +1001,25 @@ pub enum Completed {
 /// Complete: every recorded part listed exactly once with a matching ETag (any
 /// listing order), then the object publishes as its ordered part files. No
 /// data moves. ETag = sha256 over the part sha256s (S3's hash-of-part-hashes).
-pub async fn complete_upload(pool: &PgPool, upload_id: &str, listed: &[(i32, String)]) -> Result<Completed> {
-    let mut tx = pool.begin().await?;
-    let Some(up) = sqlx::query("SELECT bucket, key FROM s3p.uploads WHERE upload_id = $1 FOR UPDATE")
-        .bind(upload_id)
-        .fetch_optional(&mut *tx)
+pub async fn complete_upload(pool: &Pool, upload_id: &str, listed: &[(i32, String)]) -> Result<Completed> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let Some(up) = tx
+        .query_typed_opt(
+            "SELECT bucket, key FROM s3p.uploads WHERE upload_id = $1 FOR UPDATE",
+            &[(&upload_id, Type::TEXT)],
+        )
         .await?
     else {
         return Ok(Completed::NoSuchUpload);
     };
-    let (bucket, key): (String, String) = (up.get("bucket"), up.get("key"));
-    let rows = sqlx::query(
-        "SELECT part_no, file_id, size, sha256 FROM s3p.upload_parts WHERE upload_id = $1 ORDER BY part_no",
-    )
-    .bind(upload_id)
-    .fetch_all(&mut *tx)
-    .await?;
+    let (bucket, key): (String, String) = (up.try_get(0)?, up.try_get(1)?);
+    let rows = tx
+        .query_typed(
+            "SELECT part_no, file_id, size, sha256 FROM s3p.upload_parts WHERE upload_id = $1 ORDER BY part_no",
+            &[(&upload_id, Type::TEXT)],
+        )
+        .await?;
     let mut want: Vec<&(i32, String)> = listed.iter().collect();
     want.sort_by_key(|(no, _)| *no);
     if want.is_empty() || want.len() != rows.len() {
@@ -1012,41 +1028,36 @@ pub async fn complete_upload(pool: &PgPool, upload_id: &str, listed: &[(i32, Str
     let (mut ids, mut ends, mut size) = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), 0i64);
     let mut hasher = Sha256::new();
     for (p, r) in want.iter().zip(&rows) {
-        let sha: Vec<u8> = r.get("sha256");
-        if p.0 != r.get::<i32, _>("part_no") || p.1 != hex(&sha) {
+        let sha: Vec<u8> = r.try_get(3)?;
+        if p.0 != r.try_get::<_, i32>(0)? || p.1 != hex(&sha) {
             return Ok(Completed::InvalidPart);
         }
         hasher.update(&sha);
-        size += r.get::<i64, _>("size");
-        ids.push(r.get::<i64, _>("file_id"));
+        size += r.try_get::<_, i64>(2)?;
+        ids.push(r.try_get::<_, i64>(1)?);
         ends.push(size);
     }
     let etag = hasher.finalize().to_vec();
-    swap_object(&mut tx, &bucket, &key, ids[0], size, &etag, Some((&ids, &ends))).await?;
-    sqlx::query("DELETE FROM s3p.uploads WHERE upload_id = $1")
-        .bind(upload_id)
-        .execute(&mut *tx)
-        .await?;
+    swap_object(&tx, &bucket, &key, ids[0], size, &etag, Some((&ids, &ends))).await?;
+    tx.query_typed("DELETE FROM s3p.uploads WHERE upload_id = $1", &[(&upload_id, Type::TEXT)]).await?;
     tx.commit().await?;
     publish_cache(&bucket, &key, ids[0], size, &etag, Some((ids, ends)));
     Ok(Completed::Done { bucket, key, etag, size })
 }
 
 /// Drop a multipart upload and the rows of every part it recorded.
-pub async fn abort_upload(pool: &PgPool, upload_id: &str) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    let ids: Vec<i64> = sqlx::query_scalar("SELECT file_id FROM s3p.upload_parts WHERE upload_id = $1")
-        .bind(upload_id)
-        .fetch_all(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM s3p.uploads WHERE upload_id = $1")
-        .bind(upload_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM s3p.chunks WHERE file_id = ANY($1)")
-        .bind(&ids)
-        .execute(&mut *tx)
-        .await?;
+pub async fn abort_upload(pool: &Pool, upload_id: &str) -> Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let mut ids: Vec<i64> = Vec::new();
+    for r in tx
+        .query_typed("SELECT file_id FROM s3p.upload_parts WHERE upload_id = $1", &[(&upload_id, Type::TEXT)])
+        .await?
+    {
+        ids.push(r.try_get(0)?);
+    }
+    tx.query_typed("DELETE FROM s3p.uploads WHERE upload_id = $1", &[(&upload_id, Type::TEXT)]).await?;
+    tx.query_typed("DELETE FROM s3p.chunks WHERE file_id = ANY($1)", &[(&ids, Type::INT8_ARRAY)]).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1080,56 +1091,62 @@ fn orphans_sql(partition: &str) -> String {
 /// Scans ids in [from, horizon); returns (files, rows, horizon) so the caller
 /// resumes there. Interrupted writes of every other kind are single
 /// transactions and leave nothing behind.
-pub async fn sweep_orphans(pool: &PgPool, grace: Duration, from: i64) -> Result<(usize, u64, i64)> {
-    let horizon: Option<i64> = sqlx::query_scalar(
-        "SELECT max(file_id) FROM s3p.objects WHERE created_at < now() - make_interval(secs => $1)",
-    )
-    .bind(grace.as_secs_f64())
-    .fetch_one(pool)
-    .await?;
+pub async fn sweep_orphans(pool: &Pool, grace: Duration, from: i64) -> Result<(usize, u64, i64)> {
+    let mut conn = pool.get().await?;
+    let horizon: Option<i64> = conn
+        .query_typed_one(
+            "SELECT max(file_id) FROM s3p.objects WHERE created_at < now() - make_interval(secs => $1)",
+            &[(&grace.as_secs_f64(), Type::FLOAT8)],
+        )
+        .await?
+        .try_get(0)?;
     let horizon = match horizon {
         Some(h) if h > from => h,
         _ => return Ok((0, 0, from)),
     };
     // Partition names come from the catalog (regclass text, already quoted).
-    let partitions: Vec<String> =
-        sqlx::query_scalar("SELECT relid::regclass::text FROM pg_partition_tree('s3p.chunks') WHERE isleaf")
-            .fetch_all(pool)
-            .await?;
-    let mut tx = pool.begin().await?;
+    let mut partitions: Vec<String> = Vec::new();
+    for r in conn
+        .query_typed("SELECT relid::regclass::text FROM pg_partition_tree('s3p.chunks') WHERE isleaf", &[])
+        .await?
+    {
+        partitions.push(r.try_get(0)?);
+    }
+    let tx = conn.transaction().await?;
     // The loose scan wants index probes; gateway sessions default to bitmaps.
-    sqlx::query("SET LOCAL enable_indexscan = on").execute(&mut *tx).await?;
+    tx.batch_execute("SET LOCAL enable_indexscan = on").await?;
     let mut orphans: Vec<i64> = Vec::new();
     for partition in &partitions {
-        let sql = orphans_sql(partition);
-        let found: Vec<i64> = sqlx::query_scalar(&sql)
-            .bind(from)
-            .bind(horizon)
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await?;
-        orphans.extend(found);
+        for r in tx
+            .query_typed(&orphans_sql(partition), &[(&from, Type::INT8), (&horizon, Type::INT8)])
+            .await?
+        {
+            orphans.push(r.try_get(0)?);
+        }
     }
     tx.commit().await?;
     let mut rows = 0;
     for id in &orphans {
-        rows += sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?
-            .rows_affected();
+        rows += conn.execute("DELETE FROM s3p.chunks WHERE file_id = $1", &[id]).await?;
     }
     Ok((orphans.len(), rows, horizon))
 }
 
 /// Abort uploads abandoned for longer than `age` (S3's incomplete-upload
 /// lifecycle): their parts are committed rows, so something must reap them.
-pub async fn expire_uploads(pool: &PgPool, age: Duration) -> Result<usize> {
-    let ids: Vec<String> =
-        sqlx::query_scalar("SELECT upload_id FROM s3p.uploads WHERE created_at < now() - make_interval(secs => $1)")
-            .bind(age.as_secs_f64())
-            .fetch_all(pool)
-            .await?;
+pub async fn expire_uploads(pool: &Pool, age: Duration) -> Result<usize> {
+    let mut ids: Vec<String> = Vec::new();
+    for r in pool
+        .get()
+        .await?
+        .query_typed(
+            "SELECT upload_id FROM s3p.uploads WHERE created_at < now() - make_interval(secs => $1)",
+            &[(&age.as_secs_f64(), Type::FLOAT8)],
+        )
+        .await?
+    {
+        ids.push(r.try_get(0)?);
+    }
     for id in &ids {
         abort_upload(pool, id).await?;
     }
@@ -1147,65 +1164,77 @@ pub struct Listed {
 /// Key-ordered listing in `[prefix, prefix_end)` (byte order); `after` is
 /// exclusive.
 pub async fn list(
-    pool: &PgPool,
+    pool: &Pool,
     bucket: &str,
     prefix: &str,
     prefix_end: &str,
     after: &str,
     limit: i64,
 ) -> Result<Vec<Listed>> {
-    let rows = sqlx::query(
-        "SELECT key, size, etag, EXTRACT(EPOCH FROM created_at)::float8 AS created_epoch \
-         FROM s3p.objects \
-         WHERE bucket = $1 AND key COLLATE \"C\" >= $2 AND key COLLATE \"C\" < $3 \
-           AND key COLLATE \"C\" > $4 \
-         ORDER BY key COLLATE \"C\" LIMIT $5",
-    )
-    .bind(bucket)
-    .bind(prefix)
-    .bind(prefix_end)
-    .bind(after)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| Listed {
-            key: r.get("key"),
-            size: r.get("size"),
-            etag: r.get("etag"),
-            created_at: epoch(r.get::<f64, _>("created_epoch")),
-        })
-        .collect())
-}
-
-pub async fn buckets(pool: &PgPool) -> Result<Vec<String>> {
-    let rows = sqlx::query("SELECT DISTINCT bucket FROM s3p.objects ORDER BY bucket")
-        .fetch_all(pool)
+    let rows = pool
+        .get()
+        .await?
+        .query_typed(
+            "SELECT key, size, etag, EXTRACT(EPOCH FROM created_at)::float8 \
+             FROM s3p.objects \
+             WHERE bucket = $1 AND key COLLATE \"C\" >= $2 AND key COLLATE \"C\" < $3 \
+               AND key COLLATE \"C\" > $4 \
+             ORDER BY key COLLATE \"C\" LIMIT $5",
+            &[
+                (&bucket, Type::TEXT),
+                (&prefix, Type::TEXT),
+                (&prefix_end, Type::TEXT),
+                (&after, Type::TEXT),
+                (&limit, Type::INT8),
+            ],
+        )
         .await?;
-    Ok(rows.into_iter().map(|r| r.get::<String, _>("bucket")).collect())
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(Listed {
+            key: r.try_get(0)?,
+            size: r.try_get(1)?,
+            etag: r.try_get(2)?,
+            created_at: epoch(r.try_get(3)?),
+        });
+    }
+    Ok(out)
 }
 
-/// `(logical_bytes, physical_bytes)` over objects + chunks (tables + indexes).
-pub async fn sizes(pool: &PgPool) -> Result<(i64, i64)> {
-    let row = sqlx::query(
-        "SELECT (SELECT COALESCE(sum(size), 0)::int8 FROM s3p.objects) AS logical, \
-                pg_total_relation_size('s3p.objects') + pg_total_relation_size('s3p.chunks') AS physical, \
-                (SELECT count(*) FROM s3p.objects) AS n_objects, \
-                (SELECT count(*) FROM s3p.chunks) AS n_chunks, \
-                pg_database_size(current_database()) AS db_size",
-    )
-    .fetch_one(pool)
-    .await?;
-    let logical: i64 = row.get("logical");
-    let physical: i64 = row.get("physical");
+pub async fn buckets(pool: &Pool) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for r in pool.get().await?.query_typed("SELECT DISTINCT bucket FROM s3p.objects ORDER BY bucket", &[]).await? {
+        out.push(r.try_get(0)?);
+    }
+    Ok(out)
+}
+
+/// `(logical_bytes, physical_bytes)` over objects + chunks (tables + indexes;
+/// the chunk partitions, as the partitioned parent has no storage).
+pub async fn sizes(pool: &Pool) -> Result<(i64, i64)> {
+    let row = pool
+        .get()
+        .await?
+        .query_typed_one(
+            "SELECT (SELECT COALESCE(sum(size), 0)::int8 FROM s3p.objects), \
+                    pg_total_relation_size('s3p.objects') \
+                      + (SELECT COALESCE(sum(pg_total_relation_size(relid)), 0)::int8 \
+                         FROM pg_partition_tree('s3p.chunks')), \
+                    (SELECT count(*) FROM s3p.objects), \
+                    (SELECT count(*) FROM s3p.chunks), \
+                    pg_database_size(current_database())",
+            &[],
+        )
+        .await?;
+    let logical: i64 = row.try_get(0)?;
+    let physical: i64 = row.try_get(1)?;
     println!(
         "objects={} chunks={} logical={} MiB physical={} MiB db={} MiB overhead={:.2}%",
-        row.get::<i64, _>("n_objects"),
-        row.get::<i64, _>("n_chunks"),
+        row.try_get::<_, i64>(2)?,
+        row.try_get::<_, i64>(3)?,
         logical / 1024 / 1024,
         physical / 1024 / 1024,
-        row.get::<i64, _>("db_size") / 1024 / 1024,
+        row.try_get::<_, i64>(4)? / 1024 / 1024,
         (physical as f64 / logical.max(1) as f64 - 1.0) * 100.0,
     );
     Ok((logical, physical))

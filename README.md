@@ -117,7 +117,12 @@ Range GETs (p50, conc=1):
 | 8 MiB | 8.9 ms (1.0 GB/s) | 15.4 ms (519 MB/s) | — | — |
 
 - The proxy adds **~0.1–0.2 ms** over the raw-PG floor in every environment;
-  everything else is storage latency (Aurora ≈ 2.1 ms RTT per round trip).
+  everything else is storage latency: one Aurora round trip (`SELECT 1` over
+  TLS) is 0.87 ms from the rig, whose EC2 sits in another AZ than the writer.
+- **Connections are handed out most recently used first** (`src/pg.rs`): a TCP
+  sender restarts slow start on a connection idle past its RTO (≥ 200 ms), so a
+  FIFO pool gives every request its coldest connection — a 64 KiB fetch took
+  1.18 ms on a hot connection vs 2.17 ms after 300 ms idle.
 - **Bitmap heap scans (the default) are load-bearing on cold reads**: scattered
   8 KB page fetches become PG18 async read-stream prefetches — 5× on cold
   >RAM ranges, no warm cost. Opt out with `PGVS3_INDEXSCAN=1`.

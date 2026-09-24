@@ -17,7 +17,6 @@ use s3s::dto::{
 };
 use s3s::service::S3ServiceBuilder;
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
-use sqlx::PgPool;
 
 use crate::db;
 
@@ -25,7 +24,7 @@ use crate::db;
 /// any gateway instance can serve any request of any upload.
 #[derive(Clone)]
 pub struct PgS3 {
-    pool: PgPool,
+    pool: db::Pool,
 }
 
 fn etag(raw: &[u8]) -> Option<ETag> {
@@ -375,7 +374,7 @@ pub struct ServeConfig {
     pub secret_key: String,
 }
 
-pub async fn serve(pool: PgPool, cfg: ServeConfig) -> Result<()> {
+pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
     // Keep the chunk index hot while it is small beside shared_buffers (see
     // db::prewarm_index). Best-effort, in the background.
     let warm = pool.clone();
