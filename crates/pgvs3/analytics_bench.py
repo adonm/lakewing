@@ -56,7 +56,18 @@ def load_queries(bench: str) -> list[str]:
     return ["\n".join(q).strip() for q in queries]
 
 
-def download_click(src: str) -> None:
+def download_click(src: str, parts: int) -> None:
+    if parts:  # fast loop: 1% slices of the canonical data (typed like it too)
+        os.makedirs(src, exist_ok=True)
+        for i in range(parts):
+            dest = os.path.join(src, f"hits_{i}.parquet")
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                continue
+            print(f"fetch hits_{i}.parquet")
+            subprocess.run(["curl", "-fsL", "-o", dest,
+                            f"{CLICK_URL.rsplit('/', 1)[0]}/athena_partitioned/hits_{i}.parquet"],
+                           check=True)
+        return
     dest = os.path.join(src, "hits.parquet")
     if os.path.exists(dest) and os.path.getsize(dest) == CLICK_BYTES:
         return
@@ -81,9 +92,11 @@ def download_spatial(src: str, sf: float) -> None:
         subprocess.run(["curl", "-fsL", "-o", dest, f"{HF_DL}/{rel}"], check=True)
 
 
-def src_glob(bench: str, src: str, sf: float, table: str) -> str:
+def src_glob(bench: str, src: str, sf: float, table: str, parts: int) -> str:
     if bench == "click":
-        return os.path.join(src, "hits*.parquet")  # full file or gate sample
+        # exact file for the full run; numbered slices for --parts (kept
+        # disjoint so both can share a source dir)
+        return os.path.join(src, "hits_[0-9]*.parquet" if parts else "hits.parquet")
     return os.path.join(src, f"sf{sf:g}", table, "*.parquet")
 
 
@@ -97,15 +110,15 @@ CLICK_SELECT = """* REPLACE (
     epoch_ms(LocalEventTime * 1000) AS LocalEventTime)"""
 
 
-def load(con, stack: str, bench: str, src: str, sf: float) -> tuple[float, dict]:
+def load(con, stack: str, bench: str, src: str, sf: float, parts: int) -> tuple[float, dict]:
     tables = CLICK_TABLES if bench == "click" else SPATIAL_TABLES
     t0 = __import__("time").perf_counter()
     rows = {}
     for t in tables:
         dest = f"lake.{t}" if stack != "plain" else f"main.{t}"
         sel = CLICK_SELECT if bench == "click" else "*"
-        rd = (f"read_parquet('{src_glob(bench, src, sf, t)}', binary_as_string=True)"
-              if bench == "click" else f"read_parquet('{src_glob(bench, src, sf, t)}')")
+        rd = (f"read_parquet('{src_glob(bench, src, sf, t, parts)}', binary_as_string=True)"
+              if bench == "click" else f"read_parquet('{src_glob(bench, src, sf, t, parts)}')")
         con.sql(f"DROP TABLE IF EXISTS {dest}")
         con.sql(f"CREATE TABLE {dest} AS SELECT {sel} FROM {rd}")
         rows[t] = con.sql(f"SELECT count(*) FROM {dest}").fetchone()[0]
@@ -135,6 +148,8 @@ def main() -> None:
     ap.add_argument("--load", action="store_true", help="load source parquet before querying")
     ap.add_argument("--views-only", action="store_true", help="skip load; just make main views over lake")
     ap.add_argument("--passes", type=int, default=2)
+    ap.add_argument("--parts", type=int, default=0,
+                    help="clickbench fast loop: load N of the 100 1%% slices (0 = full hits.parquet)")
     ap.add_argument("--queries", default=None, help="range like 1-43 (default: all)")
     ap.add_argument("--query-timeout", type=float, default=0, help="per-query seconds (0 = unlimited)")
     ap.add_argument("--src-dir", default=None)
@@ -162,7 +177,8 @@ def main() -> None:
     lo, hi = int(lo), int(hi or lo)
 
     if args.download:
-        download_click(args.src_dir) if bench == "click" else download_spatial(args.src_dir, args.sf)
+        (download_click(args.src_dir, args.parts) if bench == "click"
+         else download_spatial(args.src_dir, args.sf))
 
     con = benchlib.connect(args.stack, args, extensions=("spatial",) if bench == "spatial" else ())
     record = {"bench": bench, "stack": args.stack, "duckdb": duckdb.__version__, "passes": []}
@@ -172,7 +188,7 @@ def main() -> None:
         for t in (CLICK_TABLES if bench == "click" else SPATIAL_TABLES):
             con.sql(f"CREATE OR REPLACE VIEW main.{t} AS SELECT * FROM lake.{t}")
     elif args.load:
-        record["load_s"], record["rows"] = load(con, args.stack, bench, args.src_dir, args.sf)
+        record["load_s"], record["rows"] = load(con, args.stack, bench, args.src_dir, args.sf, args.parts)
         print(f"[{args.stack}] load: {record['load_s']}s rows={record['rows']}")
 
     for p in range(args.passes):
