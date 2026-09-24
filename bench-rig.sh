@@ -217,7 +217,7 @@ micro)
   # loaded objects (sizes x concurrency), plus the direct-PostgreSQL floor.
   gw_start
   ./target/release/pgvs3 --url "$BASE" bench --endpoint http://127.0.0.1:8014 --bucket lake \
-    --requests 2000 --sizes 65536,262144,1048576,8388608 --concurrency 1,8,32 2>&1 | tee bench-out/micro.txt
+    --requests 2000 --sizes 65536,262144,1048576,8388608,67108864 --concurrency 1,8,32 2>&1 | tee bench-out/micro.txt
   echo "--- micro stats:"
   curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
     http://127.0.0.1:8014/_pgvs3/stats || true

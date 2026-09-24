@@ -55,19 +55,22 @@ fn store(cfg: &BenchConfig) -> Result<Arc<dyn ObjectStore>> {
     ))
 }
 
-fn stats(label: &str, mut v: Vec<Duration>, bytes: usize) {
+/// Latency percentiles plus aggregate throughput over the wall-clock of the
+/// whole (concurrent) run: MiB/s and requests/s across all tasks.
+fn stats(label: &str, mut v: Vec<Duration>, bytes: usize, wall: Duration) {
     v.sort_unstable();
     let at = |p: f64| v[(((v.len() - 1) as f64) * p) as usize].as_secs_f64() * 1e3;
-    let total_s: f64 = v.iter().map(|d| d.as_secs_f64()).sum();
+    let wall_s = wall.as_secs_f64().max(1e-9);
     let mib = (bytes * v.len()) as f64 / 1024.0 / 1024.0;
     println!(
-        "{label:<28} n={:<5} p50={:>7.2}ms p95={:>7.2}ms p99={:>7.2}ms max={:>7.2}ms thr={:>8.0} MiB/s",
+        "{label:<28} n={:<5} p50={:>7.2}ms p95={:>7.2}ms p99={:>7.2}ms max={:>7.2}ms agg={:>6.0} MiB/s {:>7.0} req/s",
         v.len(),
         at(0.50),
         at(0.95),
         at(0.99),
         at(1.0),
-        mib / total_s.max(1e-9)
+        mib / wall_s,
+        v.len() as f64 / wall_s
     );
 }
 
@@ -158,18 +161,28 @@ pub async fn run(cfg: BenchConfig) -> Result<()> {
     for conc in &cfg.concurrency {
         let conc = *conc;
         let per_task = cfg.requests.div_ceil(conc.max(1));
+        let t0 = Instant::now();
         let lat = load(conc, per_task, 0, cfg.clone_fields(), keys.clone(), head_op.clone()).await?;
-        stats(&format!("HEAD conc={conc}"), lat, 0);
+        stats(&format!("HEAD conc={conc}"), lat, 0, t0.elapsed());
     }
 
     for size in &cfg.sizes {
         let size = *size;
+        // Only objects at least this large: a read clamped at EOF would count
+        // as a full one.
+        let fit: Vec<(String, u64)> = keys.iter().filter(|(_, s)| *s >= size as u64).cloned().collect();
+        if fit.is_empty() {
+            println!("GET {size}B: no sampled object that large, skipped");
+            continue;
+        }
         for conc in &cfg.concurrency {
             let conc = *conc;
-            let n = if size >= 4 * 1024 * 1024 { cfg.requests / 5 } else { cfg.requests };
+            // Above 1 MiB, about the same bytes per size; at least one per task.
+            let n = (cfg.requests * (1 << 20) / size.max(1 << 20)).max(conc);
             let per_task = n.div_ceil(conc.max(1));
-            let lat = load(conc, per_task, size, cfg.clone_fields(), keys.clone(), get_op(size)).await?;
-            stats(&format!("GET {size}B conc={conc}"), lat, size);
+            let t0 = Instant::now();
+            let lat = load(conc, per_task, size, cfg.clone_fields(), fit.clone(), get_op(size)).await?;
+            stats(&format!("GET {size}B conc={conc}"), lat, size, t0.elapsed());
         }
     }
 
@@ -188,14 +201,16 @@ pub async fn run(cfg: BenchConfig) -> Result<()> {
             Ok(t0.elapsed())
         })
     });
+    let t0 = Instant::now();
     let lat = load(1, 100, 0, cfg.clone_fields(), keys.clone(), list_op).await?;
-    stats("LIST page<=1000", lat, 0);
+    stats("LIST page<=1000", lat, 0, t0.elapsed());
 
     // Raw PostgreSQL floor: the gateway's single-trip query minus HTTP/SigV4.
     let pool = db::connect(&cfg.pg_url).await?;
     let (key0, size0) = keys[0].clone();
     let mut filler = Filler::new(42);
     let mut lat = Vec::with_capacity(2000);
+    let t_floor = Instant::now();
     for _ in 0..2000 {
         let len = 262144i64.min(size0 as i64);
         let max_off = (size0 as i64 - len).max(0) / 4096;
@@ -207,7 +222,7 @@ pub async fn run(cfg: BenchConfig) -> Result<()> {
         }
         lat.push(t0.elapsed());
     }
-    stats("PG floor 256KiB", lat, 262144);
+    stats("PG floor 256KiB", lat, 262144, t_floor.elapsed());
 
     Ok(())
 }
