@@ -4,9 +4,13 @@ The absolute-fastest S3-compatible object store on PostgreSQL: the storage
 layer under **DuckLake 2.0+** (catalog in PostgreSQL, data files on `s3://`
 served by this gateway from PostgreSQL byte rows).
 
-One object = one `s3p.objects` row + fixed-size `s3p.chunks` rows. Read ranges
-are served by a **single SQL round trip** that streams exactly the requested
-bytes; fully covered rows return verbatim, edge rows slice by memcpy.
+One object = one `s3p.objects` row + fixed-size `s3p.chunks` rows. A multipart
+object is the ordered list of its part files: every part streams into its own
+COPY the moment it arrives (in parallel, no staging), upload state lives in
+PostgreSQL so any gateway can take any part, and Complete only publishes. Read
+ranges are contiguous row-range queries (one per part file touched, fetched in
+parallel) that stream exactly the requested bytes; fully covered rows return
+verbatim, edge rows slice by memcpy.
 
 Implemented with [`s3s`](https://crates.io/crates/s3s) (REST + SigV4 + hyper):
 `HEAD`, `GET`(+`Range`, suffix ranges), `PUT`, `DELETE`, `ListObjectsV2`,

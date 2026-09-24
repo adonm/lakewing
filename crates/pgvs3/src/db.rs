@@ -12,17 +12,18 @@
 //! concurrency (many GETs already in flight) smaller parts measured no gain
 //! and 512 KiB parts hurt, so only big spans fan out.
 //!
-//! Write path: deliberately single-threaded per process — one binary COPY
-//! stream at a time (a global flush permit), rows cut across multipart part
-//! boundaries. Aurora's write ceiling is ~150 MiB/s regardless of stream
-//! count, so write parallelism buys latency-per-file at the price of every
-//! byte of machinery; instead each flush takes the whole pipe and the rest
-//! queue. The object row is published last, so objects appear atomically.
+//! Write path: every PUT and every multipart part streams straight into its
+//! own binary COPY on its own connection as it arrives: no staging, no global
+//! write lock (Performance Insights showed the old serialized design leaving
+//! Aurora idle, its one COPY session 100% Client:ClientRead, and its RAM
+//! staging deadlocked at full scale). A multipart object is the ordered list
+//! of its part files (objects.parts/part_ends); upload state lives in Aurora
+//! (s3p.uploads/upload_parts), so any gateway can take any part and Complete
+//! only validates and publishes. Objects appear atomically at publish.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::task::Context;
 use std::time::{Duration, SystemTime};
 
@@ -146,6 +147,30 @@ pub struct Meta {
     pub etag: Vec<u8>,
     pub created_at: SystemTime,
     pub file_id: i64,
+    /// Multipart objects: part file_ids in order and cumulative end offsets.
+    /// None = one file (`file_id`) holds all `size` bytes.
+    pub parts: Option<Vec<i64>>,
+    pub part_ends: Option<Vec<i64>>,
+}
+
+impl Meta {
+    /// `(file_id, object byte offset, length)` of each stored segment.
+    fn segments(&self) -> Vec<(i64, i64, i64)> {
+        match (&self.parts, &self.part_ends) {
+            (Some(ids), Some(ends)) if ids.len() == ends.len() => {
+                let mut prev = 0;
+                ids.iter()
+                    .zip(ends)
+                    .map(|(&id, &end)| {
+                        let seg = (id, prev, end - prev);
+                        prev = end;
+                        seg
+                    })
+                    .collect()
+            }
+            _ => vec![(self.file_id, 0, self.size)],
+        }
+    }
 }
 
 /// Everything but the body of a served range: `[start, end]` inclusive.
@@ -284,7 +309,8 @@ pub async fn meta(pool: &PgPool, bucket: &str, key: &str) -> Result<Option<Meta>
         return Ok(Some(m.clone()));
     }
     let row = sqlx::query(
-        "SELECT file_id, size, etag, EXTRACT(EPOCH FROM created_at)::float8 AS created_epoch \
+        "SELECT file_id, size, etag, EXTRACT(EPOCH FROM created_at)::float8 AS created_epoch, \
+                parts, part_ends \
          FROM s3p.objects WHERE bucket = $1 AND key = $2",
     )
     .bind(bucket)
@@ -296,25 +322,13 @@ pub async fn meta(pool: &PgPool, bucket: &str, key: &str) -> Result<Option<Meta>
         size: r.get("size"),
         etag: r.get("etag"),
         created_at: epoch(r.get::<f64, _>("created_epoch")),
+        parts: r.get("parts"),
+        part_ends: r.get("part_ends"),
     });
     if let Some(m) = &meta {
         meta_put(bucket, key, m.clone());
     }
     Ok(meta)
-}
-
-/// One object row (no caching of the row itself: callers manage that).
-async fn object_row(
-    tx: &mut Transaction<'_, sqlx::Postgres>,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<i64>> {
-    Ok(sqlx::query("SELECT file_id FROM s3p.objects WHERE bucket = $1 AND key = $2")
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(|r| r.get("file_id")))
 }
 
 /// Serve `[start, end]` of an object. Spans up to ONESHOT_MAX take the fast
@@ -339,23 +353,21 @@ pub async fn get_body(
         start,
         end,
     };
-    let first_row = (start / ROW_BYTES) as i32;
-    let last_row = (end / ROW_BYTES) as i32;
-    let nrows = (last_row - first_row + 1) as usize;
     SPANS[span_bucket(smeta.len() as usize)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if (smeta.len() as usize) <= ONESHOT_MAX {
         use std::sync::atomic::Ordering::Relaxed;
         let t0 = std::time::Instant::now();
-        let rows = gather_rows(&pool, &m, first_row, nrows).await?;
+        let pieces = plan(&m, start, end, split_rows().unwrap_or(usize::MAX));
+        let fetched = fetch_pieces(&pool, &pieces).await?;
+        FETCH_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
         let mut out = BytesMut::with_capacity(smeta.len() as usize);
-        for (i, data) in rows.iter().enumerate() {
-            let no = first_row + i as i32;
-            let row_start = i64::from(no) * ROW_BYTES;
-            let lo = start.max(row_start) - row_start;
-            let hi = end.min(row_start + data.len() as i64 - 1) - row_start;
-            if hi >= lo {
-                out.extend_from_slice(&data[lo as usize..=hi as usize]);
+        for (p, mut rows) in pieces.iter().zip(fetched) {
+            rows.sort_unstable_by_key(|(no, _)| *no);
+            for (no, data) in &rows {
+                if let Some(s) = row_slice(p.base, *no, data, start, end) {
+                    out.extend_from_slice(&s);
+                }
             }
         }
         SMALL_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
@@ -367,7 +379,7 @@ pub async fn get_body(
         // flowing while the body drains.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1024);
         tokio::spawn(async move {
-            if let Err(e) = stream_pass_through(&pool, &m, start, end, first_row, last_row, &tx).await {
+            if let Err(e) = stream_pass_through(&pool, &m, start, end, &tx).await {
                 let _ = tx.send(Err(io_err(e))).await;
             }
         });
@@ -382,25 +394,50 @@ pub enum PieceBody {
     Streamed(PieceStream),
 }
 
-/// Whole rows of a one-shot span: parallel range parts (split_rows each,
-/// SPLIT_INFLIGHT at a time), placed by `no`.
-async fn gather_rows(pool: &PgPool, m: &Meta, first_row: i32, nrows: usize) -> Result<Vec<Bytes>> {
-    let t0 = std::time::Instant::now();
-    let mut rows = vec![Bytes::new(); nrows];
-    let last_row = first_row + nrows as i32 - 1;
-    let file_id = m.file_id;
-    let mut parts = futures::stream::iter(part_ranges(first_row, last_row, split_rows().unwrap_or(usize::MAX)))
-        .map(|(lo, hi)| fetch_part(pool, file_id, lo, hi))
-        .buffer_unordered(SPLIT_INFLIGHT);
-    while let Some(part) = parts.next().await {
-        for (no, data) in part? {
-            if let Some(slot) = rows.get_mut((no - first_row) as usize) {
-                *slot = data;
-            }
+/// One fetch unit: rows `[lo, hi]` of segment file `file_id`, which starts
+/// at object byte offset `base`.
+#[derive(Clone, Copy)]
+struct Piece {
+    file_id: i64,
+    base: i64,
+    lo: i32,
+    hi: i32,
+}
+
+/// Pieces covering object bytes `[start, end]` across the object's segments
+/// (one file, or its part files), in order, at most `step` rows each.
+fn plan(m: &Meta, start: i64, end: i64, step: usize) -> Vec<Piece> {
+    let mut out = Vec::new();
+    for (file_id, base, len) in m.segments() {
+        if len <= 0 || base + len - 1 < start || base > end {
+            continue;
         }
+        let lo = ((start.max(base) - base) / ROW_BYTES) as i32;
+        let hi = ((end.min(base + len - 1) - base) / ROW_BYTES) as i32;
+        out.extend(part_ranges(lo, hi, step).map(|(lo, hi)| Piece { file_id, base, lo, hi }));
     }
-    FETCH_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    Ok(rows)
+    out
+}
+
+/// The part of row `no` of a segment at `base` inside object bytes `[start, end]`.
+fn row_slice(base: i64, no: i32, data: &Bytes, start: i64, end: i64) -> Option<Bytes> {
+    let row_start = base + i64::from(no) * ROW_BYTES;
+    let lo = start.max(row_start) - row_start;
+    let hi = end.min(row_start + data.len() as i64 - 1) - row_start;
+    (hi >= lo).then(|| data.slice(lo as usize..=hi as usize))
+}
+
+/// All pieces' rows, fetched SPLIT_INFLIGHT at a time, returned in piece order.
+async fn fetch_pieces(pool: &PgPool, pieces: &[Piece]) -> Result<Vec<Vec<(i32, Bytes)>>> {
+    let mut out = vec![Vec::new(); pieces.len()];
+    let mut fetched = futures::stream::iter(pieces.iter().copied().enumerate())
+        .map(|(i, p)| async move { fetch_part(pool, p.file_id, p.lo, p.hi).await.map(|rows| (i, rows)) })
+        .buffer_unordered(SPLIT_INFLIGHT);
+    while let Some(r) = fetched.next().await {
+        let (i, rows) = r?;
+        out[i] = rows;
+    }
+    Ok(out)
 }
 
 /// Contiguous `[lo, hi]` ranges of at most `step` rows covering the span.
@@ -436,21 +473,19 @@ fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
     }
 }
 
-/// Large-span path (never touches the cache): the span splits into parts
+/// Large-span path: the span splits into pieces (across part files too),
 /// fetched SPLIT_INFLIGHT at a time on separate connections and emitted in
-/// submission order (`buffered`); each part is sorted locally (bitmap heap
+/// submission order (`buffered`); each piece is sorted locally (bitmap heap
 /// scans do not guarantee `no` order) and its edge rows sliced to the range.
 async fn stream_pass_through(
     pool: &PgPool,
     m: &Meta,
     start: i64,
     end: i64,
-    first_row: i32,
-    last_row: i32,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let r = stream_pass_inner(pool, m, start, end, first_row, last_row, tx).await;
+    let r = stream_pass_inner(pool, m, start, end, tx).await;
     use std::sync::atomic::Ordering::Relaxed;
     STREAM_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
     STREAM_N.fetch_add(1, Relaxed);
@@ -458,33 +493,28 @@ async fn stream_pass_through(
     r
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn stream_pass_inner(
     pool: &PgPool,
     m: &Meta,
     start: i64,
     end: i64,
-    first_row: i32,
-    last_row: i32,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<()> {
     let (step, inflight) = match split_rows() {
         Some(n) => (n.min(STREAM_PART_MAX_ROWS), SPLIT_INFLIGHT),
         None => (STREAM_PART_MAX_ROWS, 1), // A/B baseline: one query at a time
     };
-    let file_id = m.file_id;
-    let mut parts = futures::stream::iter(part_ranges(first_row, last_row, step))
-        .map(|(lo, hi)| fetch_part(pool, file_id, lo, hi))
+    let mut parts = futures::stream::iter(plan(m, start, end, step))
+        .map(|p| async move { fetch_part(pool, p.file_id, p.lo, p.hi).await.map(|rows| (p, rows)) })
         .buffered(inflight);
-    while let Some(part) = parts.next().await {
-        let mut part = part?;
-        part.sort_unstable_by_key(|(no, _)| *no);
-        for (no, data) in part {
-            let row_start = i64::from(no) * ROW_BYTES;
-            let lo = start.max(row_start) - row_start;
-            let hi = end.min(row_start + data.len() as i64 - 1) - row_start;
-            if hi >= lo && tx.send(Ok(data.slice(lo as usize..=hi as usize))).await.is_err() {
-                return Ok(());
+    while let Some(r) = parts.next().await {
+        let (p, mut rows) = r?;
+        rows.sort_unstable_by_key(|(no, _)| *no);
+        for (no, data) in rows {
+            if let Some(s) = row_slice(p.base, no, &data, start, end) {
+                if tx.send(Ok(s)).await.is_err() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -529,9 +559,10 @@ pub struct Slice {
     pub bytes: Bytes,
 }
 
-/// Overwrite-or-create through the ingest pipeline — the single write path
-/// for buffered and multipart writes alike. The ETag is the caller's sha256
-/// (idempotent retries); visibility is atomic via `publish`.
+/// Overwrite-or-create a buffered object through the ingest pipeline (seed and
+/// bench; the server streams request bodies through the same writer). The
+/// ETag is the caller's sha256 (idempotent retries); visibility is atomic via
+/// `publish`.
 pub async fn put(pool: &PgPool, bucket: &str, key: &str, data: &[u8], etag: &[u8]) -> Result<()> {
     let writer = ChunkWriter::start(pool.clone()).await?;
     let file_id = writer.file_id;
@@ -543,9 +574,8 @@ pub async fn put(pool: &PgPool, bucket: &str, key: &str, data: &[u8], etag: &[u8
 }
 
 /// Streaming ingest: bytes flow into one open binary COPY stream through
-/// `push` (rows cut across pushes through a single cursor). One ingest at a
-/// time holds the global write permit — writes stay single-threaded per
-/// process by design.
+/// `push` (rows cut across pushes through a single cursor). Every ingest has
+/// its own connection and COPY, so PUTs and multipart parts write in parallel.
 pub struct ChunkWriter {
     pub file_id: i64,
     tx: Option<tokio::sync::mpsc::Sender<IngestMsg>>,
@@ -559,13 +589,23 @@ pub enum IngestMsg {
 
 impl ChunkWriter {
     pub async fn start(pool: PgPool) -> Result<Self> {
+        Self::begin(pool, None).await
+    }
+
+    /// A multipart part: its rows and its `upload_parts` record commit in one
+    /// transaction, so a part is either fully recorded or absent.
+    pub async fn start_part(pool: PgPool, upload_id: String, part_no: i32) -> Result<Self> {
+        Self::begin(pool, Some((upload_id, part_no))).await
+    }
+
+    async fn begin(pool: PgPool, part: Option<(String, i32)>) -> Result<Self> {
         let file_id: i64 =
             sqlx::query("SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))")
                 .fetch_one(&pool)
                 .await?
                 .get(0);
         let (tx, rx) = tokio::sync::mpsc::channel::<IngestMsg>(8);
-        let done = tokio::spawn(ingest_writer(pool, file_id, rx));
+        let done = tokio::spawn(ingest_writer(pool, file_id, part, rx));
         Ok(Self {
             file_id,
             tx: Some(tx),
@@ -580,23 +620,6 @@ impl ChunkWriter {
             .send(IngestMsg::Data(chunk))
             .await
             .map_err(|_| anyhow::anyhow!("ingest writer gone"))
-    }
-
-    /// Feed staged part files through the stream in the given order.
-    pub async fn feed_files(&self, paths: &[PathBuf]) -> Result<()> {
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 1 << 20];
-        for p in paths {
-            let mut f = tokio::fs::File::open(p).await?;
-            loop {
-                let n = f.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                self.push(Bytes::copy_from_slice(&buf[..n])).await?;
-            }
-        }
-        Ok(())
     }
 
     /// Close the stream and wait for the COPY to land. Returns `(size, sha256)`.
@@ -617,21 +640,37 @@ impl ChunkWriter {
     }
 }
 
+/// Stream a request body into a writer and finish it. A body error rolls the
+/// ingest back; a writer failure surfaces through `finish`.
+pub async fn ingest_body<S, E>(writer: ChunkWriter, mut body: S) -> Result<(i64, Vec<u8>)>
+where
+    S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(c) => {
+                if writer.push(c).await.is_err() {
+                    break; // the writer failed: finish() reports why
+                }
+            }
+            Err(e) => {
+                writer.abort().await;
+                anyhow::bail!("request body: {e}");
+            }
+        }
+    }
+    writer.finish().await
+}
+
 async fn ingest_writer(
     pool: PgPool,
     file_id: i64,
+    part: Option<(String, i32)>,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
 ) -> Result<(i64, Vec<u8>)> {
-    // Serialized writes: one COPY stream at a time across the process. The
-    // permit is held for the ingest lifetime; part pushes backpressure the
-    // client instead of competing for Aurora's write ceiling.
-    static FLUSH_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-    let _permit = FLUSH_SLOTS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // No global write lock: each ingest owns a connection and a COPY, and the
+    // bounded channel backpressures the request body at COPY speed.
     let t0 = std::time::Instant::now();
 
     let mut tx = pool.begin().await?;
@@ -669,8 +708,34 @@ async fn ingest_writer(
     sink.send(&frame[..]).await?;
     sink.finish().await?;
     let sum = hasher.finalize().to_vec();
-    // Chunk rows land here; the object row publishes at Complete
-    // (`publish`), so objects appear atomically and aborts leave nothing.
+    // A multipart part records itself in the same transaction as its rows; a
+    // re-sent part replaces the earlier attempt, rows included. Unpublished
+    // rows are invisible: objects appear atomically at publish / Complete.
+    if let Some((upload_id, part_no)) = &part {
+        let old: Option<i64> = sqlx::query_scalar(
+            "DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2 RETURNING file_id",
+        )
+        .bind(upload_id)
+        .bind(part_no)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(old) = old {
+            sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
+                .bind(old)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(upload_id)
+        .bind(part_no)
+        .bind(file_id)
+        .bind(total)
+        .bind(&sum)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     eprintln!(
         "pgvs3: ingest {:.1} MiB at {:.0} MiB/s",
@@ -691,31 +756,62 @@ pub async fn publish(
     etag: &[u8],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    let old = object_row(&mut tx, bucket, key).await?;
+    swap_object(&mut tx, bucket, key, file_id, size, etag, None).await?;
+    tx.commit().await?;
+    publish_cache(bucket, key, file_id, size, etag, None);
+    Ok(())
+}
+
+/// Point (bucket, key) at new storage inside `tx` and reap the storage of any
+/// object it replaces (all of its files: the single file or every part).
+async fn swap_object(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    bucket: &str,
+    key: &str,
+    file_id: i64,
+    size: i64,
+    etag: &[u8],
+    parts: Option<(&[i64], &[i64])>,
+) -> Result<()> {
+    let old = sqlx::query("SELECT file_id, parts FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE")
+        .bind(bucket)
+        .bind(key)
+        .fetch_optional(&mut **tx)
+        .await?;
     sqlx::query(
-        "INSERT INTO s3p.objects (bucket, key, file_id, size, etag) VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO s3p.objects (bucket, key, file_id, size, etag, parts, part_ends) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size, \
-           etag = EXCLUDED.etag, created_at = now()",
+           etag = EXCLUDED.etag, parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, created_at = now()",
     )
     .bind(bucket)
     .bind(key)
     .bind(file_id)
     .bind(size)
     .bind(etag)
-    .execute(&mut *tx)
+    .bind(parts.map(|(ids, _)| ids))
+    .bind(parts.map(|(_, ends)| ends))
+    .execute(&mut **tx)
     .await?;
-    if let Some(old_id) = old {
-        sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
-            .bind(old_id)
-            .execute(&mut *tx)
-            .await?;
+    if let Some(r) = old {
+        reap(tx, r.get("file_id"), r.get("parts")).await?;
     }
-    tx.commit().await?;
-    publish_cache(bucket, key, file_id, size, etag);
     Ok(())
 }
 
-fn publish_cache(bucket: &str, key: &str, file_id: i64, size: i64, etag: &[u8]) {
+/// Delete every chunk row of an unpublished object's files.
+async fn reap(tx: &mut Transaction<'_, sqlx::Postgres>, file_id: i64, parts: Option<Vec<i64>>) -> Result<()> {
+    let mut dead = parts.unwrap_or_default();
+    dead.push(file_id);
+    sqlx::query("DELETE FROM s3p.chunks WHERE file_id = ANY($1)")
+        .bind(&dead)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn publish_cache(bucket: &str, key: &str, file_id: i64, size: i64, etag: &[u8], parts: Option<(Vec<i64>, Vec<i64>)>) {
+    let (parts, part_ends) = parts.unzip();
     meta_put(
         bucket,
         key,
@@ -724,6 +820,8 @@ fn publish_cache(bucket: &str, key: &str, file_id: i64, size: i64, etag: &[u8]) 
             etag: etag.to_vec(),
             created_at: SystemTime::now(),
             file_id,
+            parts,
+            part_ends,
         },
     );
 }
@@ -746,22 +844,124 @@ fn frame_rows(file_id: i64, first_no: i32, data: &[u8], out: &mut Vec<u8>) {
 
 pub async fn delete(pool: &PgPool, bucket: &str, key: &str) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let old: Option<i64> =
-        sqlx::query("DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id")
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(|r| r.get("file_id"));
-    if let Some(file_id) = old {
-        sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
-            .bind(file_id)
-            .execute(&mut *tx)
-            .await?;
+    let old = sqlx::query("DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id, parts")
+        .bind(bucket)
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let found = old.is_some();
+    if let Some(r) = old {
+        reap(&mut tx, r.get("file_id"), r.get("parts")).await?;
     }
     tx.commit().await?;
     meta_invalidate(bucket, key);
-    Ok(old.is_some())
+    Ok(found)
+}
+
+/// Start (or re-attach, for a retried Create) the multipart upload of a key.
+pub async fn create_upload(pool: &PgPool, bucket: &str, key: &str) -> Result<String> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) \
+         ON CONFLICT (bucket, key) DO UPDATE SET bucket = EXCLUDED.bucket RETURNING upload_id",
+    )
+    .bind(bucket)
+    .bind(key)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn upload_exists(pool: &PgPool, upload_id: &str) -> Result<bool> {
+    Ok(sqlx::query("SELECT 1 FROM s3p.uploads WHERE upload_id = $1")
+        .bind(upload_id)
+        .fetch_optional(pool)
+        .await?
+        .is_some())
+}
+
+pub enum Completed {
+    Done { bucket: String, key: String, etag: Vec<u8>, size: i64 },
+    InvalidPart,
+    NoSuchUpload,
+}
+
+/// Complete: every recorded part listed exactly once with a matching ETag (any
+/// listing order), then the object publishes as its ordered part files. No
+/// data moves. ETag = sha256 over the part sha256s (S3's hash-of-part-hashes).
+pub async fn complete_upload(pool: &PgPool, upload_id: &str, listed: &[(i32, String)]) -> Result<Completed> {
+    let mut tx = pool.begin().await?;
+    let Some(up) = sqlx::query("SELECT bucket, key FROM s3p.uploads WHERE upload_id = $1 FOR UPDATE")
+        .bind(upload_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(Completed::NoSuchUpload);
+    };
+    let (bucket, key): (String, String) = (up.get("bucket"), up.get("key"));
+    let rows = sqlx::query(
+        "SELECT part_no, file_id, size, sha256 FROM s3p.upload_parts WHERE upload_id = $1 ORDER BY part_no",
+    )
+    .bind(upload_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut want: Vec<&(i32, String)> = listed.iter().collect();
+    want.sort_by_key(|(no, _)| *no);
+    if want.is_empty() || want.len() != rows.len() {
+        return Ok(Completed::InvalidPart);
+    }
+    let (mut ids, mut ends, mut size) = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), 0i64);
+    let mut hasher = Sha256::new();
+    for (p, r) in want.iter().zip(&rows) {
+        let sha: Vec<u8> = r.get("sha256");
+        if p.0 != r.get::<i32, _>("part_no") || p.1 != hex(&sha) {
+            return Ok(Completed::InvalidPart);
+        }
+        hasher.update(&sha);
+        size += r.get::<i64, _>("size");
+        ids.push(r.get::<i64, _>("file_id"));
+        ends.push(size);
+    }
+    let etag = hasher.finalize().to_vec();
+    swap_object(&mut tx, &bucket, &key, ids[0], size, &etag, Some((&ids, &ends))).await?;
+    sqlx::query("DELETE FROM s3p.uploads WHERE upload_id = $1")
+        .bind(upload_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    publish_cache(&bucket, &key, ids[0], size, &etag, Some((ids, ends)));
+    Ok(Completed::Done { bucket, key, etag, size })
+}
+
+/// Drop a multipart upload and the rows of every part it recorded.
+pub async fn abort_upload(pool: &PgPool, upload_id: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT file_id FROM s3p.upload_parts WHERE upload_id = $1")
+        .bind(upload_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM s3p.uploads WHERE upload_id = $1")
+        .bind(upload_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM s3p.chunks WHERE file_id = ANY($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Abort uploads abandoned for longer than `age` (S3's incomplete-upload
+/// lifecycle): their parts are committed rows, so something must reap them.
+pub async fn expire_uploads(pool: &PgPool, age: Duration) -> Result<usize> {
+    let ids: Vec<String> =
+        sqlx::query_scalar("SELECT upload_id FROM s3p.uploads WHERE created_at < now() - make_interval(secs => $1)")
+            .bind(age.as_secs_f64())
+            .fetch_all(pool)
+            .await?;
+    for id in &ids {
+        abort_upload(pool, id).await?;
+    }
+    Ok(ids.len())
 }
 
 #[derive(Debug, Clone)]
