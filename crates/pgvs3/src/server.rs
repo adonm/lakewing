@@ -390,7 +390,6 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
     // (S3's incomplete-upload lifecycle) and chunk files nothing references
     // once provably 24h old. The first pass scans every file; later passes
     // resume where it stopped. Idempotent, so every gateway can run it.
-    let _ = std::fs::remove_dir_all("/dev/shm/pgvs3-mpu"); // pre-part-file RAM staging
     let gc = pool.clone();
     tokio::spawn(async move {
         let grace = std::time::Duration::from_secs(24 * 3600);

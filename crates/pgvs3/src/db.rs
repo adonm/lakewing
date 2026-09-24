@@ -1,26 +1,18 @@
-//! PostgreSQL storage: objects as fixed-size inline byte rows.
+//! PostgreSQL storage: an object is numbered 8120-byte rows in `s3p.chunks`
+//! plus one row in `s3p.objects` (layout: schema.sql).
 //!
-//! Read path: object metadata (bucket,key -> file_id/size/etag) is cached
-//! in-process (pinned, count-capped; populated at publish, dropped at delete),
-//! so opening an object costs no round trip. Row bytes are not cached: DuckDB
-//! caches what it reads, and a proxy row cache measured ~0% hits on
-//! ClickBench/SpatialBench for ~0.5 ms of CPU per request. Rows are cut
-//! through to the response as they arrive. A span up to 8 MiB is one
-//! contiguous row-range query; larger spans come in 8 MiB parts fetched in
-//! parallel on separate pool connections, since one Aurora connection moves
-//! ~530-680 MiB/s (EC2's 5 Gbps single-flow cap). Fanning the
-//! smaller spans out too (PGVS3_SPLIT_BYTES) measured worse at DuckDB's
-//! concurrency even on hot connections: 2 MiB parts +5% ClickBench and
-//! SpatialBench pass time, 1 MiB +12-21%.
+//! Reads: object metadata is cached in-process (filled at publish and first
+//! lookup, dropped at delete), so a GET costs one query per 8 MiB of range.
+//! Rows go to the response as they arrive; a range over 8 MiB fetches up to 8
+//! parts at once on separate connections, since one connection tops out near
+//! 600 MiB/s. Row bytes are not cached: DuckDB caches what it reads, and a
+//! proxy cache behind it hit ~0% of the time.
 //!
-//! Write path: every PUT and every multipart part streams straight into its
-//! own binary COPY on its own connection as it arrives: no staging, no global
-//! write lock (Performance Insights showed the old serialized design leaving
-//! Aurora idle, its one COPY session 100% Client:ClientRead, and its RAM
-//! staging deadlocked at full scale). A multipart object is the ordered list
-//! of its part files (objects.parts/part_ends); upload state lives in Aurora
-//! (s3p.uploads/upload_parts), so any gateway can take any part and Complete
-//! only validates and publishes. Objects appear atomically at publish.
+//! Writes: every PUT and every multipart part streams into its own binary
+//! COPY, with no staging and no global lock. A multipart object is the ordered
+//! list of its part files; upload state lives in PostgreSQL, so any gateway
+//! can take any part, and Complete only checks and publishes. An object
+//! appears atomically when its `objects` row is written.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
@@ -43,9 +35,6 @@ pub const SCHEMA: &str = include_str!("../schema.sql");
 /// tuple 8160 bytes = one row per 8 KB page.
 pub const ROW_BYTES: i64 = 8120;
 
-/// Rows per multi-row statement batch (520 KiB per round trip).
-const ROW_BATCH: usize = 64;
-
 const COPY_SQL: &str = "COPY s3p.chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)";
 const COPY_HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\x00\x00\x00\x00\x00\x00\x00\x00";
 const COPY_TRAILER: &[u8] = &[0xFF, 0xFF];
@@ -56,69 +45,42 @@ const SEND_BATCH: usize = 4 << 20;
 const GET_RANGE_SQL: &str =
     "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3";
 
-/// Spans up to this size are "small" (one part, latency-bound) in telemetry.
+/// Spans up to this size are one query, and "small" in the stats.
 const SMALL_MAX: usize = 8 << 20;
-/// Rows per part: a span up to SMALL_MAX (which may start mid-row) fits one.
+/// Rows per part: any span up to SMALL_MAX (it may start mid-row) fits one.
 const PART_ROWS: usize = SMALL_MAX / ROW_BYTES as usize + 2;
-/// Parts in flight per request, each on its own pool connection.
-const SPLIT_INFLIGHT: usize = 8;
-/// Rows are forwarded to the response in chunks of about this size.
+/// Parts in flight per GET, each on its own pool connection. Smaller parts
+/// measured slower at DuckDB's concurrency (2 MiB: +5% pass time, 1 MiB:
+/// +12-21%), so a span is only split above 8 MiB.
+const PARTS_INFLIGHT: usize = 8;
+/// Rows go to the response in chunks of about this size.
 const CHUNK: usize = 256 << 10;
 
-/// Rows per part (PGVS3_SPLIT_BYTES, capped at PART_ROWS; default 8 MiB, so
-/// small spans are one part). 0 = PART_ROWS parts fetched one at a time: the
-/// A/B baseline.
-fn split_rows() -> Option<usize> {
-    static N: OnceLock<Option<usize>> = OnceLock::new();
-    *N.get_or_init(|| {
-        let bytes = std::env::var("PGVS3_SPLIT_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8 << 20);
-        (bytes > 0).then(|| bytes.div_ceil(ROW_BYTES as usize))
-    })
-}
-
 pub async fn connect(url: &str) -> Result<Pool> {
-    // Bitmap heap scans hand the row-span TIDs to PostgreSQL 18's async
-    // read-stream prefetch: cold >RAM range reads measured 5x faster than
-    // one-page-at-a-time index scans (256KiB GET p50 14.1ms -> 2.8ms), with no
-    // warm cost. Opt back into index scans with PGVS3_INDEXSCAN=1.
-    let indexscan = std::env::var_os("PGVS3_INDEXSCAN").is_some();
-    // Aurora round trips dominate small operations; a synchronous_commit per
-    // transaction pays one every write. Objects are immutable and
-    // sha256-idempotent, so commit-ack loss only ever replays a PUT. Set
-    // PGVS3_DURABLE=1 to require synchronous commits.
-    let durable = std::env::var_os("PGVS3_DURABLE").is_some();
-    // work_mem keeps bitmap TID maps exact; effective_io_concurrency deepens
-    // bitmap read-stream prefetch (no measured gain past 32 on Aurora). The
-    // rest bounds what a dead or wedged gateway can leave holding locks
-    // server-side: a vanished client is noticed in ~1 min (Aurora's keepalive
-    // defaults: ~16 min), and a transaction left idle (only ever a bug here)
-    // is killed.
+    // Index scans off: bitmap heap scans hand the whole row span to
+    // PostgreSQL 18's read-ahead, ~5x faster on cold ranges at no warm cost.
+    // work_mem keeps the bitmaps exact; effective_io_concurrency deepens the
+    // read-ahead (no gain past 32 on Aurora). The keepalive and
+    // idle-transaction limits bound what a dead gateway can leave holding
+    // locks.
     let mut session = String::from(
-        "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
+        "SET enable_indexscan = off; SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
          SET tcp_keepalives_idle = 30; SET tcp_keepalives_interval = 10; \
          SET tcp_keepalives_count = 3; SET idle_in_transaction_session_timeout = '5min';",
     );
-    if !indexscan {
-        session.push_str(" SET enable_indexscan = off;");
-    }
-    if !durable {
+    // A synchronous commit costs every write an Aurora round trip, while
+    // objects are immutable and sha256-idempotent: a lost commit only means a
+    // retried PUT. PGVS3_DURABLE=1 turns synchronous commits back on.
+    if std::env::var_os("PGVS3_DURABLE").is_none() {
         session.push_str(" SET synchronous_commit = off;");
     }
-    // No io_combine_limit: PG18 clamps it to the postmaster-level
-    // io_max_combine_limit (commands/variable.c assign hook; 168 kB on Aurora,
-    // 128 kB stock), so a session SET above that is a silent no-op. Raising it
-    // needs a parameter-group change.
+    // (io_combine_limit cannot go here: PostgreSQL clamps it to the server's
+    // io_max_combine_limit, which only a parameter-group change raises.)
     Pool::connect(
         url,
         crate::pg::Options {
-            // Warm pool: cold-pool setup (TCP + TLS + SCRAM + session SETs to
-            // Aurora) showed up as 10-13 ms average acquire wait per part
-            // (~40% of fetch time) in the c7gn A/B; at 32 SpatialBench's burst
-            // still waited 5-8 ms per part, so keep DuckDB's in-flight GETs
-            // covered.
+            // Opening a connection (TCP, TLS, SCRAM, the SETs) costs ~10 ms,
+            // so keep enough open for DuckDB's bursts.
             min: pool_min(),
             // Parallel parts multiply connection demand; Aurora allows ~1700.
             max: 256,
@@ -545,7 +507,7 @@ fn part_ranges(first_row: i32, last_row: i32, step: usize) -> impl Iterator<Item
 }
 
 /// Rows of `[start, end]` in `no` order, forwarded in ~CHUNK pieces as they
-/// arrive. Parts fetch concurrently (SPLIT_INFLIGHT at a time), each in its
+/// arrive. Parts fetch concurrently (PARTS_INFLIGHT at a time), each in its
 /// own task (`spawn_part`); the head part is cut through while later parts
 /// queue their rows. A missing row (e.g. the object was replaced under a
 /// stale meta-cache entry) is an error, never a short body.
@@ -556,16 +518,12 @@ async fn stream_span(
     end: i64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<()> {
-    let (step, inflight) = match split_rows() {
-        Some(n) => (n.min(PART_ROWS), SPLIT_INFLIGHT),
-        None => (PART_ROWS, 1), // A/B baseline: one query at a time
-    };
-    let mut todo = plan(m, start, end, step).into_iter();
-    let mut running = VecDeque::with_capacity(inflight);
+    let mut todo = plan(m, start, end, PART_ROWS).into_iter();
+    let mut running = VecDeque::with_capacity(PARTS_INFLIGHT);
     let mut chunk = BytesMut::with_capacity(CHUNK + ROW_BYTES as usize);
     let mut sent = 0i64;
     loop {
-        while running.len() < inflight {
+        while running.len() < PARTS_INFLIGHT {
             let Some(p) = todo.next() else { break };
             running.push_back((p, spawn_part(pool, p)));
         }
@@ -817,7 +775,8 @@ async fn ingest_writer(
     sink.send(Bytes::from_static(COPY_HEADER)).await?;
 
     let mut hasher = Sha256::new();
-    let mut pending: Vec<u8> = Vec::with_capacity(ROW_BYTES as usize * (ROW_BATCH + 1));
+    // Bytes not yet framed: always less than one row between pushes.
+    let mut pending: Vec<u8> = Vec::new();
     let mut frame = BytesMut::with_capacity(SEND_BATCH);
     let mut next_no = 0i32;
     let mut total = 0i64;
