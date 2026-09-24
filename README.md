@@ -7,7 +7,10 @@ served by this gateway from PostgreSQL byte rows).
 One object = one `s3p.objects` row + fixed-size `s3p.chunks` rows. A multipart
 object is the ordered list of its part files: every part streams into its own
 COPY the moment it arrives (in parallel, no staging), upload state lives in
-PostgreSQL so any gateway can take any part, and Complete only publishes. Read
+PostgreSQL so any gateway can take any part, and Complete only publishes. Every
+gateway runs a janitor at startup and hourly: multipart uploads abandoned for
+24 h and chunk files nothing references once provably 24 h old (left by a
+gateway killed mid-write) are reaped. Read
 ranges are contiguous row-range queries (one per part file touched, fetched in
 parallel) that stream exactly the requested bytes; fully covered rows return
 verbatim, edge rows slice by memcpy.

@@ -100,24 +100,29 @@ pub async fn connect(url: &str) -> Result<PgPool> {
         .test_before_acquire(false)
         .after_connect(move |conn, _meta| {
             Box::pin(async move {
-                // Whole session setup in one round trip (simple-query batch).
                 // work_mem keeps bitmap TID maps exact; effective_io_concurrency
                 // deepens bitmap read-stream prefetch (no measured gain past 32
-                // on Aurora).
-                let sets: &'static str = match (indexscan, durable) {
-                    (false, false) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
-                                       SET enable_indexscan = off; SET synchronous_commit = off;",
-                    (false, true) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
-                                      SET enable_indexscan = off;",
-                    (true, false) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
-                                      SET synchronous_commit = off;",
-                    (true, true) => "SET work_mem = '64MB'; SET effective_io_concurrency = 32;",
-                };
+                // on Aurora). The rest bounds what a dead or wedged gateway can
+                // leave holding locks server-side: a vanished client is noticed
+                // in ~1 min (Aurora's keepalive defaults: ~16 min), and a
+                // transaction left idle (only ever a bug here) is killed.
+                sqlx::Executor::execute(
+                    &mut *conn,
+                    "SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
+                     SET tcp_keepalives_idle = 30; SET tcp_keepalives_interval = 10; \
+                     SET tcp_keepalives_count = 3; SET idle_in_transaction_session_timeout = '5min';",
+                )
+                .await?;
+                if !indexscan {
+                    sqlx::Executor::execute(&mut *conn, "SET enable_indexscan = off").await?;
+                }
+                if !durable {
+                    sqlx::Executor::execute(&mut *conn, "SET synchronous_commit = off").await?;
+                }
                 // No io_combine_limit: PG18 clamps it to the postmaster-level
                 // io_max_combine_limit (commands/variable.c assign hook; 168 kB
                 // on Aurora, 128 kB stock), so a session SET above that is a
                 // silent no-op. Raising it needs a parameter-group change.
-                sqlx::Executor::execute(&mut *conn, sets).await?;
                 Ok(())
             })
         })
@@ -948,6 +953,62 @@ pub async fn abort_upload(pool: &PgPool, upload_id: &str) -> Result<()> {
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Unreferenced chunk files with ids in [$1, $2): a loose index scan (one PK
+/// probe per distinct file, not per row) anti-joined against everything that
+/// can own a file: published objects (single file or parts) and recorded
+/// upload parts.
+const ORPHANS_SQL: &str = "\
+WITH RECURSIVE f(file_id) AS ( \
+    SELECT min(file_id) FROM s3p.chunks WHERE file_id >= $1 AND file_id < $2 \
+  UNION ALL \
+    SELECT (SELECT min(c.file_id) FROM s3p.chunks c WHERE c.file_id > f.file_id AND c.file_id < $2) \
+    FROM f WHERE f.file_id IS NOT NULL \
+) \
+SELECT f.file_id FROM f \
+WHERE f.file_id IS NOT NULL \
+  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f.file_id) \
+  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f.file_id) \
+  AND f.file_id NOT IN (SELECT unnest(parts) FROM s3p.objects WHERE parts IS NOT NULL)";
+
+/// Reap chunk files nothing references once provably older than `grace`: a
+/// PUT whose publish never ran (its rows commit before the object row), or a
+/// pre-part-file multipart flush cut short by a killed gateway. file_ids come
+/// from one sequence (cache 1), so every id below the newest object published
+/// before now-grace was allocated before then: no per-row timestamp needed.
+/// Scans ids in [from, horizon); returns (files, rows, horizon) so the caller
+/// resumes there. Interrupted writes of every other kind are single
+/// transactions and leave nothing behind.
+pub async fn sweep_orphans(pool: &PgPool, grace: Duration, from: i64) -> Result<(usize, u64, i64)> {
+    let horizon: Option<i64> = sqlx::query_scalar(
+        "SELECT max(file_id) FROM s3p.objects WHERE created_at < now() - make_interval(secs => $1)",
+    )
+    .bind(grace.as_secs_f64())
+    .fetch_one(pool)
+    .await?;
+    let horizon = match horizon {
+        Some(h) if h > from => h,
+        _ => return Ok((0, 0, from)),
+    };
+    let mut tx = pool.begin().await?;
+    // The loose scan wants index probes; gateway sessions default to bitmaps.
+    sqlx::query("SET LOCAL enable_indexscan = on").execute(&mut *tx).await?;
+    let orphans: Vec<i64> = sqlx::query_scalar(ORPHANS_SQL)
+        .bind(from)
+        .bind(horizon)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let mut rows = 0;
+    for id in &orphans {
+        rows += sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected();
+    }
+    Ok((orphans.len(), rows, horizon))
 }
 
 /// Abort uploads abandoned for longer than `age` (S3's incomplete-upload

@@ -387,17 +387,33 @@ pub async fn serve(pool: PgPool, cfg: ServeConfig) -> Result<()> {
             Err(e) => eprintln!("pgvs3: prewarm skipped: {e}"),
         }
     });
-    // Abandoned multipart uploads hold committed part rows: reap them hourly
-    // (S3's incomplete-upload lifecycle, 24h).
+    // Janitor, at startup and hourly, for state that gateways killed mid-write
+    // (by any instance) leave in Aurora: multipart uploads abandoned for 24h
+    // (S3's incomplete-upload lifecycle) and chunk files nothing references
+    // once provably 24h old. The first pass scans every file; later passes
+    // resume where it stopped. Idempotent, so every gateway can run it.
+    let _ = std::fs::remove_dir_all("/dev/shm/pgvs3-mpu"); // pre-part-file RAM staging
     let gc = pool.clone();
     tokio::spawn(async move {
+        let grace = std::time::Duration::from_secs(24 * 3600);
+        let mut from = 0i64;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
-            match db::expire_uploads(&gc, std::time::Duration::from_secs(24 * 3600)).await {
+            match db::expire_uploads(&gc, grace).await {
                 Ok(0) => {}
-                Ok(n) => eprintln!("pgvs3: expired {n} abandoned multipart uploads"),
-                Err(e) => eprintln!("pgvs3: upload expiry failed: {e}"),
+                Ok(n) => eprintln!("pgvs3: janitor expired {n} abandoned multipart uploads"),
+                Err(e) => eprintln!("pgvs3: janitor upload expiry failed: {e}"),
+            }
+            match db::sweep_orphans(&gc, grace, from).await {
+                Ok((files, rows, next)) => {
+                    if files > 0 {
+                        let mib = rows as i64 * db::ROW_BYTES / (1 << 20);
+                        eprintln!("pgvs3: janitor reaped {files} orphaned files ({rows} rows, ~{mib} MiB)");
+                    }
+                    from = next;
+                }
+                Err(e) => eprintln!("pgvs3: janitor orphan sweep failed: {e}"),
             }
         }
     });
