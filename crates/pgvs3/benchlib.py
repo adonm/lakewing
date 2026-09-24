@@ -102,7 +102,7 @@ def gateway_stats():
 
 def gateway_counters(st):
     """(MiB served, GETs) from a gateway perf line, or None."""
-    m = st and re.search(r"small total=\S+ fetch=\S+ local=\S+ n=(\d+) \| stream=\S+ n=(\d+) .* served=(\d+)MiB", st)
+    m = st and re.search(r"small n=(\d+) .*\| stream n=(\d+) .* served=(\d+)MiB", st)
     return (int(m.group(3)), int(m.group(1)) + int(m.group(2))) if m else None
 
 

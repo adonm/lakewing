@@ -4,10 +4,11 @@
 //! in-process (pinned, count-capped; populated at publish, dropped at delete),
 //! so opening an object costs no round trip. Row bytes are not cached: DuckDB
 //! caches what it reads, and a proxy row cache measured ~0% hits on
-//! ClickBench/SpatialBench for ~0.5 ms of CPU per request. A span up to 8 MiB
-//! is one contiguous row-range query; larger spans stream through in 8 MiB
-//! parts fetched in parallel on separate pool connections, since one Aurora
-//! connection moves ~530 MiB/s (EC2's 5 Gbps single-flow cap). Fanning the
+//! ClickBench/SpatialBench for ~0.5 ms of CPU per request. Rows are cut
+//! through to the response as they arrive. A span up to 8 MiB is one
+//! contiguous row-range query; larger spans come in 8 MiB parts fetched in
+//! parallel on separate pool connections, since one Aurora connection moves
+//! ~530-680 MiB/s (EC2's 5 Gbps single-flow cap). Fanning the
 //! smaller spans out too (PGVS3_SPLIT_BYTES) measured worse at DuckDB's
 //! concurrency even on hot connections: 2 MiB parts +5% ClickBench and
 //! SpatialBench pass time, 1 MiB +12-21%.
@@ -21,7 +22,7 @@
 //! (s3p.uploads/upload_parts), so any gateway can take any part and Complete
 //! only validates and publishes. Objects appear atomically at publish.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 use std::task::Context;
@@ -29,9 +30,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Row, Transaction};
 
 pub use crate::pg::Pool;
@@ -55,18 +56,18 @@ const SEND_BATCH: usize = 4 << 20;
 const GET_RANGE_SQL: &str =
     "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3";
 
-/// Spans up to this size are fetched into one buffer (no task, no channel);
-/// larger spans stream through in ordered parts.
-const ONESHOT_MAX: usize = 8 << 20;
-
+/// Spans up to this size are "small" (one part, latency-bound) in telemetry.
+const SMALL_MAX: usize = 8 << 20;
+/// Rows per part: a span up to SMALL_MAX (which may start mid-row) fits one.
+const PART_ROWS: usize = SMALL_MAX / ROW_BYTES as usize + 2;
 /// Parts in flight per request, each on its own pool connection.
 const SPLIT_INFLIGHT: usize = 8;
-/// Pass-through parts never buffer more than ~8 MiB each.
-const STREAM_PART_MAX_ROWS: usize = 1024;
+/// Rows are forwarded to the response in chunks of about this size.
+const CHUNK: usize = 256 << 10;
 
-/// Rows per parallel piece of a one-buffer span (PGVS3_SPLIT_BYTES; default
-/// 8 MiB = ONESHOT_MAX, i.e. no fan-out). 0 also makes streams fetch one part
-/// at a time: the A/B baseline.
+/// Rows per part (PGVS3_SPLIT_BYTES, capped at PART_ROWS; default 8 MiB, so
+/// small spans are one part). 0 = PART_ROWS parts fetched one at a time: the
+/// A/B baseline.
 fn split_rows() -> Option<usize> {
     static N: OnceLock<Option<usize>> = OnceLock::new();
     *N.get_or_init(|| {
@@ -267,9 +268,10 @@ impl SliceMeta {
     }
 }
 
-/// Streamed slice pieces, in `no` order: one buffer per part through a
-/// bounded channel back to the fetching task, so at most two parts queue.
+/// A cut-through response body: the first chunk (fetched before the response
+/// started), then the rest in `no` order as the span task forwards it.
 pub struct PieceStream {
+    first: Option<Bytes>,
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
 }
 
@@ -277,7 +279,11 @@ impl Stream for PieceStream {
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        self.get_mut().rx.poll_recv(cx)
+        let this = self.get_mut();
+        match this.first.take() {
+            Some(head) => std::task::Poll::Ready(Some(Ok(head))),
+            None => this.rx.poll_recv(cx),
+        }
     }
 }
 
@@ -329,9 +335,9 @@ fn meta_invalidate(bucket: &str, key: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// GET telemetry for bottleneck hunting: span-size histogram, time awaiting
-// PostgreSQL versus local decode/assembly, and pass-through stream time. Read
-// via `stage_stats_line` (the stats route and the log timer print it).
+// GET telemetry for bottleneck hunting: span-size histogram, time to the first
+// and the last byte handed to the response, parts and pool waits. Read via
+// `stage_stats_line` (the stats route and the log timer print it).
 // ---------------------------------------------------------------------------
 static SPANS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 // GET latency histogram: quarter-octave buckets of microseconds (~19%
@@ -356,42 +362,39 @@ fn lat_pct(counts: &[u64], p: f64) -> f64 {
     }
     0.0
 }
-// Small path: wall time per request and of its (parallel) fetch phase.
-static SMALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FETCH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SMALL_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static STREAM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static STREAM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per span class (0 = small, 1 = larger): GETs, summed time to the first byte
+// handed to the response, summed time to the last.
+static GETS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static TTFB_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static TOTAL_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 // Per part query, both paths: count and pool-acquire wait (summed, so it can
 // exceed wall time under concurrency; growth means the pool is the limit).
 static PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `spans=[..] small total=.. fetch=.. local=.. | stream=.. | parts=.. wait(sum)=.. | served=..`
+/// `spans=[..] small n=.. ttfb=.. total=.. | stream n=.. ttfb=.. total=.. | parts=.. wait(sum)=.. | served=..`
 pub fn stage_stats_line() -> String {
     use std::sync::atomic::Ordering::Relaxed;
-    let ms = |us: u64| us as f64 / 1e3;
-    let total = SMALL_US.load(Relaxed);
-    let fetch = FETCH_US.load(Relaxed);
+    let ms = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed) as f64 / 1e3;
     let s: Vec<u64> = SPANS.iter().map(|a| a.load(Relaxed)).collect();
     let lat: Vec<u64> = LAT.iter().map(|a| a.load(Relaxed)).collect();
     format!(
-        "perf: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small total={:.0}ms fetch={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+        "perf: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small n={} ttfb={:.0}ms total={:.0}ms | stream n={} ttfb={:.0}ms total={:.0}ms | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
         s[0],
         s[1],
         s[2],
         s[3],
         s[4],
-        ms(total),
-        ms(fetch),
-        ms(total.saturating_sub(fetch)),
-        SMALL_N.load(Relaxed),
-        ms(STREAM_US.load(Relaxed)),
-        STREAM_N.load(Relaxed),
+        GETS[0].load(Relaxed),
+        ms(&TTFB_US[0]),
+        ms(&TOTAL_US[0]),
+        GETS[1].load(Relaxed),
+        ms(&TTFB_US[1]),
+        ms(&TOTAL_US[1]),
         PARTS.load(Relaxed),
-        ms(WAIT_US.load(Relaxed)),
-        SERVED.load(Relaxed) / 1024 / 1024,
+        ms(&WAIT_US),
+        SERVED.load(Relaxed) >> 20,
         lat_pct(&lat, 0.50),
         lat_pct(&lat, 0.95),
         lat_pct(&lat, 0.99),
@@ -399,7 +402,7 @@ pub fn stage_stats_line() -> String {
 }
 
 /// Span-size histogram buckets: <64K <512K <2M <8M >=8M (the workload's read
-/// shapes; the last boundary is ONESHOT_MAX).
+/// shapes; the last boundary is SMALL_MAX).
 fn span_bucket(span: usize) -> usize {
     const T: [usize; 4] = [65536, 524_288, 2_097_152, 8_388_608];
     T.iter().position(|&t| span < t).unwrap_or(4)
@@ -434,10 +437,12 @@ pub async fn meta(pool: &Pool, bucket: &str, key: &str) -> Result<Option<Meta>> 
     Ok(Some(meta))
 }
 
-/// Serve `[start, end]` of an object. Spans up to ONESHOT_MAX take the fast
-/// path: rows fetched (as parallel parts above PGVS3_SPLIT_BYTES) into one
-/// buffer, no channel hop, no task; larger spans stream through in ordered
-/// parts.
+/// Serve `[start, end]` of an object, cut through: rows go to the response as
+/// they arrive from PostgreSQL (`stream_span`), not after the whole span (on
+/// an 8 MiB GET that was a serial ~3 ms, a 0.5 ms assembly copy plus the
+/// loopback send, after a 12 ms fetch). The response starts only once the
+/// first chunk exists, so a failure before any byte is a clean S3 error; a
+/// span that fits in the first chunk goes out as one buffer.
 pub async fn get_body(
     pool: Pool,
     bucket: String,
@@ -446,6 +451,7 @@ pub async fn get_body(
     last: i64,
     suffix: i64,
 ) -> Result<Option<(SliceMeta, PieceBody)>> {
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(m) = meta(&pool, &bucket, &key).await? else { return Ok(None) };
     let (start, end) = eff_range(m.size, first, last, suffix);
     let smeta = SliceMeta {
@@ -456,42 +462,42 @@ pub async fn get_body(
         start,
         end,
     };
-    SPANS[span_bucket(smeta.len() as usize)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    if (smeta.len() as usize) <= ONESHOT_MAX {
-        use std::sync::atomic::Ordering::Relaxed;
-        let t0 = std::time::Instant::now();
-        let pieces = plan(&m, start, end, split_rows().unwrap_or(usize::MAX));
-        let fetched = fetch_pieces(&pool, &pieces).await?;
-        FETCH_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
-        let mut out = BytesMut::with_capacity(smeta.len() as usize);
-        for (p, rows) in pieces.iter().zip(&fetched) {
-            for (no, row) in rows {
-                if let Some(s) = row_slice(p.base, *no, row.try_get(1)?, start, end) {
-                    out.extend_from_slice(s);
-                }
-            }
+    let len = smeta.len() as usize;
+    if len == 0 {
+        return Ok(Some((smeta, PieceBody::OneShot(Bytes::new()))));
+    }
+    SPANS[span_bucket(len)].fetch_add(1, Relaxed);
+    let class = usize::from(len > SMALL_MAX);
+    let t0 = std::time::Instant::now();
+    // ~8 MiB of chunks queue for the response; parts buffer their own rows.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    tokio::spawn(async move {
+        if let Err(e) = stream_span(&pool, &m, start, end, &tx).await {
+            let _ = tx.send(Err(io_err(e))).await;
         }
-        SMALL_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
-        lat_record(t0.elapsed().as_micros() as u64);
-        SMALL_N.fetch_add(1, Relaxed);
-        SERVED.fetch_add(smeta.len() as u64, Relaxed);
-        Ok(Some((smeta, PieceBody::OneShot(out.freeze()))))
-    } else {
-        // One buffer per part (<= 8 MiB); two queued keep part fetches
-        // flowing while the body drains.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
-        tokio::spawn(async move {
-            if let Err(e) = stream_pass_through(&pool, &m, start, end, &tx).await {
-                let _ = tx.send(Err(io_err(e))).await;
-            }
-        });
-        Ok(Some((smeta, PieceBody::Streamed(PieceStream { rx }))))
+        let us = t0.elapsed().as_micros() as u64;
+        GETS[class].fetch_add(1, Relaxed);
+        TOTAL_US[class].fetch_add(us, Relaxed);
+        lat_record(us);
+        SERVED.fetch_add(len as u64, Relaxed);
+    });
+    let head = rx.recv().await;
+    TTFB_US[class].fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+    match head {
+        Some(Ok(head)) if head.len() == len => Ok(Some((smeta, PieceBody::OneShot(head)))),
+        Some(Ok(head)) => Ok(Some((smeta, PieceBody::Streamed(PieceStream { first: Some(head), rx })))),
+        Some(Err(e)) => {
+            // Perhaps a stale cache entry (the object replaced via another
+            // gateway): the retry looks the metadata up again.
+            meta_invalidate(&bucket, &key);
+            Err(e.into())
+        }
+        None => Err(anyhow::anyhow!("GET of {bucket}/{key} ended before any data")),
     }
 }
 
-/// Response body for a served range: one buffer for small spans, a stream for
-/// pass-through spans.
+/// Response body for a served range: one buffer when the span fits in the
+/// first chunk, else the cut-through stream.
 pub enum PieceBody {
     OneShot(Bytes),
     Streamed(PieceStream),
@@ -530,19 +536,6 @@ fn row_slice(base: i64, no: i32, data: &[u8], start: i64, end: i64) -> Option<&[
     (hi >= lo).then(|| &data[lo as usize..=hi as usize])
 }
 
-/// All pieces' rows, fetched SPLIT_INFLIGHT at a time, returned in piece order.
-async fn fetch_pieces(pool: &Pool, pieces: &[Piece]) -> Result<Vec<Vec<(i32, Row)>>> {
-    let mut out: Vec<Vec<(i32, Row)>> = (0..pieces.len()).map(|_| Vec::new()).collect();
-    let mut fetched = futures::stream::iter(pieces.iter().copied().enumerate())
-        .map(|(i, p)| async move { fetch_part(pool, p).await.map(|rows| (i, rows)) })
-        .buffer_unordered(SPLIT_INFLIGHT);
-    while let Some(r) = fetched.next().await {
-        let (i, rows) = r?;
-        out[i] = rows;
-    }
-    Ok(out)
-}
-
 /// Contiguous `[lo, hi]` ranges of at most `step` rows covering the span.
 fn part_ranges(first_row: i32, last_row: i32, step: usize) -> impl Iterator<Item = (i32, i32)> {
     let step = step.clamp(1, i32::MAX as usize);
@@ -551,24 +544,109 @@ fn part_ranges(first_row: i32, last_row: i32, step: usize) -> impl Iterator<Item
         .map(move |lo| (lo, lo.saturating_add(step as i32 - 1).min(last_row)))
 }
 
-/// One contiguous row-range query on its own pool connection (the prepared
-/// GET_RANGE_SQL), rows sorted by `no`. Each row's bytes stay in the
-/// connection's receive buffer until the caller copies them out.
-async fn fetch_part(pool: &Pool, p: Piece) -> Result<Vec<(i32, Row)>> {
+/// Rows of `[start, end]` in `no` order, forwarded in ~CHUNK pieces as they
+/// arrive. Parts fetch concurrently (SPLIT_INFLIGHT at a time), each in its
+/// own task (`spawn_part`); the head part is cut through while later parts
+/// queue their rows. A missing row (e.g. the object was replaced under a
+/// stale meta-cache entry) is an error, never a short body.
+async fn stream_span(
+    pool: &Pool,
+    m: &Meta,
+    start: i64,
+    end: i64,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<()> {
+    let (step, inflight) = match split_rows() {
+        Some(n) => (n.min(PART_ROWS), SPLIT_INFLIGHT),
+        None => (PART_ROWS, 1), // A/B baseline: one query at a time
+    };
+    let mut todo = plan(m, start, end, step).into_iter();
+    let mut running = VecDeque::with_capacity(inflight);
+    let mut chunk = BytesMut::with_capacity(CHUNK + ROW_BYTES as usize);
+    let mut sent = 0i64;
+    loop {
+        while running.len() < inflight {
+            let Some(p) = todo.next() else { break };
+            running.push_back((p, spawn_part(pool, p)));
+        }
+        let Some((p, mut rows)) = running.pop_front() else { break };
+        // Bitmap heap scans return TID order: hold any row that runs ahead.
+        let mut early: BTreeMap<i32, Row> = BTreeMap::new();
+        let mut next = p.lo;
+        while let Some(row) = rows.recv().await {
+            let row = row?;
+            let no: i32 = row.try_get(0)?;
+            if no != next {
+                early.insert(no, row);
+                continue;
+            }
+            put_row(&mut chunk, &p, no, &row, start, end)?;
+            next += 1;
+            while let Some(row) = early.remove(&next) {
+                put_row(&mut chunk, &p, next, &row, start, end)?;
+                next += 1;
+            }
+            if chunk.len() >= CHUNK {
+                sent += chunk.len() as i64;
+                if tx.send(Ok(chunk.split().freeze())).await.is_err() {
+                    return Ok(()); // the client went away
+                }
+                chunk.reserve(CHUNK + ROW_BYTES as usize);
+            }
+        }
+        anyhow::ensure!(next > p.hi, "file {} rows {}..={}: row {next} missing", p.file_id, p.lo, p.hi);
+    }
+    anyhow::ensure!(
+        sent + chunk.len() as i64 == end - start + 1,
+        "short read: {} of {} bytes",
+        sent + chunk.len() as i64,
+        end - start + 1
+    );
+    if !chunk.is_empty() {
+        let _ = tx.send(Ok(chunk.freeze())).await;
+    }
+    Ok(())
+}
+
+/// Append row `no`'s part of `[start, end]` to `chunk`.
+fn put_row(chunk: &mut BytesMut, p: &Piece, no: i32, row: &Row, start: i64, end: i64) -> Result<()> {
+    if let Some(s) = row_slice(p.base, no, row.try_get(1)?, start, end) {
+        chunk.extend_from_slice(s);
+    }
+    Ok(())
+}
+
+/// Fetch one part in its own task, into a channel with room for all its
+/// rows: the fetch never waits on the consumer (which drains parts in order),
+/// so every in-flight part streams from PostgreSQL at full speed.
+fn spawn_part(pool: &Pool, p: Piece) -> tokio::sync::mpsc::Receiver<Result<Row>> {
+    let (tx, rx) = tokio::sync::mpsc::channel((p.hi - p.lo + 2) as usize);
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = fetch_part(&pool, p, &tx).await {
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+    rx
+}
+
+/// One contiguous row-range query (the prepared GET_RANGE_SQL) on its own
+/// pool connection; rows go to `tx` as they arrive. Each keeps its bytes in
+/// the connection's receive buffer until copied into a response chunk.
+async fn fetch_part(pool: &Pool, p: Piece, tx: &tokio::sync::mpsc::Sender<Result<Row>>) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
     let conn = pool.get().await?;
     WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
     PARTS.fetch_add(1, Relaxed);
-    let rows = conn.query(conn.range(), &[&p.file_id, &p.lo, &p.hi]).await?;
-    drop(conn);
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        out.push((r.try_get(0)?, r));
+    let params: [&(dyn ToSql + Sync); 3] = [&p.file_id, &p.lo, &p.hi];
+    let mut rows = std::pin::pin!(conn.query_raw(conn.range(), params).await?);
+    while let Some(row) = rows.try_next().await? {
+        if tx.send(Ok(row)).await.is_err() {
+            break; // the span was abandoned
+        }
     }
-    // Bitmap heap scans return TID order, not `no` order.
-    out.sort_unstable_by_key(|(no, _)| *no);
-    Ok(out)
+    Ok(())
 }
 
 /// Effective `[start, end]` inclusive for a request (mirrors the old SQL clamp).
@@ -578,63 +656,6 @@ fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
     } else {
         (first.max(0), if last >= 0 { last.min(size - 1) } else { size - 1 })
     }
-}
-
-/// Large-span path: the span splits into pieces (across part files too),
-/// fetched SPLIT_INFLIGHT at a time on separate connections and emitted in
-/// submission order (`buffered`); each piece is sorted locally (bitmap heap
-/// scans do not guarantee `no` order) and its edge rows sliced to the range.
-async fn stream_pass_through(
-    pool: &Pool,
-    m: &Meta,
-    start: i64,
-    end: i64,
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-) -> Result<()> {
-    let t0 = std::time::Instant::now();
-    let r = stream_pass_inner(pool, m, start, end, tx).await;
-    use std::sync::atomic::Ordering::Relaxed;
-    STREAM_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
-    lat_record(t0.elapsed().as_micros() as u64);
-    STREAM_N.fetch_add(1, Relaxed);
-    SERVED.fetch_add((end - start + 1) as u64, Relaxed);
-    r
-}
-
-async fn stream_pass_inner(
-    pool: &Pool,
-    m: &Meta,
-    start: i64,
-    end: i64,
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-) -> Result<()> {
-    // Parts are STREAM_PART_MAX_ROWS whatever PGVS3_SPLIT_BYTES says (it sizes
-    // the fan-out of one-buffer spans); SPLIT=0 keeps the one-query-at-a-time
-    // A/B baseline.
-    let inflight = if split_rows().is_some() { SPLIT_INFLIGHT } else { 1 };
-    // Each part fetches in its own task: `buffered` polls inline futures only
-    // while this loop awaits the head part, so they stalled whenever the
-    // body's consumer pushed back.
-    let mut parts = futures::stream::iter(plan(m, start, end, STREAM_PART_MAX_ROWS))
-        .map(|p| {
-            let pool = pool.clone();
-            tokio::spawn(async move { fetch_part(&pool, p).await.map(|rows| (p, rows)) })
-        })
-        .buffered(inflight);
-    while let Some(joined) = parts.next().await {
-        let (p, rows) = joined??;
-        let mut buf = BytesMut::with_capacity(rows.len() * ROW_BYTES as usize);
-        for (no, row) in &rows {
-            if let Some(s) = row_slice(p.base, *no, row.try_get(1)?, start, end) {
-                buf.extend_from_slice(s);
-            }
-        }
-        drop(rows);
-        if tx.send(Ok(buf.freeze())).await.is_err() {
-            return Ok(());
-        }
-    }
-    Ok(())
 }
 
 /// Buffered variant (tests, bench floor).
