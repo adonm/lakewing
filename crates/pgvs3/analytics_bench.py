@@ -157,7 +157,8 @@ def main() -> None:
     ap.add_argument("--plain-db", default=None)
     ap.add_argument("--scratch-db", default=".tmp/pgvs3/scratch.duckdb")
     ap.add_argument("--data-path", default=None)
-    ap.add_argument("--catalog", default=benchlib.PG)
+    ap.add_argument("--catalog", default=None,
+                    help="DuckLake catalog DSN (defaults: lake-s3 ducklake_catalog, lake-local ducklake_catalog_local)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 

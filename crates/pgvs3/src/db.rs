@@ -364,6 +364,36 @@ fn row_get(file_id: i64, no: i32) -> Option<Bytes> {
     hit
 }
 
+// ---------------------------------------------------------------------------
+// GET stage attribution for bottleneck hunting: time awaiting PostgreSQL
+// versus local cache/decode/assembly, and pass-through stream time. Read via
+// `stage_stats_line` (the stats route and the log timer print it).
+// ---------------------------------------------------------------------------
+static SQL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SMALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SMALL_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STREAM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STREAM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `small total=.. sql=.. local=.. | stream=.. n=.. | served=..MiB`
+pub fn stage_stats_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ms = |us: u64| us as f64 / 1e3;
+    let total = SMALL_US.load(Relaxed);
+    let sql = SQL_US.load(Relaxed);
+    format!(
+        "perf: small total={:.0}ms sql={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | served={}MiB",
+        ms(total),
+        ms(sql),
+        ms(total.saturating_sub(sql)),
+        SMALL_N.load(Relaxed),
+        ms(STREAM_US.load(Relaxed)),
+        STREAM_N.load(Relaxed),
+        SERVED.load(Relaxed) / 1024 / 1024,
+    )
+}
+
 /// Span-size buckets for the tuning counters: the gate lives at the last
 /// boundary.
 fn span_bucket(span: usize) -> usize {
@@ -461,6 +491,8 @@ pub async fn get_body(
     row_cache().lock().unwrap().spans[bkt] += 1;
 
     if (smeta.len() as usize) <= admit_bytes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t0 = std::time::Instant::now();
         let rows = gather_rows(&pool, &m, first_row, nrows).await?;
         let mut out = BytesMut::with_capacity(smeta.len() as usize);
         for (i, data) in rows.iter().enumerate() {
@@ -472,6 +504,9 @@ pub async fn get_body(
                 out.extend_from_slice(&data[lo as usize..=hi as usize]);
             }
         }
+        SMALL_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+        SMALL_N.fetch_add(1, Relaxed);
+        SERVED.fetch_add(smeta.len() as u64, Relaxed);
         Ok(Some((smeta, PieceBody::OneShot(out.freeze()))))
     } else {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
@@ -504,11 +539,13 @@ async fn gather_rows(pool: &PgPool, m: &Meta, first_row: i32, nrows: usize) -> R
         }
     }
     if !missing.is_empty() {
+        let t0 = std::time::Instant::now();
         let got = sqlx::query(GET_ROWS_FULL_SQL)
             .bind(m.file_id)
             .bind(&missing[..])
             .fetch_all(pool)
             .await?;
+        SQL_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         for r in got {
             let no: i32 = r.get("no");
             let raw = r.try_get_raw("data")?;
@@ -535,6 +572,25 @@ fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
 /// touches the cache). Rows arrive in `no` order only by plan luck (bitmap
 /// scans do not preserve it), so a tiny reorder buffer restores byte order.
 async fn stream_pass_through(
+    pool: &PgPool,
+    m: &Meta,
+    start: i64,
+    end: i64,
+    first_row: i32,
+    last_row: i32,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let r = stream_pass_inner(pool, m, start, end, first_row, last_row, tx).await;
+    use std::sync::atomic::Ordering::Relaxed;
+    STREAM_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+    STREAM_N.fetch_add(1, Relaxed);
+    SERVED.fetch_add((end - start + 1) as u64, Relaxed);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_pass_inner(
     pool: &PgPool,
     m: &Meta,
     start: i64,

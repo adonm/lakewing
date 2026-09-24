@@ -45,10 +45,11 @@ def connect(stack: str, args, extensions: tuple = ()) -> duckdb.DuckDBPyConnecti
         con.sql("SET s3_url_style='path'")
         con.sql("SET s3_access_key_id='cachebench'")
         con.sql("SET s3_secret_access_key='cachebench-local-only'")
-        con.sql(f"ATTACH 'ducklake:postgres:{args.catalog}' AS lake (DATA_PATH '{args.data_path}')")
+        con.sql(f"ATTACH 'ducklake:postgres:{args.catalog or PG}' AS lake (DATA_PATH '{args.data_path}')")
     elif stack == "lake-local":
         os.makedirs(args.local_dir, exist_ok=True)
-        con.sql(f"ATTACH 'ducklake:postgres:{PG_LOCAL}' AS lake (DATA_PATH '{args.local_dir}')")
+        # --catalog overrides the local default (rig runs point this at Aurora)
+        con.sql(f"ATTACH 'ducklake:postgres:{args.catalog or PG_LOCAL}' AS lake (DATA_PATH '{args.local_dir}')")
     return con
 
 
@@ -84,7 +85,7 @@ def gateway_stats():
         ).stdout.strip()
     except Exception:
         return None
-    return st or None
+    return st if st.startswith(("cache:", "perf:")) else None
 
 
 def write_record(record: dict, out: str) -> None:
