@@ -153,6 +153,8 @@ def main() -> None:
     ap.add_argument("--queries", default=None, help="range like 1-43 (default: all)")
     ap.add_argument("--query-timeout", type=float, default=0, help="per-query seconds (0 = unlimited)")
     ap.add_argument("--memory-limit", default=None, help="DuckDB memory_limit (default: DuckDB's 80%% of RAM)")
+    ap.add_argument("--no-file-cache", action="store_true",
+                    help="disable DuckDB's external file cache: every pass reads through the proxy")
     ap.add_argument("--src-dir", default=None)
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--plain-db", default=None)
@@ -194,10 +196,18 @@ def main() -> None:
         print(f"[{args.stack}] load: {record['load_s']}s rows={record['rows']}")
 
     for p in range(args.passes):
+        before = benchlib.gateway_counters(benchlib.gateway_stats())
         times, errors = run_pass(con, queries, lo, hi, args.query_timeout or None)
-        record["passes"].append({"times": times, "errors": errors})
+        after = benchlib.gateway_counters(benchlib.gateway_stats())
         total = sum(times.values())
-        print(f"[{args.stack}] pass {p + 1}: total {total:.1f}s")
+        rec = {"times": times, "errors": errors}
+        line = f"[{args.stack}] pass {p + 1}: total {total:.1f}s"
+        if before and after:  # read KPIs: this pass's traffic through the proxy
+            mib, gets = after[0] - before[0], after[1] - before[1]
+            rec.update(read_mib=mib, gets=gets, read_mib_s=round(mib / max(total, 1e-9), 1))
+            line += f" | proxy {gets} GETs, {mib} MiB, {rec['read_mib_s']:.0f} MiB/s"
+        record["passes"].append(rec)
+        print(line)
         print("  " + "  ".join(f"{k}={v:.2f}" for k, v in times.items()))
         for k, v in errors.items():
             print(f"  {k}: {v}")

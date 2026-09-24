@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# Benchmark loops on the AWS rig (Aurora catalog + data through pgvs3).
-# Results land in .tmp/pgvs3/rig-out/ (JSON per run + gateway cache telemetry).
+# Read-focused benchmark loops on the AWS rig (Aurora catalog + data through
+# pgvs3). Results land in .tmp/pgvs3/rig-out/ (JSON per run + gateway perf).
 #
-#   ./bench-rig.sh quick    fast loop: clickbench 10% (1.5G slices) + spatialbench
-#                           sf1 on lake-s3, 2 passes, capped queries (~15 min)
-#   ./bench-rig.sh sweep    gateway-config A/B on the quick data (split parts
-#                           PGVS3_SPLIT_BYTES): views-only, gateway restarted
-#                           per config
-#   ./bench-rig.sh full     headline run: clickbench 100% x3 passes + spatialbench
-#                           sf10 x2 passes (hours)
+#   ./bench-rig.sh load [quick|full]  the ONLY mode that writes: (re)load the
+#                           datasets once per layout version (default: both)
+#   ./bench-rig.sh quick    reads: clickbench 10% + spatialbench sf1 Q1-Q7
+#   ./bench-rig.sh full     reads: clickbench 100% + spatialbench sf10 Q1-Q7
+#   ./bench-rig.sh micro    reads, no engine: GET latency/throughput matrix
+#                           over the loaded objects + direct-PostgreSQL floor
+#   ./bench-rig.sh sweep    reads: gateway-config A/B on the quick data
 #   ./bench-rig.sh stop     kill any running driver/gateway (safe to run anytime)
 #   ./bench-rig.sh wait     re-attach to an in-flight run and fetch results
 #
-# quick loads the data; sweep iterates proxy configs on it without reloading.
+# Read runs: fresh DuckDB + fresh gateway per bench, DuckDB's external file
+# cache off (every pass reads through the proxy), 3 passes, per-pass proxy
+# GETs/MiB/MiB/s and gateway GET p50/p95/p99. Aurora stays warm: evicting its
+# buffer cache (pg_buffercache_evict_*) needs superuser, which Aurora withholds.
 # ALL storage is Aurora: the pgvs3 chunks (pgvs3_bench) and the DuckLake
 # catalogs (ducklake_click_lake_s3, ducklake_spatial_lake_s3) share the one
 # cluster, so any setup attaching them sees the same schema (multi_check
@@ -52,7 +55,8 @@ exec 9>/tmp/pgvs3-bench.lock
 flock -n 9 || { echo "another bench driver is running"; exit 3; }
 cd /home/ec2-user
 export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH
-MODE=${1:?quick|full|sweep}
+MODE=${1:?load|quick|full|micro|sweep}
+TARGET=${2:-all}
 PW=$(cat ~/.pgpw)
 END=pgvs3-perf.cluster-csmlp5ndujwv.us-east-2.rds.amazonaws.com
 BASE="postgres://pgvs3admin:${PW}@${END}:5432/pgvs3_bench?sslmode=require"
@@ -161,35 +165,62 @@ PY
 }
 
 case $MODE in
-quick)
-  fresh_catalogs ducklake_click_lake_s3 ducklake_spatial_lake_s3
-  run_one click-lake-s3 "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --parts 10 --download --load --passes 2 --query-timeout 300
-  multi_check click "$CAT_C3" 's3://lake/run-31/' hits
-  # sf1 not sf0.1: at sf0.1 the generator emits 0 buildings and DuckLake
-  # inlines the small tables into the catalog (no proxy traffic at all).
-  run_one spatial-lake-s3 "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 1 --download --load --passes 2 --query-timeout 120
-  multi_check spatial "$CAT_S3" 's3://lake/run-32/' 'trip,customer,driver,vehicle,zone,building'
+load)
+  # The only mode that writes: (re)create the benchmark datasets once per
+  # layout version; every other mode reads them.
+  if [ "$TARGET" != full ]; then
+    fresh_catalogs ducklake_click_lake_s3 ducklake_spatial_lake_s3
+    run_one load-click "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --parts 10 --download --load --passes 0
+    multi_check click "$CAT_C3" 's3://lake/run-31/' hits
+    # sf1 not sf0.1: at sf0.1 the generator emits 0 buildings and DuckLake
+    # inlines the small tables into the catalog (no proxy traffic at all).
+    run_one load-spatial "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 1 --download --load --passes 0
+    multi_check spatial "$CAT_S3" 's3://lake/run-32/' 'trip,customer,driver,vehicle,zone,building'
+  fi
+  if [ "$TARGET" != quick ]; then
+    fresh_catalogs ducklake_click_full ducklake_spatial_full
+    run_one load-click-full "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_CF" --data-path 's3://lake/run-33/' \
+      --download --load --passes 0
+    multi_check click-full "$CAT_CF" 's3://lake/run-33/' hits
+    run_one load-spatial-full "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_SF" --data-path 's3://lake/run-34/' \
+      --sf 10 --download --load --passes 0
+    multi_check spatial-full "$CAT_SF" 's3://lake/run-34/' 'trip,customer,driver,vehicle,zone,building'
+  fi
   ;;
-full)
-  fresh_catalogs ducklake_click_full ducklake_spatial_full
-  # 11GB DuckDB cap on the 16 GiB worker: load-time multipart staging lives
-  # in /dev/shm (RAM). Spatial Q8-Q12 are DuckDB-CPU-bound: bounded at 300s.
-  run_one click-full "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_CF" --data-path 's3://lake/run-33/' \
-    --download --load --passes 3 --query-timeout 600 --memory-limit 11GB
-  multi_check click-full "$CAT_CF" 's3://lake/run-33/' hits
-  run_one spatial-full "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_SF" --data-path 's3://lake/run-34/' \
-    --sf 10 --download --load --passes 2 --query-timeout 300 --memory-limit 11GB
-  multi_check spatial-full "$CAT_SF" 's3://lake/run-34/' 'trip,customer,driver,vehicle,zone,building'
+quick | full)
+  # Reads only, on data from `load`. SpatialBench Q1-Q7: Q8-Q12 are DuckDB's
+  # CPU-bound spatial joins (and a 2.0-alpha binder bug), no read-path signal.
+  if [ "$MODE" = quick ]; then
+    run_one click-quick "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" \
+      --views-only --passes 3 --no-file-cache --query-timeout 300
+    run_one spatial-quick "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 1 \
+      --views-only --passes 3 --no-file-cache --queries 1-7 --query-timeout 120
+  else
+    run_one click-full "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_CF" --data-path 's3://lake/run-33/' \
+      --views-only --passes 3 --no-file-cache --query-timeout 600
+    run_one spatial-full "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_SF" --data-path 's3://lake/run-34/' --sf 10 \
+      --views-only --passes 3 --no-file-cache --queries 1-7 --query-timeout 600
+  fi
+  ;;
+micro)
+  # The raw read path with no engine in it: GET latency/throughput over the
+  # loaded objects (sizes x concurrency), plus the direct-PostgreSQL floor.
+  gw_start
+  ./target/release/pgvs3 --url "$BASE" bench --endpoint http://127.0.0.1:8014 --bucket lake \
+    --requests 2000 --sizes 65536,262144,1048576,8388608 --concurrency 1,8,32 2>&1 | tee bench-out/micro.txt
+  echo "--- micro stats:"
+  curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
+    http://127.0.0.1:8014/_pgvs3/stats || true
   ;;
 sweep)
-  # views-only on the quick data: only the gateway config changes between
-  # runs; SPLIT=0 is the one-query-per-span baseline.
+  # Gateway-config A/B on the quick data (reads only); SPLIT=0 is the
+  # one-query-per-span baseline.
   for cfg in "8388608 default" "0 nosplit"; do
     read -r SPLIT TAG <<<"$cfg"
-    run_one "sweep-click-$TAG" "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --views-only --passes 2 --query-timeout 300
-    # Q1-Q7 only: Q8-Q12 are DuckDB's CPU-bound spatial joins (timeouts /
-    # an internal binder error on 2.0-alpha), no proxy signal; full keeps all.
-    run_one "sweep-spatial-$TAG" "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 1 --views-only --passes 2 --queries 1-7 --query-timeout 120
+    run_one "sweep-click-$TAG" "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" \
+      --views-only --passes 3 --no-file-cache --query-timeout 300
+    run_one "sweep-spatial-$TAG" "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 1 \
+      --views-only --passes 3 --no-file-cache --queries 1-7 --query-timeout 120
   done
   ;;
 *)
@@ -206,12 +237,12 @@ DRV
   printf '%s' "$PGVS3_PG_PASSWORD" | "${SSH[@]}" 'cat > ~/.pgpw && chmod 600 ~/.pgpw'
   # rm before nohup (sync), and the driver flocks /tmp/pgvs3-bench.lock so two
   # drivers can never coexist and kill each other's gateway mid-upload.
-  "${SSH[@]}" "chmod +x ~/run-analytics.sh; rm -f ~/BENCH.DONE; nohup ~/run-analytics.sh $MODE >~/bench-driver-$MODE-\$(date +%H%M%S).log 2>&1 & echo driver-started-$MODE"
+  "${SSH[@]}" "chmod +x ~/run-analytics.sh; rm -f ~/BENCH.DONE; nohup ~/run-analytics.sh $MODE ${2:-} >~/bench-driver-$MODE-\$(date +%H%M%S).log 2>&1 & echo driver-started-$MODE"
 fi
 
 echo "waiting for ~/BENCH.DONE ..."
 until "${SSH[@]}" 'test -f BENCH.DONE' 2>/dev/null; do sleep 30; done
 mkdir -p .tmp/pgvs3/rig-out
-scp -i $KEY -o StrictHostKeyChecking=accept-new -q "ec2-user@$IP:bench-out/*.json" .tmp/pgvs3/rig-out/ 2>/dev/null || true
+scp -i $KEY -o StrictHostKeyChecking=accept-new -q "ec2-user@$IP:bench-out/*" .tmp/pgvs3/rig-out/ 2>/dev/null || true
 "${SSH[@]}" 'ls -t ~/bench-driver-*.log | head -1 | xargs tail -30' || true
 echo "results in .tmp/pgvs3/rig-out/"

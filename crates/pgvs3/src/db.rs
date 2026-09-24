@@ -329,6 +329,28 @@ fn meta_invalidate(bucket: &str, key: &str) {
 // via `stage_stats_line` (the stats route and the log timer print it).
 // ---------------------------------------------------------------------------
 static SPANS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+// GET latency histogram: quarter-octave buckets of microseconds (~19%
+// resolution), read back as p50/p95/p99.
+static LAT: [std::sync::atomic::AtomicU64; 128] = [const { std::sync::atomic::AtomicU64::new(0) }; 128];
+
+fn lat_record(us: u64) {
+    let idx = ((us.max(1) as f64).log2() * 4.0) as usize;
+    LAT[idx.min(127)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Upper bound (ms) of the bucket holding the `p` quantile.
+fn lat_pct(counts: &[u64], p: f64) -> f64 {
+    let total: u64 = counts.iter().sum();
+    let target = (total as f64 * p).ceil() as u64;
+    let mut seen = 0;
+    for (i, c) in counts.iter().enumerate() {
+        seen += c;
+        if total > 0 && seen >= target {
+            return 2f64.powf((i + 1) as f64 / 4.0) / 1e3;
+        }
+    }
+    0.0
+}
 // Small path: wall time per request and of its (parallel) fetch phase.
 static SMALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FETCH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -348,8 +370,9 @@ pub fn stage_stats_line() -> String {
     let total = SMALL_US.load(Relaxed);
     let fetch = FETCH_US.load(Relaxed);
     let s: Vec<u64> = SPANS.iter().map(|a| a.load(Relaxed)).collect();
+    let lat: Vec<u64> = LAT.iter().map(|a| a.load(Relaxed)).collect();
     format!(
-        "perf: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small total={:.0}ms fetch={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | parts={} wait(sum)={:.0}ms | served={}MiB",
+        "perf: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small total={:.0}ms fetch={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
         s[0],
         s[1],
         s[2],
@@ -364,6 +387,9 @@ pub fn stage_stats_line() -> String {
         PARTS.load(Relaxed),
         ms(WAIT_US.load(Relaxed)),
         SERVED.load(Relaxed) / 1024 / 1024,
+        lat_pct(&lat, 0.50),
+        lat_pct(&lat, 0.95),
+        lat_pct(&lat, 0.99),
     )
 }
 
@@ -444,6 +470,7 @@ pub async fn get_body(
             }
         }
         SMALL_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+        lat_record(t0.elapsed().as_micros() as u64);
         SMALL_N.fetch_add(1, Relaxed);
         SERVED.fetch_add(smeta.len() as u64, Relaxed);
         Ok(Some((smeta, PieceBody::OneShot(out.freeze()))))
@@ -561,6 +588,7 @@ async fn stream_pass_through(
     let r = stream_pass_inner(pool, m, start, end, tx).await;
     use std::sync::atomic::Ordering::Relaxed;
     STREAM_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+    lat_record(t0.elapsed().as_micros() as u64);
     STREAM_N.fetch_add(1, Relaxed);
     SERVED.fetch_add((end - start + 1) as u64, Relaxed);
     r

@@ -6,6 +6,7 @@ signed gateway telemetry fetch.
 """
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -36,6 +37,10 @@ def connect(stack: str, args, extensions: tuple = ()) -> duckdb.DuckDBPyConnecti
     con.sql("SET http_timeout=300")
     if getattr(args, "memory_limit", None):
         con.sql(f"SET memory_limit='{args.memory_limit}'")
+    if getattr(args, "no_file_cache", False):
+        # Every pass then re-reads through httpfs, i.e. through the proxy:
+        # passes after the first measure the read path, not DuckDB's cache.
+        con.sql("SET enable_external_file_cache = false")
     for ext in ("postgres", "httpfs", "ducklake", *extensions):
         if stack == "plain" and ext in ("postgres", "httpfs", "ducklake"):
             continue
@@ -88,6 +93,12 @@ def gateway_stats():
     except Exception:
         return None
     return st if st.startswith("perf:") else None
+
+
+def gateway_counters(st):
+    """(MiB served, GETs) from a gateway perf line, or None."""
+    m = st and re.search(r"small total=\S+ fetch=\S+ local=\S+ n=(\d+) \| stream=\S+ n=(\d+) .* served=(\d+)MiB", st)
+    return (int(m.group(3)), int(m.group(1)) + int(m.group(2))) if m else None
 
 
 def write_record(record: dict, out: str) -> None:
