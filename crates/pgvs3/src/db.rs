@@ -164,12 +164,15 @@ fn epoch(secs: f64) -> SystemTime {
 // ---------------------------------------------------------------------------
 // Small in-process caches between consumers (DuckLake workers own the big byte
 // cache) and Aurora: their only job is removing round trips. Meta is the
-// pinned tier (count-capped, never evicted by byte pressure). Rows use 2Q:
-// admission is gated on span size so scan floods never enter, probation is
-// FIFO (25%), and a row earns protected-tier LRU residency (75%) only on its
-// second distinct read. Coherence is structural: publish populates, delete
-// drops. PGVS3_CACHE_MIB=0 disables the row tier; PGVS3_ADMIT_ROWS tunes the
-// gate (default 8 rows = 64 KiB) against the stats log.
+// pinned tier (count-capped, never evicted by byte pressure). Rows use S3-FIFO
+// with a span-size gate: the gate only exists to keep scan-flood bytes out of
+// the machinery, while frequency-based promotion (second touch, or ghost
+// re-arrival) is what pins hot spans. Tuned for analytical workloads
+// (ClickBench / SpatialBench on DuckLake): the recurring hot unit there is a
+// column chunk (100 KiB–8 MiB), so admission is span-bounded
+// (PGVS3_ADMIT_BYTES, default 8 MiB) rather than tiny — hot chunks of any
+// reasonable size earn residency on a second read, geometry floods pass
+// through. PGVS3_CACHE_MIB=0 disables the row tier entirely.
 // ---------------------------------------------------------------------------
 
 const META_CAP: usize = 1 << 18;
@@ -228,12 +231,11 @@ struct RowCache {
     g_order: VecDeque<(i64, i32)>,
     budget: usize,
     enabled: bool,
-    // counters for gate/policy tuning (printed by the server's stats line)
-    pub small_reqs: u64,
-    pub big_reqs: u64,
+    // per-span-size counters for gate tuning (printed by the stats line)
+    pub spans: [u64; 5],
     pub hits: u64,
-    pub promotes: u64,
     pub admits: u64,
+    pub promotes: u64,
     pub admits_ghost: u64,
 }
 
@@ -258,8 +260,7 @@ fn row_cache() -> &'static Mutex<RowCache> {
             g_order: VecDeque::new(),
             budget,
             enabled: budget > 0,
-            small_reqs: 0,
-            big_reqs: 0,
+            spans: [0; 5],
             hits: 0,
             promotes: 0,
             admits: 0,
@@ -363,13 +364,30 @@ fn row_get(file_id: i64, no: i32) -> Option<Bytes> {
     hit
 }
 
-/// One-line cache telemetry for tuning PGVS3_ADMIT_ROWS / PGVS3_CACHE_MIB.
+/// Span-size buckets for the tuning counters: the gate lives at the last
+/// boundary.
+fn span_bucket(span: usize) -> usize {
+    const T: [usize; 4] = [65536, 524_288, 2_097_152, 8_388_608];
+    T.iter().position(|&t| span < t).unwrap_or(4)
+}
+
+fn admit_bytes() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PGVS3_ADMIT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8 * 1024 * 1024)
+    })
+}
+
+/// One-line cache telemetry for tuning PGVS3_ADMIT_BYTES / PGVS3_CACHE_MIB.
 pub fn cache_stats_line() -> String {
     let c = row_cache().lock().unwrap();
-    let reqs = c.small_reqs + c.big_reqs;
     format!(
-        "cache: reqs={} (small={} big={}) hits={} admits={} (ghost={} promotes={}) tiers=s:{}B/m:{}B",
-        reqs, c.small_reqs, c.big_reqs, c.hits, c.admits, c.admits_ghost, c.promotes, c.s_used, c.m_used
+        "cache: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] hits={} admits={} (ghost={} promotes={}) tiers=s:{}B/m:{}B",
+        c.spans[0], c.spans[1], c.spans[2], c.spans[3], c.spans[4],
+        c.hits, c.admits, c.admits_ghost, c.promotes, c.s_used, c.m_used
     )
 }
 
@@ -439,9 +457,10 @@ pub async fn get_body(
     let first_row = (start / ROW_BYTES) as i32;
     let last_row = (end / ROW_BYTES) as i32;
     let nrows = (last_row - first_row + 1) as usize;
+    let bkt = span_bucket(smeta.len() as usize);
+    row_cache().lock().unwrap().spans[bkt] += 1;
 
-    if nrows <= admit_rows() {
-        row_cache().lock().unwrap().small_reqs += 1;
+    if (smeta.len() as usize) <= admit_bytes() {
         let rows = gather_rows(&pool, &m, first_row, nrows).await?;
         let mut out = BytesMut::with_capacity(smeta.len() as usize);
         for (i, data) in rows.iter().enumerate() {
@@ -455,7 +474,6 @@ pub async fn get_body(
         }
         Ok(Some((smeta, PieceBody::OneShot(out.freeze()))))
     } else {
-        row_cache().lock().unwrap().big_reqs += 1;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
         tokio::spawn(async move {
             if let Err(e) = stream_pass_through(&pool, &m, start, end, first_row, last_row, &tx).await {
@@ -556,16 +574,6 @@ async fn stream_pass_through(
     Ok(())
 }
 
-fn admit_rows() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("PGVS3_ADMIT_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8)
-    })
-}
-
 /// Buffered variant (tests, bench floor).
 pub async fn get(pool: &PgPool, bucket: &str, key: &str, first: i64, last: i64, suffix: i64) -> Result<Option<Slice>> {
     let Some((meta, body)) =
@@ -604,29 +612,17 @@ pub struct Slice {
     pub bytes: Bytes,
 }
 
-/// Overwrite-or-create in one transaction. The ETag is the sha256 of the body,
-/// so retried identical PUTs are idempotent.
+/// Overwrite-or-create through the ingest pipeline — the single write path
+/// for buffered and multipart writes alike. The ETag is the caller's sha256
+/// (idempotent retries); visibility is atomic via `publish`.
 pub async fn put(pool: &PgPool, bucket: &str, key: &str, data: &[u8], etag: &[u8]) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    let file_id = replace_object_row(&mut tx, bucket, key, data.len() as i64, etag).await?;
-
-    let mut sink = tx.copy_in_raw(COPY_SQL).await?;
-    let mut buf = Vec::with_capacity(SEND_BATCH);
-    buf.extend_from_slice(&COPY_HEADER);
-    for (b, batch) in data.chunks(ROW_BYTES as usize * ROW_BATCH).enumerate() {
-        frame_rows(file_id, (b * ROW_BATCH) as i32, batch, &mut buf);
-        if buf.len() >= SEND_BATCH {
-            sink.send(&buf[..]).await?;
-            buf.clear();
-        }
+    let writer = ChunkWriter::start(pool.clone()).await?;
+    let file_id = writer.file_id;
+    for chunk in data.chunks(SEND_BATCH) {
+        writer.push(Bytes::copy_from_slice(chunk)).await?;
     }
-    buf.extend_from_slice(&COPY_TRAILER);
-    sink.send(&buf[..]).await?;
-    sink.finish().await?;
-
-    tx.commit().await?;
-    publish_cache(bucket, key, file_id, data.len() as i64, etag);
-    Ok(())
+    let (size, _sum) = writer.finish().await?;
+    publish(pool, bucket, key, file_id, size, etag).await
 }
 
 /// Streaming ingest: bytes flow into one open binary COPY stream through
@@ -829,44 +825,6 @@ fn frame_rows(file_id: i64, first_no: i32, data: &[u8], out: &mut Vec<u8>) {
         out.extend_from_slice(&((end - start) as i32).to_be_bytes());
         out.extend_from_slice(&data[start..end]);
     }
-}
-
-/// Delete any previous object with this key and insert its row. Plain
-/// statements on purpose: a single-statement CTE here (delete + scrub + insert)
-/// is snapshot-hazardous — the insert's conflict handling can observe the
-/// pre-delete row while the scrub's deletions are not yet visible to the chunk
-/// insert, colliding on chunks_pkey on overwrite.
-async fn replace_object_row(
-    tx: &mut Transaction<'_, sqlx::Postgres>,
-    bucket: &str,
-    key: &str,
-    size: i64,
-    etag: &[u8],
-) -> Result<i64> {
-    let old: Option<i64> =
-        sqlx::query("DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id")
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|r| r.get("file_id"));
-    if let Some(old_id) = old {
-        sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
-            .bind(old_id)
-            .execute(&mut **tx)
-            .await?;
-    }
-    let file_id: i64 = sqlx::query(
-        "INSERT INTO s3p.objects (bucket, key, size, etag) VALUES ($1, $2, $3, $4) RETURNING file_id",
-    )
-    .bind(bucket)
-    .bind(key)
-    .bind(size)
-    .bind(etag)
-    .fetch_one(&mut **tx)
-    .await?
-    .get("file_id");
-    Ok(file_id)
 }
 
 pub async fn delete(pool: &PgPool, bucket: &str, key: &str) -> Result<bool> {
