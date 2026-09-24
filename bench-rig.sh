@@ -44,9 +44,19 @@ fi
 
 if [ "$MODE" != "wait" ]; then
   tar czf - Cargo.toml Cargo.lock .cargo crates mise.toml justfile | "${SSH[@]}" 'tar xzf -'
-  # Rebuild on every deploy: source and binary must match (the binary is
-  # built on the rig — Fedora-built binaries do not run on AL2023).
-  "${SSH[@]}" 'touch crates/pgvs3/src/lib.rs && ~/.cargo/bin/cargo build --release -p pgvs3 2>&1 | tail -1'
+  # Rebuild only when the Rust build inputs changed (a fat-LTO relink is ~1.5
+  # min; harness/SQL edits need none). Built on the rig: Fedora-built binaries
+  # do not run on AL2023. The hash is recorded only after a successful build.
+  HASH=$(find crates Cargo.toml Cargo.lock .cargo -type f \( -name '*.rs' -o -name Cargo.toml \
+           -o -name Cargo.lock -o -name schema.sql -o -path '.cargo/*' \) -print0 \
+         | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+  "${SSH[@]}" "if [ -x target/release/pgvs3 ] && [ \"\$(cat .pgvs3-build 2>/dev/null)\" = $HASH ]; then
+      echo 'binary current ($HASH)'
+    elif touch crates/pgvs3/src/lib.rs && ~/.cargo/bin/cargo build --release -p pgvs3 >/tmp/pgvs3-build.log 2>&1; then
+      tail -1 /tmp/pgvs3-build.log; echo $HASH > .pgvs3-build
+    else
+      tail -20 /tmp/pgvs3-build.log; exit 1
+    fi"
   "${SSH[@]}" 'cat > ~/run-analytics.sh' <<'DRV'
 #!/usr/bin/env bash
 # $1 = quick | full | sweep. Results in ~/bench-out, ~/BENCH.DONE marks the end.
