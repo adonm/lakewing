@@ -121,6 +121,31 @@ moves ~650 MiB/s (EC2's single-flow cap) and the instance ~3.8 GiB/s. The
 gateway adds ~0.25 ms per request, and Aurora spends most of its time waiting
 to send (`Client:ClientWrite`).
 
+## Potential further gains
+
+Small ones: reads are ~20% of a pass and network-bound. Measure before
+building.
+
+- **DuckDB read merging.** Try `parquet_prefetch_column_gap` values through
+  `BENCH_EXTRA`; DuckDB already read ~10% fewer bytes once GETs got faster.
+  A win is a user setting, not code.
+- **Single large streams.** One 64 MiB GET gets ~1.7 of the ~3.8 GiB/s
+  available, and SpatialBench's zone queries read ~640 MiB chunks (up to
+  ~0.3 s per pass). Profile the forwarding path first.
+- **Small-GET overhead.** The gateway adds ~0.25 ms per request, at most
+  2–3% of a pass. Act only on a clear profile hotspot (SigV4, s3s, hyper).
+- **Cold reads.** Aurora caps PostgreSQL 18's read merging at 128 KiB
+  (`io_max_combine_limit`). Raising it is a parameter-group experiment on a
+  dataset larger than the cache (`just rig full`).
+- **Outside the gateway.** A larger instance raises the ~3.8 GiB/s ceiling;
+  fleets spread over AZs want an Aurora reader in each (a cross-AZ round trip
+  costs ~7×).
+- **Tried, no gain:** a proxy cache or prefetcher, splitting reads under
+  8 MiB, bigger TCP buffers, DuckDB's curl HTTP client.
+
+Before more tuning: integration tests against a local PostgreSQL (range
+edges, multipart lifecycle, overwrite/delete, the orphan sweep).
+
 ## Benchmarks
 
 - Local: `just clickbench`, `just spatialbench sf=10` and `just tpch sf=10`
