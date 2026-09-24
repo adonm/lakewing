@@ -183,7 +183,9 @@ sweep)
              "2048 8388608 2097152 split2m" "0 8388608 1048576 nocache"; do
     read -r MIB ADM SPLIT TAG <<<"$cfg"
     run_one "sweep-click-$TAG" "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --views-only --passes 2 --query-timeout 300
-    run_one "sweep-spatial-$TAG" "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 1 --views-only --passes 2 --query-timeout 120
+    # Q1-Q7 only: Q8-Q12 are DuckDB's CPU-bound spatial joins (timeouts /
+    # an internal binder error on 2.0-alpha), no proxy signal; full keeps all.
+    run_one "sweep-spatial-$TAG" "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 1 --views-only --passes 2 --queries 1-7 --query-timeout 120
   done
   ;;
 *)
