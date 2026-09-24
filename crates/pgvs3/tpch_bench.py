@@ -5,10 +5,7 @@
 # ///
 """TPC-H (DuckDB `tpch` extension) on DuckLake over pgvs3.
 
-Stacks:
-  lake-s3     DuckLake, catalog=PostgreSQL, DATA_PATH = s3:// via the pgvs3 gateway
-  lake-local  DuckLake, catalog=PostgreSQL, DATA_PATH = local directory (baseline)
-  plain       TPC-H tables in a local DuckDB file (engine ceiling)
+Stacks: see benchlib.connect (lake-s3 / lake-local / plain).
 
 Loads with `CALL dbgen`, times every TPC-H query for `--passes` passes, and
 writes a JSON record. Example:
@@ -20,43 +17,13 @@ writes a JSON record. Example:
 """
 
 import argparse
-import json
-import os
-import subprocess
 import time
 
 import duckdb
 
+import benchlib
+
 TABLES = ["region", "nation", "supplier", "part", "partsupp", "customer", "orders", "lineitem"]
-PG = "dbname=ducklake_catalog host=127.0.0.1 user=postgres password=postgres"
-PG_LOCAL = "dbname=ducklake_catalog_local host=127.0.0.1 user=postgres password=postgres"
-
-
-def connect(stack: str, args) -> duckdb.DuckDBPyConnection:
-    # File-backed scratch: SF100 raw TPC-H does not fit in RAM. Spills go to
-    # the NVMe tree, not the tmpfs /tmp.
-    con = duckdb.connect(args.scratch_db if stack.startswith("lake") else args.plain_db)
-    con.sql("SET temp_directory='.tmp/pgvs3/duckdb-temp'")
-    # Multipart Completes flush through the proxy into Aurora; the default
-    # 30s response window is smaller than a big flush under load, and httpfs
-    # refuses to retry an unknown-outcome Complete. Generous window.
-    con.sql("SET http_timeout=300")
-    for ext in ("postgres", "httpfs", "ducklake", "tpch"):
-        if stack == "plain" and ext in ("postgres", "httpfs", "ducklake"):
-            continue
-        con.sql(f"INSTALL {ext}")
-        con.sql(f"LOAD {ext}")
-    if stack == "lake-s3":
-        con.sql("SET s3_endpoint='127.0.0.1:8014'")
-        con.sql("SET s3_use_ssl=false")
-        con.sql("SET s3_url_style='path'")
-        con.sql("SET s3_access_key_id='cachebench'")
-        con.sql("SET s3_secret_access_key='cachebench-local-only'")
-        con.sql(f"ATTACH 'ducklake:postgres:{args.catalog}' AS lake (DATA_PATH '{args.data_path}')")
-    elif stack == "lake-local":
-        os.makedirs(args.local_dir, exist_ok=True)
-        con.sql(f"ATTACH 'ducklake:postgres:{PG_LOCAL}' AS lake (DATA_PATH '{args.local_dir}')")
-    return con
 
 
 def load(con, stack: str, sf: float) -> float:
@@ -82,9 +49,7 @@ def load(con, stack: str, sf: float) -> float:
 def run_pass(con, queries) -> dict:
     times = {}
     for q in queries:
-        t0 = time.perf_counter()
-        con.execute(f"PRAGMA tpch({q})").fetchall()
-        times[q] = round(time.perf_counter() - t0, 3)
+        times[q] = benchlib.run_sql(con, f"PRAGMA tpch({q})")[0]
     return times
 
 
@@ -100,14 +65,14 @@ def main() -> None:
     ap.add_argument("--plain-db", default=".tmp/pgvs3/plain.duckdb")
     ap.add_argument("--scratch-db", default=".tmp/pgvs3/scratch.duckdb")
     ap.add_argument("--data-path", default="s3://lake/ducklake/")
-    ap.add_argument("--catalog", default=PG)
+    ap.add_argument("--catalog", default=benchlib.PG)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     lo, _, hi = args.queries.partition("-")
     queries = list(range(int(lo), int(hi or lo) + 1))
 
-    con = connect(args.stack, args)
+    con = benchlib.connect(args.stack, args, extensions=("tpch",))
     record = {"stack": args.stack, "sf": args.sf, "duckdb": duckdb.__version__, "passes": []}
     if args.views_only:
         for t in TABLES:
@@ -125,23 +90,11 @@ def main() -> None:
 
     # Gateway cache telemetry (signed debug route) — the tuning surface for
     # PGVS3_ADMIT_BYTES / PGVS3_CACHE_MIB, captured per run.
-    try:
-        st = subprocess.run(
-            ["curl", "-s", "--aws-sigv4", "aws:amz:us-east-1:s3",
-             "--user", "cachebench:cachebench-local-only",
-             "http://127.0.0.1:8014/_pgvs3/stats"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-        if st:
-            record["gateway_stats"] = st
-            print("gateway:", st)
-    except Exception:
-        pass
+    if st := benchlib.gateway_stats():
+        record["gateway_stats"] = st
+        print("gateway:", st)
 
-    out = args.out or f".tmp/pgvs3/tpch-{args.stack}-sf{args.sf:g}.json"
-    with open(out, "w") as f:
-        json.dump(record, f, indent=1)
-    print(f"wrote {out}")
+    benchlib.write_record(record, args.out or f".tmp/pgvs3/tpch-{args.stack}-sf{args.sf:g}.json")
 
 
 if __name__ == "__main__":

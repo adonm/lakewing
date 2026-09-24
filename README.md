@@ -113,6 +113,14 @@ Range GETs (p50, conc=1):
 
 ## Repo layout
 
+- `crates/pgvs3/queries/` — vendored benchmark SQL: ClickBench `duckdb/queries.sql`
+  (43, verbatim from ClickHouse/ClickBench) and Sedona-SpatialBench's 12
+  DuckDB-dialect queries (from apache/sedona-spatialbench `print_queries.py`).
+- `crates/pgvs3/analytics_bench.py` — ClickBench / SpatialBench on the
+  lake-s3 / lake-local / plain stacks (load, timed passes, per-query timeout,
+  cache telemetry). `tpch_bench.py` is the same for TPC-H; both share
+  `benchlib.py`. Recipes: `just clickbench`, `just spatialbench sf=10`.
+
 - `crates/pgvs3` — the service (`lib` + `bin`; the lib is embeddable, e.g.
   in-process in an application) plus `tpch_bench.py`, the DuckLake workload
   verification.

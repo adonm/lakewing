@@ -2,7 +2,7 @@
 URL := "postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench"
 
 default:
-    @echo "setup | dev-db | smoke | seed | micro | tpch sf=10 stack=lake-s3 | dev-origin | dev-origin-clean"
+    @echo "setup | dev-db | smoke | seed | micro | tpch sf=10 stack=lake-s3 | clickbench | spatialbench sf=10 | dev-origin | dev-origin-clean"
 
 # Fetch everything the build needs (mise auto-installs the toolchain).
 setup:
@@ -28,6 +28,8 @@ dev-db:
       sleep 1
     done
     docker exec pgvs3-pg psql -U postgres -c 'CREATE DATABASE pgvs3_bench' 2>/dev/null || true
+    docker exec pgvs3-pg psql -U postgres -c 'CREATE DATABASE ducklake_catalog' 2>/dev/null || true
+    docker exec pgvs3-pg psql -U postgres -c 'CREATE DATABASE ducklake_catalog_local' 2>/dev/null || true
     echo "postgres up: {{URL}}"
 
 # End-to-end proof on a fresh host: build, seed a little, serve, ranged GET.
@@ -60,6 +62,14 @@ tpch sf="10" stack="lake-s3" extra="":
 # Same, on the DuckDB 2.0 pre-release line (async I/O).
 tpch2 sf="10" stack="lake-s3" extra="":
     uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/tpch_bench.py --stack {{stack}} --sf {{sf}} --load --passes 2 {{extra}}
+
+# ClickBench on DuckLake (43 queries, hits.parquet via --download).
+clickbench stack="lake-s3" passes="3" extra="":
+    uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/analytics_bench.py --bench click --stack {{stack}} --download --load --passes {{passes}} {{extra}}
+
+# Sedona-SpatialBench on DuckLake (12 queries, DuckDB dialect).
+spatialbench sf="10" stack="lake-s3" passes="3" extra="":
+    uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/analytics_bench.py --bench spatial --sf {{sf}} --stack {{stack}} --download --load --passes {{passes}} {{extra}}
 
 # Real-S3-semantics test origin (SeaweedFS) for conformance tests.
 dev-origin:
