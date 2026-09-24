@@ -223,9 +223,10 @@ micro)
     http://127.0.0.1:8014/_pgvs3/stats || true
   ;;
 sweep)
-  # Gateway-config A/B on the quick data (reads only); SPLIT=0 is the
-  # one-query-per-span baseline.
-  for cfg in "8388608 default" "0 nosplit"; do
+  # Gateway-config A/B on the quick data (reads only). SPLIT sizes the
+  # fan-out of one-buffer (<= 8 MiB) spans across connections; 0 = one query
+  # per span.
+  for cfg in "8388608 8m" "2097152 2m" "1048576 1m"; do
     read -r SPLIT TAG <<<"$cfg"
     run_one "sweep-click-$TAG" "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" \
       --views-only --passes 3 --no-file-cache --query-timeout 300

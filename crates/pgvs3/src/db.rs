@@ -4,13 +4,13 @@
 //! in-process (pinned, count-capped; populated at publish, dropped at delete),
 //! so opening an object costs no round trip. Row bytes are not cached: DuckDB
 //! caches what it reads, and a proxy row cache measured ~0% hits on
-//! ClickBench/SpatialBench for ~0.5 ms of CPU per request. Each GET is one
-//! contiguous row-range query; spans above PGVS3_SPLIT_BYTES (default 8 MiB)
-//! fetch in parallel
-//! parts on separate pool connections: one Aurora connection moves ~420-500
-//! MB/s warm / ~300 MB/s cold, which binds a lone large read. At DuckDB's
-//! concurrency (many GETs already in flight) smaller parts measured no gain
-//! and 512 KiB parts hurt, so only big spans fan out.
+//! ClickBench/SpatialBench for ~0.5 ms of CPU per request. A span up to 8 MiB
+//! is one contiguous row-range query; larger spans stream through in 8 MiB
+//! parts fetched in parallel on separate pool connections, since one Aurora
+//! connection moves ~530 MiB/s (EC2's 5 Gbps single-flow cap). Fanning the
+//! smaller spans out too (PGVS3_SPLIT_BYTES) measured worse at DuckDB's
+//! concurrency even on hot connections: 2 MiB parts +5% ClickBench and
+//! SpatialBench pass time, 1 MiB +12-21%.
 //!
 //! Write path: every PUT and every multipart part streams straight into its
 //! own binary COPY on its own connection as it arrives: no staging, no global
@@ -64,8 +64,9 @@ const SPLIT_INFLIGHT: usize = 8;
 /// Pass-through parts never buffer more than ~8 MiB each.
 const STREAM_PART_MAX_ROWS: usize = 1024;
 
-/// Rows per parallel part (PGVS3_SPLIT_BYTES, default 8 MiB = only spans above
-/// the admission gate split; 0 disables splitting entirely, for A/B runs).
+/// Rows per parallel piece of a one-buffer span (PGVS3_SPLIT_BYTES; default
+/// 8 MiB = ONESHOT_MAX, i.e. no fan-out). 0 also makes streams fetch one part
+/// at a time: the A/B baseline.
 fn split_rows() -> Option<usize> {
     static N: OnceLock<Option<usize>> = OnceLock::new();
     *N.get_or_init(|| {
@@ -607,15 +608,21 @@ async fn stream_pass_inner(
     end: i64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<()> {
-    let (step, inflight) = match split_rows() {
-        Some(n) => (n.min(STREAM_PART_MAX_ROWS), SPLIT_INFLIGHT),
-        None => (STREAM_PART_MAX_ROWS, 1), // A/B baseline: one query at a time
-    };
-    let mut parts = futures::stream::iter(plan(m, start, end, step))
-        .map(|p| async move { fetch_part(pool, p).await.map(|rows| (p, rows)) })
+    // Parts are STREAM_PART_MAX_ROWS whatever PGVS3_SPLIT_BYTES says (it sizes
+    // the fan-out of one-buffer spans); SPLIT=0 keeps the one-query-at-a-time
+    // A/B baseline.
+    let inflight = if split_rows().is_some() { SPLIT_INFLIGHT } else { 1 };
+    // Each part fetches in its own task: `buffered` polls inline futures only
+    // while this loop awaits the head part, so they stalled whenever the
+    // body's consumer pushed back.
+    let mut parts = futures::stream::iter(plan(m, start, end, STREAM_PART_MAX_ROWS))
+        .map(|p| {
+            let pool = pool.clone();
+            tokio::spawn(async move { fetch_part(&pool, p).await.map(|rows| (p, rows)) })
+        })
         .buffered(inflight);
-    while let Some(r) = parts.next().await {
-        let (p, rows) = r?;
+    while let Some(joined) = parts.next().await {
+        let (p, rows) = joined??;
         let mut buf = BytesMut::with_capacity(rows.len() * ROW_BYTES as usize);
         for (no, row) in &rows {
             if let Some(s) = row_slice(p.base, *no, row.try_get(1)?, start, end) {
