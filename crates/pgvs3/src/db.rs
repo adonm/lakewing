@@ -28,7 +28,6 @@ use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row, Transaction};
-use std::path::PathBuf;
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
 
@@ -87,10 +86,11 @@ pub async fn connect(url: &str) -> Result<PgPool> {
                 if !durable {
                     let _ = sqlx::query("SET synchronous_commit = off").execute(&mut *conn).await;
                 }
-                // PG18 AIO tuning is postmaster-scoped (parameter groups on
-                // Aurora); attempted best-effort in case that changes.
-                let _ = sqlx::query("SET io_method = 'io_uring'").execute(&mut *conn).await;
-                let _ = sqlx::query("SET io_workers = 8").execute(&mut *conn).await;
+                // PG18 read-stream combine width (pages per async op): wider
+                // suiting network storage. io_method/io_workers are
+                // postmaster-scoped and absent from Aurora's parameter-group
+                // surface entirely — io_combine_limit is the live knob.
+                let _ = sqlx::query("SET io_combine_limit = 64").execute(&mut *conn).await;
                 Ok(())
             })
         })
@@ -413,18 +413,18 @@ async fn object_row(
         .map(|r| r.get("file_id")))
 }
 
-/// Serve `[start, end]` of an object as a stream of pieces in byte order.
-/// Spans above the admission gate stream straight through (no cache reads or
-/// writes — their bytes live in DuckLake's buffer); small spans are served
-/// from the 2Q row cache and fetch only misses.
-pub async fn get_stream(
+/// Serve `[start, end]` of an object. Spans above the admission gate stream
+/// straight through (no cache reads or writes — their bytes live in DuckLake's
+/// buffer); small spans take the fast path: rows gathered in memory (2Q cache
+/// first, one query for misses) and concatenated — no channel hop, no task.
+pub async fn get_body(
     pool: PgPool,
     bucket: String,
     key: String,
     first: i64,
     last: i64,
     suffix: i64,
-) -> Result<Option<(SliceMeta, PieceStream)>> {
+) -> Result<Option<(SliceMeta, PieceBody)>> {
     let Some(m) = meta(&pool, &bucket, &key).await? else { return Ok(None) };
     let (start, end) = eff_range(m.size, first, last, suffix);
     let smeta = SliceMeta {
@@ -435,51 +435,46 @@ pub async fn get_stream(
         start,
         end,
     };
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-    tokio::spawn(async move {
-        let res = stream_span(&pool, &m, start, end, &tx).await;
-        if let Err(e) = res {
-            let _ = tx.send(Err(io_err(e))).await;
-        }
-    });
-    Ok(Some((smeta, PieceStream { rx })))
-}
-
-/// Effective `[start, end]` inclusive for a request (mirrors the old SQL clamp).
-fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
-    if suffix >= 0 {
-        ((size - suffix).max(0), size - 1)
-    } else {
-        (first.max(0), if last >= 0 { last.min(size - 1) } else { size - 1 })
-    }
-}
-
-/// Fetch `[start, end]` in byte order into the channel. The admission gate is
-/// per-request span: large spans bypass the cache entirely; small spans serve
-/// hits from 2Q and fetch misses in one query (whole rows, so entries are
-/// reusable at any sub-range).
-async fn stream_span(
-    pool: &PgPool,
-    m: &Meta,
-    start: i64,
-    end: i64,
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-) -> Result<()> {
     let first_row = (start / ROW_BYTES) as i32;
     let last_row = (end / ROW_BYTES) as i32;
     let nrows = (last_row - first_row + 1) as usize;
 
-    if nrows > admit_rows() {
+    if nrows <= admit_rows() {
+        row_cache().lock().unwrap().small_reqs += 1;
+        let rows = gather_rows(&pool, &m, first_row, nrows).await?;
+        let mut out = BytesMut::with_capacity(smeta.len() as usize);
+        for (i, data) in rows.iter().enumerate() {
+            let no = first_row + i as i32;
+            let row_start = i64::from(no) * ROW_BYTES;
+            let lo = start.max(row_start) - row_start;
+            let hi = end.min(row_start + data.len() as i64 - 1) - row_start;
+            if hi >= lo {
+                out.extend_from_slice(&data[lo as usize..=hi as usize]);
+            }
+        }
+        Ok(Some((smeta, PieceBody::OneShot(out.freeze()))))
+    } else {
         row_cache().lock().unwrap().big_reqs += 1;
-        return stream_pass_through(pool, m, start, end, first_row, last_row, tx).await;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+        tokio::spawn(async move {
+            if let Err(e) = stream_pass_through(&pool, &m, start, end, first_row, last_row, &tx).await {
+                let _ = tx.send(Err(io_err(e))).await;
+            }
+        });
+        Ok(Some((smeta, PieceBody::Streamed(PieceStream { rx }))))
     }
+}
 
-    {
-        let mut c = row_cache().lock().unwrap();
-        c.small_reqs += 1;
-    }
-    // Small span: cache-first, then fetch misses as whole rows.
-    let mut rows: Vec<Option<Bytes>> = vec![None; nrows]; // full rows
+/// Response body for a served range: one buffer for small spans, a stream for
+/// pass-through spans.
+pub enum PieceBody {
+    OneShot(Bytes),
+    Streamed(PieceStream),
+}
+
+/// Whole-row gather for small spans: 2Q cache first, one query for misses.
+async fn gather_rows(pool: &PgPool, m: &Meta, first_row: i32, nrows: usize) -> Result<Vec<Bytes>> {
+    let mut rows: Vec<Option<Bytes>> = vec![None; nrows];
     let mut missing: Vec<i32> = Vec::new();
     for i in 0..nrows {
         let no = first_row + i as i32;
@@ -505,18 +500,16 @@ async fn stream_span(
             }
         }
     }
-    // Slice the covered bytes out of each row, in row order.
-    for (i, row) in rows.into_iter().enumerate() {
-        let no = first_row + i as i32;
-        let Some(data) = row else {
-            return Err(anyhow::anyhow!("missing chunk row {no}"));
-        };
-        let piece = slice_row(&data, no, start, end);
-        if !piece.is_empty() && tx.send(Ok(piece)).await.is_err() {
-            return Ok(());
-        }
+    Ok(rows.into_iter().map(|p| p.unwrap_or_default()).collect())
+}
+
+/// Effective `[start, end]` inclusive for a request (mirrors the old SQL clamp).
+fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
+    if suffix >= 0 {
+        ((size - suffix).max(0), size - 1)
+    } else {
+        (first.max(0), if last >= 0 { last.min(size - 1) } else { size - 1 })
     }
-    Ok(())
 }
 
 /// Large-span path: stream sliced pieces straight from the database (never
@@ -572,35 +565,31 @@ fn admit_rows() -> usize {
     })
 }
 
-/// Covered bytes of one row within `[start, end]`.
-fn slice_row(data: &[u8], no: i32, start: i64, end: i64) -> Bytes {
-    let row_start = i64::from(no) * ROW_BYTES;
-    let lo = start.max(row_start) - row_start;
-    let hi = end.min(row_start + data.len() as i64 - 1) - row_start;
-    if hi < lo {
-        return Bytes::new();
-    }
-    Bytes::copy_from_slice(&data[lo as usize..=hi as usize])
-}
-
 /// Buffered variant (tests, bench floor).
 pub async fn get(pool: &PgPool, bucket: &str, key: &str, first: i64, last: i64, suffix: i64) -> Result<Option<Slice>> {
-    let Some((meta, mut stream)) = get_stream(pool.clone(), bucket.to_owned(), key.to_owned(), first, last, suffix).await?
+    let Some((meta, body)) =
+        get_body(pool.clone(), bucket.to_owned(), key.to_owned(), first, last, suffix).await?
     else {
         return Ok(None);
     };
-    let mut out = BytesMut::with_capacity(meta.len() as usize);
-    while let Some(piece) = stream.next().await {
-        let piece = piece?;
-        out.extend_from_slice(&piece);
-    }
+    let bytes = match body {
+        PieceBody::OneShot(b) => b,
+        PieceBody::Streamed(mut s) => {
+            let mut out = BytesMut::with_capacity(meta.len() as usize);
+            while let Some(piece) = s.next().await {
+                let piece = piece?;
+                out.extend_from_slice(&piece);
+            }
+            out.freeze()
+        }
+    };
     Ok(Some(Slice {
         size: meta.size,
         etag: meta.etag,
         created_at: meta.created_at,
         start: meta.start,
         end: meta.end,
-        bytes: out.freeze(),
+        bytes,
     }))
 }
 
@@ -639,13 +628,73 @@ pub async fn put(pool: &PgPool, bucket: &str, key: &str, data: &[u8], etag: &[u8
     Ok(())
 }
 
-/// Assemble an object from ordered part files (multipart Complete): one
-/// single-threaded COPY stream, rows cut across part boundaries, object row
-/// published last (atomic visibility). Returns `(size, sha256)`.
-pub async fn put_files(pool: &PgPool, bucket: &str, key: &str, paths: &[PathBuf]) -> Result<(i64, Vec<u8>)> {
-    use tokio::io::AsyncReadExt;
-    // One flush at a time: each Complete gets the whole pipe (clients will not
-    // retry an unknown-outcome Complete, so per-file latency is the metric).
+/// Streaming ingest for multipart uploads: part bytes flow straight into one
+/// open binary COPY stream as they arrive (rows cut across part boundaries
+/// through a single cursor), so `Complete` only validates and publishes.
+/// One ingest at a time holds the global write permit — writes stay
+/// single-threaded per process by design.
+pub struct ChunkWriter {
+    pub file_id: i64,
+    tx: Option<tokio::sync::mpsc::Sender<IngestMsg>>,
+    done: Option<tokio::task::JoinHandle<Result<(i64, Vec<u8>)>>>,
+}
+
+pub enum IngestMsg {
+    Data(Bytes),
+    Abort,
+}
+
+impl ChunkWriter {
+    pub async fn start(pool: PgPool) -> Result<Self> {
+        let file_id: i64 =
+            sqlx::query("SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))")
+                .fetch_one(&pool)
+                .await?
+                .get(0);
+        let (tx, rx) = tokio::sync::mpsc::channel::<IngestMsg>(8);
+        let done = tokio::spawn(ingest_writer(pool, file_id, rx));
+        Ok(Self {
+            file_id,
+            tx: Some(tx),
+            done: Some(done),
+        })
+    }
+
+    pub async fn push(&self, chunk: Bytes) -> Result<()> {
+        self.tx
+            .as_ref()
+            .expect("writer open")
+            .send(IngestMsg::Data(chunk))
+            .await
+            .map_err(|_| anyhow::anyhow!("ingest writer gone"))
+    }
+
+    /// Close the stream and wait for the COPY to land. Returns `(size, sha256)`.
+    pub async fn finish(mut self) -> Result<(i64, Vec<u8>)> {
+        self.tx.take();
+        self.done.take().expect("writer joined").await?
+    }
+
+    /// Roll the ingest back (drops the COPY transaction; no rows are visible
+    /// since the object row never published).
+    pub async fn abort(mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(IngestMsg::Abort).await;
+        }
+        if let Some(h) = self.done.take() {
+            let _ = h.await;
+        }
+    }
+}
+
+async fn ingest_writer(
+    pool: PgPool,
+    file_id: i64,
+    mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
+) -> Result<(i64, Vec<u8>)> {
+    // Serialized writes: one COPY stream at a time across the process. The
+    // permit is held for the ingest lifetime; part pushes backpressure the
+    // client instead of competing for Aurora's write ceiling.
     static FLUSH_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let _permit = FLUSH_SLOTS
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
@@ -653,48 +702,33 @@ pub async fn put_files(pool: &PgPool, bucket: &str, key: &str, paths: &[PathBuf]
         .acquire_owned()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let t_flush = std::time::Instant::now();
-
-    let mut total = 0i64;
-    for p in paths {
-        total += tokio::fs::metadata(p).await?.len() as i64;
-    }
+    let t0 = std::time::Instant::now();
 
     let mut tx = pool.begin().await?;
-    let file_id: i64 = sqlx::query("SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))")
-        .fetch_one(&mut *tx)
-        .await?
-        .get(0);
     let mut sink = tx.copy_in_raw(COPY_SQL).await?;
-    let t_copy = std::time::Instant::now();
-    let mut read_s = 0f64;
+    sink.send(&COPY_HEADER[..]).await?;
 
     let mut hasher = Sha256::new();
     let mut pending: Vec<u8> = Vec::with_capacity(ROW_BYTES as usize * (ROW_BATCH + 1));
     let mut frame: Vec<u8> = Vec::with_capacity(SEND_BATCH);
-    frame.extend_from_slice(&COPY_HEADER);
     let mut next_no = 0i32;
-    let mut buf = vec![0u8; 1 << 20];
-    for p in paths {
-        let mut f = tokio::fs::File::open(p).await?;
-        loop {
-            let t_read = std::time::Instant::now();
-            let n = f.read(&mut buf).await?;
-            read_s += t_read.elapsed().as_secs_f64();
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            pending.extend_from_slice(&buf[..n]);
-            let whole = pending.len() - pending.len() % ROW_BYTES as usize;
-            if whole > 0 {
-                frame_rows(file_id, next_no, &pending[..whole], &mut frame);
-                next_no += (whole / ROW_BYTES as usize) as i32;
-                pending.drain(..whole);
-                if frame.len() >= SEND_BATCH {
-                    sink.send(&frame[..]).await?;
-                    frame.clear();
-                }
+    let mut total = 0i64;
+    while let Some(msg) = rx.recv().await {
+        let chunk = match msg {
+            IngestMsg::Data(b) => b,
+            IngestMsg::Abort => anyhow::bail!("ingest aborted"),
+        };
+        hasher.update(&chunk);
+        total += chunk.len() as i64;
+        pending.extend_from_slice(&chunk);
+        let whole = pending.len() - pending.len() % ROW_BYTES as usize;
+        if whole > 0 {
+            frame_rows(file_id, next_no, &pending[..whole], &mut frame);
+            next_no += (whole / ROW_BYTES as usize) as i32;
+            pending.drain(..whole);
+            if frame.len() >= SEND_BATCH {
+                sink.send(&frame[..]).await?;
+                frame.clear();
             }
         }
     }
@@ -704,10 +738,29 @@ pub async fn put_files(pool: &PgPool, bucket: &str, key: &str, paths: &[PathBuf]
     frame.extend_from_slice(&COPY_TRAILER);
     sink.send(&frame[..]).await?;
     sink.finish().await?;
-
     let sum = hasher.finalize().to_vec();
-    // Publish: pointer-swap the object row (overwrite keeps the old rows until
-    // the swap, then reaps them).
+    // Chunk rows land here; the object row publishes at Complete
+    // (`publish`), so objects appear atomically and aborts leave nothing.
+    tx.commit().await?;
+    eprintln!(
+        "pgvs3: ingest {:.1} MiB at {:.0} MiB/s",
+        total as f64 / 1024.0 / 1024.0,
+        total as f64 / 1024.0 / 1024.0 / t0.elapsed().as_secs_f64().max(1e-9)
+    );
+    Ok((total, sum))
+}
+
+/// Publish an object row: pointer-swap on overwrite (old rows reap after the
+/// swap), then refresh the meta cache. This is the visibility boundary.
+pub async fn publish(
+    pool: &PgPool,
+    bucket: &str,
+    key: &str,
+    file_id: i64,
+    size: i64,
+    etag: &[u8],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
     let old = object_row(&mut tx, bucket, key).await?;
     sqlx::query(
         "INSERT INTO s3p.objects (bucket, key, file_id, size, etag) VALUES ($1, $2, $3, $4, $5) \
@@ -717,8 +770,8 @@ pub async fn put_files(pool: &PgPool, bucket: &str, key: &str, paths: &[PathBuf]
     .bind(bucket)
     .bind(key)
     .bind(file_id)
-    .bind(total)
-    .bind(&sum)
+    .bind(size)
+    .bind(etag)
     .execute(&mut *tx)
     .await?;
     if let Some(old_id) = old {
@@ -728,18 +781,8 @@ pub async fn put_files(pool: &PgPool, bucket: &str, key: &str, paths: &[PathBuf]
             .await?;
     }
     tx.commit().await?;
-    publish_cache(bucket, key, file_id, total, &sum);
-    let total_s = t_flush.elapsed().as_secs_f64();
-    let copy_s = t_copy.elapsed().as_secs_f64();
-    eprintln!(
-        "pgvs3: flush {:.1} MiB at {:.0} MiB/s (read {:.2}s, copy {:.2}s, publish {:.2}s)",
-        total as f64 / 1024.0 / 1024.0,
-        total as f64 / 1024.0 / 1024.0 / total_s.max(1e-9),
-        read_s,
-        copy_s,
-        (total_s - copy_s).max(0.0),
-    );
-    Ok((total, sum))
+    publish_cache(bucket, key, file_id, size, etag);
+    Ok(())
 }
 
 fn publish_cache(bucket: &str, key: &str, file_id: i64, size: i64, etag: &[u8]) {
@@ -771,7 +814,11 @@ fn frame_rows(file_id: i64, first_no: i32, data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Delete any previous object with this key and insert its row (one round trip).
+/// Delete any previous object with this key and insert its row. Plain
+/// statements on purpose: a single-statement CTE here (delete + scrub + insert)
+/// is snapshot-hazardous — the insert's conflict handling can observe the
+/// pre-delete row while the scrub's deletions are not yet visible to the chunk
+/// insert, colliding on chunks_pkey on overwrite.
 async fn replace_object_row(
     tx: &mut Transaction<'_, sqlx::Postgres>,
     bucket: &str,
@@ -779,23 +826,30 @@ async fn replace_object_row(
     size: i64,
     etag: &[u8],
 ) -> Result<i64> {
-    let old: Option<i64> = sqlx::query(
-        "WITH gone AS ( \
-           DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id) \
-         , scrub AS (DELETE FROM s3p.chunks WHERE file_id IN (SELECT file_id FROM gone)) \
-         INSERT INTO s3p.objects (bucket, key, size, etag) VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (bucket, key) DO UPDATE SET size = EXCLUDED.size, etag = EXCLUDED.etag, \
-           created_at = now() \
-         RETURNING file_id",
+    let old: Option<i64> =
+        sqlx::query("DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id")
+            .bind(bucket)
+            .bind(key)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(|r| r.get("file_id"));
+    if let Some(old_id) = old {
+        sqlx::query("DELETE FROM s3p.chunks WHERE file_id = $1")
+            .bind(old_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    let file_id: i64 = sqlx::query(
+        "INSERT INTO s3p.objects (bucket, key, size, etag) VALUES ($1, $2, $3, $4) RETURNING file_id",
     )
     .bind(bucket)
     .bind(key)
     .bind(size)
     .bind(etag)
-    .fetch_optional(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?
-    .map(|r| r.get("file_id"));
-    old.ok_or_else(|| anyhow::anyhow!("object row insert returned nothing"))
+    .get("file_id");
+    Ok(file_id)
 }
 
 pub async fn delete(pool: &PgPool, bucket: &str, key: &str) -> Result<bool> {

@@ -3,7 +3,6 @@
 //! implemented; everything else stays `NotImplemented` (s3s trait defaults).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -23,18 +22,16 @@ use s3s::service::S3ServiceBuilder;
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tokio::io::AsyncWriteExt;
 
 use crate::db;
 
-/// One in-flight multipart upload: parts staged as temp files, re-chunked into
-/// rows on CompleteMultipartUpload.
-#[derive(Clone)]
+/// One in-flight multipart upload: part bytes stream straight into an open
+/// COPY stream (db::ChunkWriter); Complete validates and publishes.
 struct Mpu {
     bucket: String,
     key: String,
-    dir: PathBuf,
-    parts: BTreeMap<i32, (PathBuf, Vec<u8>)>, // part_no -> (file, sha256)
+    writer: db::ChunkWriter,
+    parts: BTreeMap<i32, Vec<u8>>, // part_no -> sha256
 }
 
 #[derive(Clone)]
@@ -96,7 +93,7 @@ impl S3 for PgS3 {
         let ranged = input.range.is_some();
         let (first, last, suffix) = range_params(input.range);
         // One round trip: metadata + a stream of exactly the requested bytes.
-        let (meta, body) = db::get_stream(self.pool.clone(), input.bucket, input.key, first, last, suffix)
+        let (meta, body) = db::get_body(self.pool.clone(), input.bucket, input.key, first, last, suffix)
             .await
             .map_err(internal)?
             .ok_or_else(|| s3_error!(NoSuchKey))?;
@@ -107,7 +104,10 @@ impl S3 for PgS3 {
         let body_len = meta.len();
         let out = GetObjectOutput {
             accept_ranges: Some("bytes".to_owned()),
-            body: Some(StreamingBlob::wrap(body)),
+            body: Some(match body {
+                db::PieceBody::OneShot(b) => StreamingBlob::from_bytes(b),
+                db::PieceBody::Streamed(s) => StreamingBlob::wrap(s),
+            }),
             content_length: Some(body_len),
             content_range: ranged.then(|| format!("bytes {}-{}/{}", meta.start, meta.end, meta.size)),
             content_type: Some("application/octet-stream".to_owned()),
@@ -153,7 +153,8 @@ impl S3 for PgS3 {
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
         // Idempotent per (bucket, key): a client retry of Create must not fork
-        // the upload into two ids.
+        // the upload into two ids. The writer task takes the global write
+        // permit itself, so Create never blocks on a busy flush.
         let mut mpus = self.mpus.lock().await;
         let existing = mpus
             .iter()
@@ -162,19 +163,21 @@ impl S3 for PgS3 {
         let id = match existing {
             Some(id) => id,
             None => {
-                let id = format!("{:016x}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0));
-                // Staging lives on the NVMe scratch tree, not tmpfs: parts can be GBs.
-                let dir = std::path::PathBuf::from(".tmp/pgvs3/mpu").join(&id);
-                tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
+                let writer = db::ChunkWriter::start(self.pool.clone()).await.map_err(internal)?;
+                let id = format!(
+                    "{:016x}-{:08x}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                    writer.file_id as u32
+                );
                 mpus.insert(
                     id.clone(),
                     Mpu {
                         bucket: input.bucket.clone(),
                         key: input.key.clone(),
-                        dir,
+                        writer,
                         parts: BTreeMap::new(),
                     },
                 );
@@ -193,29 +196,27 @@ impl S3 for PgS3 {
         let mut input = req.input;
         let id = input.upload_id;
         let part_no = input.part_number;
-        let path = {
-            let mut mpus = self.mpus.lock().await;
-            let mpu = mpus.get_mut(&id).ok_or_else(|| s3_error!(NoSuchUpload))?;
-            let path = mpu.dir.join(format!("{part_no:06}"));
-            mpu.parts.insert(part_no, (path.clone(), Vec::new()));
-            path
-        };
-        let mut f = tokio::fs::File::create(&path).await.map_err(internal)?;
+        // The map lock serializes part streams (writes are single-threaded by
+        // design); the writer task drains its channel independently of this
+        // lock, so holding it across the stream cannot deadlock.
+        let mut mpus = self.mpus.lock().await;
+        let mpu = mpus.get_mut(&id).ok_or_else(|| s3_error!(NoSuchUpload))?;
+        if mpu.parts.contains_key(&part_no) {
+            return Err(s3_error!(InvalidPart)); // no rewind: a streamed part cannot be re-sent
+        }
+        let expected = mpu.parts.keys().max().map(|m| m + 1).unwrap_or(1);
+        if part_no != expected {
+            return Err(s3_error!(InvalidPartOrder)); // one row cursor: parts stream in order
+        }
         let mut hasher = Sha256::new();
         let mut body = input.body.take().unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(internal)?;
             hasher.update(&chunk);
-            f.write_all(&chunk).await.map_err(internal)?;
+            mpu.writer.push(chunk).await.map_err(internal)?;
         }
-        f.flush().await.map_err(internal)?;
         let sum = hasher.finalize().to_vec();
-        {
-            let mut mpus = self.mpus.lock().await;
-            if let Some(slot) = mpus.get_mut(&id).and_then(|m| m.parts.get_mut(&part_no)) {
-                slot.1 = sum.clone();
-            }
-        }
+        mpu.parts.insert(part_no, sum.clone());
         Ok(S3Response::new(UploadPartOutput {
             e_tag: etag(&sum),
             ..Default::default()
@@ -227,59 +228,63 @@ impl S3 for PgS3 {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let input = req.input;
-        // State survives until success: Complete flushes gigabytes to the
-        // database and clients retry on timeout — a re-run must be able to
-        // find (or redo) the work, never see NoSuchUpload.
-        let mpu = {
-            let mpus = self.mpus.lock().await;
-            match mpus.get(&input.upload_id) {
-                Some(m) => m.clone(),
-                None => {
-                    // Retried after a lost success response: the object is
-                    // already there. Report it (S3 clients treat identical
-                    // re-completion as success).
-                    if let Some(meta) = db::meta(&self.pool, &input.bucket, &input.key)
-                        .await
-                        .map_err(internal)?
-                    {
-                        return Ok(S3Response::new(CompleteMultipartUploadOutput {
-                            bucket: Some(input.bucket),
-                            key: Some(input.key),
-                            e_tag: etag(&meta.etag),
-                            ..Default::default()
-                        }));
-                    }
-                    return Err(s3_error!(NoSuchUpload));
-                }
+        let Some(mpu) = self.mpus.lock().await.remove(&input.upload_id) else {
+            // Retried after a lost success response: the object is already
+            // published. Report it (S3 clients treat identical re-completion
+            // as success).
+            if let Some(meta) = db::meta(&self.pool, &input.bucket, &input.key)
+                .await
+                .map_err(internal)?
+            {
+                return Ok(S3Response::new(CompleteMultipartUploadOutput {
+                    bucket: Some(input.bucket),
+                    key: Some(input.key),
+                    e_tag: etag(&meta.etag),
+                    ..Default::default()
+                }));
             }
+            return Err(s3_error!(NoSuchUpload));
         };
 
-        let listed = input.multipart_upload.and_then(|m| m.parts).unwrap_or_default();
-        if listed.is_empty() {
-            return Err(s3_error!(InvalidPart));
-        }
-        let mut paths = Vec::with_capacity(listed.len());
-        let mut last_no = 0i32;
-        for cp in listed {
-            let no = cp.part_number.ok_or_else(|| s3_error!(InvalidPart))?;
-            if no <= last_no {
-                return Err(s3_error!(InvalidPartOrder));
-            }
-            last_no = no;
-            let (path, sha) = mpu.parts.get(&no).ok_or_else(|| s3_error!(InvalidPart))?;
-            let want = cp.e_tag.map(|e| e.value().to_owned()).unwrap_or_default();
-            if want != db::hex(sha) {
+        let check = (|| -> S3Result<()> {
+            let listed = input
+                .multipart_upload
+                .as_ref()
+                .and_then(|m| m.parts.clone())
+                .unwrap_or_default();
+            if listed.is_empty() {
                 return Err(s3_error!(InvalidPart));
             }
-            paths.push(path.clone());
+            let mut last_no = 0i32;
+            for cp in &listed {
+                let no = cp.part_number.ok_or_else(|| s3_error!(InvalidPart))?;
+                if no <= last_no {
+                    return Err(s3_error!(InvalidPartOrder));
+                }
+                last_no = no;
+                let want = cp.e_tag.as_ref().map(|e| e.value().to_owned()).unwrap_or_default();
+                let got = mpu.parts.get(&no).ok_or_else(|| s3_error!(InvalidPart))?;
+                if want != db::hex(got) {
+                    return Err(s3_error!(InvalidPart));
+                }
+            }
+            if listed.len() != mpu.parts.len() {
+                return Err(s3_error!(InvalidPart)); // every uploaded part must be listed
+            }
+            Ok(())
+        })();
+        if let Err(e) = check {
+            mpu.writer.abort().await;
+            return Err(e);
         }
 
-        let (size, sum) = db::put_files(&self.pool, &mpu.bucket, &mpu.key, &paths)
+        // The heavy work already happened during UploadPart: this is just the
+        // tail of the COPY plus the publication transaction.
+        let file_id = mpu.writer.file_id;
+        let (size, sum) = mpu.writer.finish().await.map_err(internal)?;
+        db::publish(&self.pool, &mpu.bucket, &mpu.key, file_id, size, &sum)
             .await
             .map_err(internal)?;
-        // Only now is the upload finished with: drop state and staging.
-        self.mpus.lock().await.remove(&input.upload_id);
-        let _ = tokio::fs::remove_dir_all(&mpu.dir).await;
         eprintln!("pgvs3: multipart {}/{} = {} bytes", mpu.bucket, mpu.key, size);
         Ok(S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(mpu.bucket.clone()),
@@ -295,7 +300,7 @@ impl S3 for PgS3 {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         if let Some(mpu) = self.mpus.lock().await.remove(&req.input.upload_id) {
-            let _ = tokio::fs::remove_dir_all(&mpu.dir).await;
+            mpu.writer.abort().await;
         }
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
