@@ -17,6 +17,7 @@
 //! queue. The object row is published last, so objects appear atomically.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Context;
@@ -628,11 +629,10 @@ pub async fn put(pool: &PgPool, bucket: &str, key: &str, data: &[u8], etag: &[u8
     Ok(())
 }
 
-/// Streaming ingest for multipart uploads: part bytes flow straight into one
-/// open binary COPY stream as they arrive (rows cut across part boundaries
-/// through a single cursor), so `Complete` only validates and publishes.
-/// One ingest at a time holds the global write permit — writes stay
-/// single-threaded per process by design.
+/// Streaming ingest: bytes flow into one open binary COPY stream through
+/// `push` (rows cut across pushes through a single cursor). One ingest at a
+/// time holds the global write permit — writes stay single-threaded per
+/// process by design.
 pub struct ChunkWriter {
     pub file_id: i64,
     tx: Option<tokio::sync::mpsc::Sender<IngestMsg>>,
@@ -667,6 +667,23 @@ impl ChunkWriter {
             .send(IngestMsg::Data(chunk))
             .await
             .map_err(|_| anyhow::anyhow!("ingest writer gone"))
+    }
+
+    /// Feed staged part files through the stream in the given order.
+    pub async fn feed_files(&self, paths: &[PathBuf]) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 1 << 20];
+        for p in paths {
+            let mut f = tokio::fs::File::open(p).await?;
+            loop {
+                let n = f.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                self.push(Bytes::copy_from_slice(&buf[..n])).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Close the stream and wait for the COPY to land. Returns `(size, sha256)`.
