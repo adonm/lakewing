@@ -46,6 +46,11 @@ def connect(stack: str, args, extensions: tuple = ()) -> duckdb.DuckDBPyConnecti
             continue
         con.sql(f"INSTALL {ext}")
         con.sql(f"LOAD {ext}")
+    for kv in getattr(args, "set", None) or []:
+        name, _, value = kv.partition("=")
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", name):
+            raise SystemExit(f"--set: bad setting name {name!r}")
+        con.sql(f"SET {name} = '{value.replace(chr(39), chr(39) * 2)}'")
     if stack == "lake-s3":
         con.sql("SET s3_endpoint='127.0.0.1:8014'")
         con.sql("SET s3_use_ssl=false")

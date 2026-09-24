@@ -30,10 +30,16 @@ KEY=.tmp/pgvs3/pgvs3-perf-key.pem
 # shellcheck disable=SC1091
 source .tmp/pgvs3/aws-rig.env
 
-IP=$(aws ec2 describe-instances --profile "$P" --region us-east-2 --instance-ids $INST \
-  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+if IP=$(aws ec2 describe-instances --profile "$P" --region us-east-2 --instance-ids $INST \
+      --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null); then
+  echo "$IP" > .tmp/pgvs3/rig-ip
+else
+  # The public IP only changes on stop/start: without an AWS session (e.g. an
+  # expired SSO login) reuse the last one seen.
+  IP=$(cat .tmp/pgvs3/rig-ip)
+  echo "(aws unavailable, using the cached rig IP; refresh: aws sso login --profile $P)"
+fi
 echo "rig: $IP (mode: $MODE)"
-echo "$IP" > .tmp/pgvs3/rig-ip
 SSH=(ssh -i $KEY -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 "ec2-user@$IP")
 
 if [ "$MODE" = "stop" ]; then
@@ -125,9 +131,12 @@ run_one() {
   # DuckLake catalog must be on the pgvs3 Aurora instance.
   local catdesc
   catdesc=$(sed -E 's/.*(dbname=[^ ]+).*(host=[^ ]+).*/\1 \2/' <<<"$catalog")
-  echo "=== $label [SPLIT=$SPLIT] catalog=${catdesc:-n/a} $(date -u +%H:%M:%S) ==="
+  echo "=== $label [SPLIT=$SPLIT${BENCH_EXTRA:+ $BENCH_EXTRA}] catalog=${catdesc:-n/a} $(date -u +%H:%M:%S) ==="
   gw_start
-  mise exec -- uv run --with "duckdb==$PRE" python crates/pgvs3/analytics_bench.py "$@" \
+  # BENCH_EXTRA: extra harness args for A/B runs (word-split on purpose), e.g.
+  # BENCH_EXTRA='--set httpfs_client_implementation=curl' ./bench-rig.sh quick
+  # shellcheck disable=SC2086
+  mise exec -- uv run --with "duckdb==$PRE" python crates/pgvs3/analytics_bench.py "$@" ${BENCH_EXTRA:-} \
     --out "/home/ec2-user/bench-out/$label.json" 2>&1 | tail -8
   echo "--- $label stats:"
   curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
@@ -248,7 +257,7 @@ DRV
   printf '%s' "$PGVS3_PG_PASSWORD" | "${SSH[@]}" 'cat > ~/.pgpw && chmod 600 ~/.pgpw'
   # rm before nohup (sync), and the driver flocks /tmp/pgvs3-bench.lock so two
   # drivers can never coexist and kill each other's gateway mid-upload.
-  "${SSH[@]}" "chmod +x ~/run-analytics.sh; rm -f ~/BENCH.DONE; nohup ~/run-analytics.sh $MODE ${2:-} >~/bench-driver-$MODE-\$(date +%H%M%S).log 2>&1 & echo driver-started-$MODE"
+  "${SSH[@]}" "chmod +x ~/run-analytics.sh; rm -f ~/BENCH.DONE; BENCH_EXTRA='${BENCH_EXTRA:-}' nohup ~/run-analytics.sh $MODE ${2:-} >~/bench-driver-$MODE-\$(date +%H%M%S).log 2>&1 & echo driver-started-$MODE"
 fi
 
 echo "waiting for ~/BENCH.DONE ..."

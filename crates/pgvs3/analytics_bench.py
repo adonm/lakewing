@@ -153,6 +153,8 @@ def main() -> None:
     ap.add_argument("--queries", default=None, help="range like 1-43 (default: all)")
     ap.add_argument("--query-timeout", type=float, default=0, help="per-query seconds (0 = unlimited)")
     ap.add_argument("--memory-limit", default=None, help="DuckDB memory_limit (default: DuckDB's 80%% of RAM)")
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    help="extra DuckDB setting, applied after the extensions load (A/B knobs)")
     ap.add_argument("--no-file-cache", action="store_true",
                     help="disable DuckDB's external file cache: every pass reads through the proxy")
     ap.add_argument("--src-dir", default=None)
