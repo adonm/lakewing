@@ -160,7 +160,7 @@ rig-teardown:
     aws=(aws --profile "$RIG_AWS_PROFILE" --region "$RIG_AWS_REGION")
     for db in $("${aws[@]}" rds describe-db-clusters --db-cluster-identifier "$RIG_DB_CLUSTER" \
                   --query 'DBClusters[0].DBClusterMembers[].DBInstanceIdentifier' --output text); do
-      "${aws[@]}" rds delete-db-instance --db-instance-identifier "$db" --skip-final-snapshot --delete-automated-backups
+      "${aws[@]}" rds delete-db-instance --db-instance-identifier "$db"  # snapshots/backups are the cluster's
     done
     "${aws[@]}" rds delete-db-cluster --db-cluster-identifier "$RIG_DB_CLUSTER" --skip-final-snapshot
     "${aws[@]}" ec2 terminate-instances --instance-ids "$RIG_INSTANCE"
