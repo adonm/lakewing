@@ -89,8 +89,8 @@ def main() -> None:
         print(f"[{args.stack}] pass {p + 1}: total {total:.1f}s")
         print("  " + "  ".join(f"Q{q}={times[q]:.2f}" for q in queries))
 
-    # Gateway cache telemetry (signed debug route) — the tuning surface for
-    # PGVS3_ADMIT_BYTES / PGVS3_CACHE_MIB, captured per run.
+    # Gateway telemetry (signed debug route): span histogram + GET stage
+    # counters, captured per run.
     if st := benchlib.gateway_stats():
         record["gateway_stats"] = st
         print("gateway:", st)

@@ -5,8 +5,8 @@
 #   ./bench-rig.sh quick    fast loop: clickbench 10% (1.5G slices) + spatialbench
 #                           sf1 on lake-s3, 2 passes, capped queries (~15 min)
 #   ./bench-rig.sh sweep    gateway-config A/B on the quick data (split parts
-#                           PGVS3_SPLIT_BYTES, cache PGVS3_CACHE_MIB): views-only,
-#                           gateway restarted per config (cold proxy cache)
+#                           PGVS3_SPLIT_BYTES): views-only, gateway restarted
+#                           per config
 #   ./bench-rig.sh full     headline run: clickbench 100% x3 passes + spatialbench
 #                           sf10 x2 passes (hours)
 #   ./bench-rig.sh stop     kill any running driver/gateway (safe to run anytime)
@@ -76,12 +76,14 @@ SPAT=(--bench spatial --data-path 's3://lake/run-32/'
       --plain-db /home/ec2-user/bench-data/spatial-plain.duckdb
       --scratch-db /home/ec2-user/bench-data/scratch-spatial.duckdb)
 
-MIB=2048   # proxy row-cache MiB (PGVS3_CACHE_MIB)
-ADM=8388608  # cacheable span bytes (PGVS3_ADMIT_BYTES)
 SPLIT=8388608  # parallel part bytes (PGVS3_SPLIT_BYTES; 0 = one query per span)
+# Full runs keep their own catalogs + data paths so the quick loop's data
+# survives them.
+CAT_CF="dbname=ducklake_click_full host=$END user=pgvs3admin password=$PW sslmode=require"
+CAT_SF="dbname=ducklake_spatial_full host=$END user=pgvs3admin password=$PW sslmode=require"
 
 fresh_catalogs() {
-  for db in ducklake_click_lake_s3 ducklake_spatial_lake_s3; do
+  for db in "$@"; do
     psql "$ADMIN" -c "DROP DATABASE IF EXISTS $db" >/dev/null 2>&1
     psql "$ADMIN" -c "CREATE DATABASE $db" >/dev/null 2>&1
   done
@@ -90,7 +92,7 @@ fresh_catalogs() {
 gw_start() {
   pkill -x pgvs3 || true
   sleep 1
-  PGVS3_CACHE_MIB=$MIB PGVS3_ADMIT_BYTES=$ADM PGVS3_SPLIT_BYTES=$SPLIT \
+  PGVS3_SPLIT_BYTES=$SPLIT \
     nohup ./target/release/pgvs3 --url "$BASE" serve --addr 127.0.0.1:8014 >/tmp/s-bench.log 2>&1 &
   for _ in $(seq 1 20); do
     curl -s -o /dev/null --max-time 1 http://127.0.0.1:8014/ && return 0
@@ -109,7 +111,7 @@ run_one() {
   # DuckLake catalog must be on the pgvs3 Aurora instance.
   local catdesc
   catdesc=$(sed -E 's/.*(dbname=[^ ]+).*(host=[^ ]+).*/\1 \2/' <<<"$catalog")
-  echo "=== $label [MIB=$MIB ADM=$ADM SPLIT=$SPLIT] catalog=${catdesc:-n/a} $(date -u +%H:%M:%S) ==="
+  echo "=== $label [SPLIT=$SPLIT] catalog=${catdesc:-n/a} $(date -u +%H:%M:%S) ==="
   gw_start
   mise exec -- uv run --with "duckdb==$PRE" python crates/pgvs3/analytics_bench.py "$@" \
     --out "/home/ec2-user/bench-out/$label.json" 2>&1 | tail -8
@@ -160,7 +162,7 @@ PY
 
 case $MODE in
 quick)
-  fresh_catalogs
+  fresh_catalogs ducklake_click_lake_s3 ducklake_spatial_lake_s3
   run_one click-lake-s3 "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --parts 10 --download --load --passes 2 --query-timeout 300
   multi_check click "$CAT_C3" 's3://lake/run-31/' hits
   # sf1 not sf0.1: at sf0.1 the generator emits 0 buildings and DuckLake
@@ -169,19 +171,21 @@ quick)
   multi_check spatial "$CAT_S3" 's3://lake/run-32/' 'trip,customer,driver,vehicle,zone,building'
   ;;
 full)
-  fresh_catalogs
-  run_one click-lake-s3 "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --download --load --passes 3 --query-timeout 600
-  multi_check click "$CAT_C3" 's3://lake/run-31/' hits
-  run_one spatial-lake-s3 "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_S3" --sf 10 --download --load --passes 2 --query-timeout 1200
-  multi_check spatial "$CAT_S3" 's3://lake/run-32/' 'trip,customer,driver,vehicle,zone,building'
+  fresh_catalogs ducklake_click_full ducklake_spatial_full
+  # 11GB DuckDB cap on the 16 GiB worker: load-time multipart staging lives
+  # in /dev/shm (RAM). Spatial Q8-Q12 are DuckDB-CPU-bound: bounded at 300s.
+  run_one click-full "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_CF" --data-path 's3://lake/run-33/' \
+    --download --load --passes 3 --query-timeout 600 --memory-limit 11GB
+  multi_check click-full "$CAT_CF" 's3://lake/run-33/' hits
+  run_one spatial-full "${SPAT[@]}" --stack lake-s3 --catalog "$CAT_SF" --data-path 's3://lake/run-34/' \
+    --sf 10 --download --load --passes 2 --query-timeout 300 --memory-limit 11GB
+  multi_check spatial-full "$CAT_SF" 's3://lake/run-34/' 'trip,customer,driver,vehicle,zone,building'
   ;;
 sweep)
-  # views-only on the quick data: only the gateway config (MIB ADM SPLIT)
-  # changes between runs; SPLIT=0 is the one-query-per-span baseline and
-  # nocache isolates the proxy row cache's contribution.
-  for cfg in "2048 8388608 0 nosplit" "2048 8388608 8388608 split8m" "2048 8388608 2097152 split2m" \
-             "0 8388608 8388608 nocache"; do
-    read -r MIB ADM SPLIT TAG <<<"$cfg"
+  # views-only on the quick data: only the gateway config changes between
+  # runs; SPLIT=0 is the one-query-per-span baseline.
+  for cfg in "8388608 default" "0 nosplit"; do
+    read -r SPLIT TAG <<<"$cfg"
     run_one "sweep-click-$TAG" "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --views-only --passes 2 --query-timeout 300
     # Q1-Q7 only: Q8-Q12 are DuckDB's CPU-bound spatial joins (timeouts /
     # an internal binder error on 2.0-alpha), no proxy signal; full keeps all.

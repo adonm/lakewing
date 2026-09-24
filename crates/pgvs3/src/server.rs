@@ -483,7 +483,7 @@ impl s3s::route::S3Route for StatsRoute {
         *method == hyper::http::Method::GET && uri.path() == "/_pgvs3/stats"
     }
     async fn call(&self, _req: S3Request<s3s::Body>) -> S3Result<S3Response<s3s::Body>> {
-        let line = format!("{}\n{}\n", db::cache_stats_line(), db::stage_stats_line());
+        let line = format!("{}\n", db::stage_stats_line());
         Ok(S3Response::new(s3s::Body::from(bytes::Bytes::from(line))))
     }
 }
@@ -525,7 +525,7 @@ pub async fn serve(pool: PgPool, cfg: ServeConfig) -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tick.tick().await;
-            eprintln!("{}\n{}", crate::db::cache_stats_line(), crate::db::stage_stats_line());
+            eprintln!("{}", crate::db::stage_stats_line());
         }
     });
     loop {

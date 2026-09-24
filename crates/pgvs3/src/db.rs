@@ -1,12 +1,12 @@
 //! PostgreSQL storage: objects as fixed-size inline byte rows.
 //!
-//! Read path: object metadata (bucket,key -> file_id/size/etag) and row slices
-//! are cached in-process within a small fixed budget (PGVS3_CACHE_MIB, default
-//! 2048): the cache sits between consumers (DuckLake workers own the big byte
-//! cache) and Aurora, purely to remove round trips. Objects are immutable by
-//! convention, so cache entries are populated at publish and dropped at
-//! delete; repeat reads (parquet footers, hot ranges) reach PostgreSQL zero
-//! times. Spans above PGVS3_SPLIT_BYTES (default 8 MiB) fetch in parallel
+//! Read path: object metadata (bucket,key -> file_id/size/etag) is cached
+//! in-process (pinned, count-capped; populated at publish, dropped at delete),
+//! so opening an object costs no round trip. Row bytes are not cached: DuckDB
+//! caches what it reads, and a proxy row cache measured ~0% hits on
+//! ClickBench/SpatialBench for ~0.5 ms of CPU per request. Each GET is one
+//! contiguous row-range query; spans above PGVS3_SPLIT_BYTES (default 8 MiB)
+//! fetch in parallel
 //! parts on separate pool connections: one Aurora connection moves ~420-500
 //! MB/s warm / ~300 MB/s cold, which binds a lone large read. At DuckDB's
 //! concurrency (many GETs already in flight) smaller parts measured no gain
@@ -52,9 +52,9 @@ const SEND_BATCH: usize = 4 << 20;
 const GET_RANGE_SQL: &str =
     "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3";
 
-/// Whole rows for scattered `no`s (cache misses interleaved with hits).
-const GET_ROWS_FULL_SQL: &str =
-    "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no = ANY($2::int4[])";
+/// Spans up to this size are fetched into one buffer (no task, no channel);
+/// larger spans stream through in ordered parts.
+const ONESHOT_MAX: usize = 8 << 20;
 
 /// Parts in flight per request, each on its own pool connection.
 const SPLIT_INFLIGHT: usize = 8;
@@ -187,17 +187,8 @@ fn epoch(secs: f64) -> SystemTime {
 }
 
 // ---------------------------------------------------------------------------
-// Small in-process caches between consumers (DuckLake workers own the big byte
-// cache) and Aurora: their only job is removing round trips. Meta is the
-// pinned tier (count-capped, never evicted by byte pressure). Rows use S3-FIFO
-// with a span-size gate: the gate only exists to keep scan-flood bytes out of
-// the machinery, while frequency-based promotion (second touch, or ghost
-// re-arrival) is what pins hot spans. Tuned for analytical workloads
-// (ClickBench / SpatialBench on DuckLake): the recurring hot unit there is a
-// column chunk (100 KiB–8 MiB), so admission is span-bounded
-// (PGVS3_ADMIT_BYTES, default 8 MiB) rather than tiny — hot chunks of any
-// reasonable size earn residency on a second read, geometry floods pass
-// through. PGVS3_CACHE_MIB=0 disables the row tier entirely.
+// Pinned metadata cache: bucket/key -> Meta, count-capped, never evicted by
+// byte pressure. Its only job is removing the lookup round trip per GET.
 // ---------------------------------------------------------------------------
 
 const META_CAP: usize = 1 << 18;
@@ -234,166 +225,12 @@ fn meta_invalidate(bucket: &str, key: &str) {
     meta_cache().lock().unwrap().map.remove(&(bucket.to_owned(), key.to_owned()));
 }
 
-struct Node {
-    data: Bytes,
-    freq: u8, // saturating access counter (0..=3)
-}
-
-/// S3-FIFO (Yang et al., SOSP'23): small FIFO `s` (10%), main queue `m` (90%)
-/// with CLOCK second-chance on the freq counter, and a ghost list `g` of
-/// recently evicted keys. New rows enter `s`; only a second touch (freq > 1 at
-/// eviction) or a ghost re-arrival earns `m` residency. One-timers — including
-/// any medium reads that slip the admission gate — die in `s`/`g` without
-/// displacing pinned footers. All operations O(1); no recency bookkeeping.
-struct RowCache {
-    s: HashMap<(i64, i32), Node>,
-    s_order: VecDeque<(i64, i32)>,
-    s_used: usize,
-    m: HashMap<(i64, i32), Node>,
-    m_order: VecDeque<(i64, i32)>,
-    m_used: usize,
-    g: std::collections::HashSet<(i64, i32)>,
-    g_order: VecDeque<(i64, i32)>,
-    budget: usize,
-    enabled: bool,
-    // per-span-size counters for gate tuning (printed by the stats line)
-    pub spans: [u64; 5],
-    pub hits: u64,
-    pub admits: u64,
-    pub promotes: u64,
-    pub admits_ghost: u64,
-}
-
-const FREQ_MAX: u8 = 3;
-
-fn row_cache() -> &'static Mutex<RowCache> {
-    static C: OnceLock<Mutex<RowCache>> = OnceLock::new();
-    C.get_or_init(|| {
-        let mib = std::env::var("PGVS3_CACHE_MIB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048);
-        let budget = mib * 1024 * 1024;
-        Mutex::new(RowCache {
-            s: HashMap::new(),
-            s_order: VecDeque::new(),
-            s_used: 0,
-            m: HashMap::new(),
-            m_order: VecDeque::new(),
-            m_used: 0,
-            g: std::collections::HashSet::new(),
-            g_order: VecDeque::new(),
-            budget,
-            enabled: budget > 0,
-            spans: [0; 5],
-            hits: 0,
-            promotes: 0,
-            admits: 0,
-            admits_ghost: 0,
-        })
-    })
-}
-
-fn ghost_put(c: &mut RowCache, k: (i64, i32)) {
-    if c.g.insert(k) {
-        c.g_order.push_back(k);
-    }
-    let cap = (c.budget / ROW_BYTES as usize / 10) * 9; // ~90% of slot count
-    while c.g_order.len() > cap {
-        match c.g_order.pop_front() {
-            Some(old) => {
-                c.g.remove(&old);
-            }
-            None => break,
-        }
-    }
-}
-
-/// Evict/promote until bytes fit. `s` drains first above its 10% quota;
-/// second touches promote to `m`, one-timers ghost out; `m` uses CLOCK.
-fn evict_to_fit(c: &mut RowCache) {
-    while c.s_used + c.m_used > c.budget {
-        let s_quota = c.budget / 10;
-        if !c.s_order.is_empty() && (c.s_used > s_quota || c.m_order.is_empty()) {
-            let front = c.s_order.pop_front().unwrap();
-            if let Some(node) = c.s.remove(&front) {
-                c.s_used -= node.data.len();
-                if node.freq > 1 {
-                    c.promotes += 1;
-                    c.m_used += node.data.len();
-                    c.m.insert(front, node);
-                    c.m_order.push_back(front);
-                } else {
-                    ghost_put(c, front);
-                }
-            }
-            continue;
-        }
-        let Some(front) = c.m_order.front().copied() else { break };
-        c.m_order.pop_front();
-        let Some(node) = c.m.get_mut(&front) else { continue };
-        if node.freq == 0 {
-            let Some(gone) = c.m.remove(&front) else { continue };
-            c.m_used -= gone.data.len();
-            ghost_put(c, front);
-        } else {
-            node.freq -= 1; // second chance
-            c.m_order.push_back(front);
-        }
-    }
-}
-
-fn row_put(file_id: i64, no: i32, bytes: Bytes) {
-    let mut c = row_cache().lock().unwrap();
-    if !c.enabled || bytes.len() > c.budget {
-        return;
-    }
-    let k = (file_id, no);
-    if c.s.contains_key(&k) || c.m.contains_key(&k) {
-        return;
-    }
-    c.admits += 1;
-    let ghost = c.g.remove(&k);
-    if ghost {
-        // Seen recently and evicted: it earned main-queue residency.
-        c.admits_ghost += 1;
-        c.m_used += bytes.len();
-        c.m.insert(k, Node { data: bytes, freq: 1 });
-        c.m_order.push_back(k);
-    } else {
-        c.s_used += bytes.len();
-        c.s.insert(k, Node { data: bytes, freq: 0 });
-        c.s_order.push_back(k);
-    }
-    evict_to_fit(&mut c);
-}
-
-fn row_get(file_id: i64, no: i32) -> Option<Bytes> {
-    let mut c = row_cache().lock().unwrap();
-    if !c.enabled {
-        return None;
-    }
-    let k = (file_id, no);
-    let hit = if let Some(node) = c.s.get_mut(&k) {
-        node.freq = node.freq.saturating_add(1).min(FREQ_MAX);
-        Some(node.data.clone())
-    } else if let Some(node) = c.m.get_mut(&k) {
-        node.freq = node.freq.saturating_add(1).min(FREQ_MAX);
-        Some(node.data.clone())
-    } else {
-        None
-    };
-    if hit.is_some() {
-        c.hits += 1;
-    }
-    hit
-}
-
 // ---------------------------------------------------------------------------
-// GET stage attribution for bottleneck hunting: time awaiting PostgreSQL
-// versus local cache/decode/assembly, and pass-through stream time. Read via
-// `stage_stats_line` (the stats route and the log timer print it).
+// GET telemetry for bottleneck hunting: span-size histogram, time awaiting
+// PostgreSQL versus local decode/assembly, and pass-through stream time. Read
+// via `stage_stats_line` (the stats route and the log timer print it).
 // ---------------------------------------------------------------------------
+static SPANS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 // Small path: wall time per request and of its (parallel) fetch phase.
 static SMALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FETCH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -406,14 +243,20 @@ static PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `small total=.. fetch=.. local=.. | stream=.. | parts=.. wait(sum)=.. | served=..`
+/// `spans=[..] small total=.. fetch=.. local=.. | stream=.. | parts=.. wait(sum)=.. | served=..`
 pub fn stage_stats_line() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let ms = |us: u64| us as f64 / 1e3;
     let total = SMALL_US.load(Relaxed);
     let fetch = FETCH_US.load(Relaxed);
+    let s: Vec<u64> = SPANS.iter().map(|a| a.load(Relaxed)).collect();
     format!(
-        "perf: small total={:.0}ms fetch={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | parts={} wait(sum)={:.0}ms | served={}MiB",
+        "perf: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small total={:.0}ms fetch={:.0}ms local={:.0}ms n={} | stream={:.0}ms n={} | parts={} wait(sum)={:.0}ms | served={}MiB",
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+        s[4],
         ms(total),
         ms(fetch),
         ms(total.saturating_sub(fetch)),
@@ -426,31 +269,11 @@ pub fn stage_stats_line() -> String {
     )
 }
 
-/// Span-size buckets for the tuning counters: the gate lives at the last
-/// boundary.
+/// Span-size histogram buckets: <64K <512K <2M <8M >=8M (the workload's read
+/// shapes; the last boundary is ONESHOT_MAX).
 fn span_bucket(span: usize) -> usize {
     const T: [usize; 4] = [65536, 524_288, 2_097_152, 8_388_608];
     T.iter().position(|&t| span < t).unwrap_or(4)
-}
-
-fn admit_bytes() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("PGVS3_ADMIT_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8 * 1024 * 1024)
-    })
-}
-
-/// One-line cache telemetry for tuning PGVS3_ADMIT_BYTES / PGVS3_CACHE_MIB.
-pub fn cache_stats_line() -> String {
-    let c = row_cache().lock().unwrap();
-    format!(
-        "cache: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] hits={} admits={} (ghost={} promotes={}) tiers=s:{}B/m:{}B",
-        c.spans[0], c.spans[1], c.spans[2], c.spans[3], c.spans[4],
-        c.hits, c.admits, c.admits_ghost, c.promotes, c.s_used, c.m_used
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -494,10 +317,10 @@ async fn object_row(
         .map(|r| r.get("file_id")))
 }
 
-/// Serve `[start, end]` of an object. Spans above the admission gate stream
-/// straight through (no cache reads or writes — their bytes live in DuckLake's
-/// buffer); small spans take the fast path: rows gathered in memory (2Q cache
-/// first, one query for misses) and concatenated — no channel hop, no task.
+/// Serve `[start, end]` of an object. Spans up to ONESHOT_MAX take the fast
+/// path: rows fetched (as parallel parts above PGVS3_SPLIT_BYTES) into one
+/// buffer, no channel hop, no task; larger spans stream through in ordered
+/// parts.
 pub async fn get_body(
     pool: PgPool,
     bucket: String,
@@ -519,10 +342,9 @@ pub async fn get_body(
     let first_row = (start / ROW_BYTES) as i32;
     let last_row = (end / ROW_BYTES) as i32;
     let nrows = (last_row - first_row + 1) as usize;
-    let bkt = span_bucket(smeta.len() as usize);
-    row_cache().lock().unwrap().spans[bkt] += 1;
+    SPANS[span_bucket(smeta.len() as usize)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    if (smeta.len() as usize) <= admit_bytes() {
+    if (smeta.len() as usize) <= ONESHOT_MAX {
         use std::sync::atomic::Ordering::Relaxed;
         let t0 = std::time::Instant::now();
         let rows = gather_rows(&pool, &m, first_row, nrows).await?;
@@ -560,54 +382,43 @@ pub enum PieceBody {
     Streamed(PieceStream),
 }
 
-/// Whole-row gather for small spans: cache first, then the misses as parallel
-/// parts (split_rows each, SPLIT_INFLIGHT at a time).
+/// Whole rows of a one-shot span: parallel range parts (split_rows each,
+/// SPLIT_INFLIGHT at a time), placed by `no`.
 async fn gather_rows(pool: &PgPool, m: &Meta, first_row: i32, nrows: usize) -> Result<Vec<Bytes>> {
-    let mut rows: Vec<Option<Bytes>> = vec![None; nrows];
-    let mut missing: Vec<i32> = Vec::new();
-    for (i, slot) in rows.iter_mut().enumerate() {
-        let no = first_row + i as i32;
-        match row_get(m.file_id, no) {
-            Some(r) => *slot = Some(r),
-            None => missing.push(no),
-        }
-    }
-    if !missing.is_empty() {
-        let t0 = std::time::Instant::now();
-        let file_id = m.file_id;
-        // Owned per-part `no` lists: futures over borrowed slices are
-        // higher-ranked and trip the Send check of spawned callers.
-        let chunks = missing.chunks(split_rows().unwrap_or(usize::MAX)).map(<[i32]>::to_vec);
-        let mut parts = futures::stream::iter(chunks)
-            .map(|nos| async move { fetch_part(pool, file_id, &nos).await })
-            .buffer_unordered(SPLIT_INFLIGHT);
-        while let Some(part) = parts.next().await {
-            for (no, data) in part? {
-                row_put(m.file_id, no, data.clone());
-                if let Some(slot) = rows.get_mut((no - first_row) as usize) {
-                    *slot = Some(data);
-                }
+    let t0 = std::time::Instant::now();
+    let mut rows = vec![Bytes::new(); nrows];
+    let last_row = first_row + nrows as i32 - 1;
+    let file_id = m.file_id;
+    let mut parts = futures::stream::iter(part_ranges(first_row, last_row, split_rows().unwrap_or(usize::MAX)))
+        .map(|(lo, hi)| fetch_part(pool, file_id, lo, hi))
+        .buffer_unordered(SPLIT_INFLIGHT);
+    while let Some(part) = parts.next().await {
+        for (no, data) in part? {
+            if let Some(slot) = rows.get_mut((no - first_row) as usize) {
+                *slot = data;
             }
         }
-        FETCH_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
-    Ok(rows.into_iter().map(|p| p.unwrap_or_default()).collect())
+    FETCH_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(rows)
 }
 
-/// One part query on its own pool connection; `nos` ascending. Contiguous
-/// runs use the range predicate, scattered misses `= ANY`.
-async fn fetch_part(pool: &PgPool, file_id: i64, nos: &[i32]) -> Result<Vec<(i32, Bytes)>> {
+/// Contiguous `[lo, hi]` ranges of at most `step` rows covering the span.
+fn part_ranges(first_row: i32, last_row: i32, step: usize) -> impl Iterator<Item = (i32, i32)> {
+    let step = step.clamp(1, i32::MAX as usize);
+    (first_row..=last_row)
+        .step_by(step)
+        .map(move |lo| (lo, lo.saturating_add(step as i32 - 1).min(last_row)))
+}
+
+/// One contiguous row-range query on its own pool connection.
+async fn fetch_part(pool: &PgPool, file_id: i64, lo: i32, hi: i32) -> Result<Vec<(i32, Bytes)>> {
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
     let mut conn = pool.acquire().await?;
     WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
     PARTS.fetch_add(1, Relaxed);
-    let (lo, hi) = (nos[0], nos[nos.len() - 1]);
-    let got = if (hi - lo + 1) as usize == nos.len() {
-        sqlx::query(GET_RANGE_SQL).bind(file_id).bind(lo).bind(hi).fetch_all(&mut *conn).await?
-    } else {
-        sqlx::query(GET_ROWS_FULL_SQL).bind(file_id).bind(nos).fetch_all(&mut *conn).await?
-    };
+    let got = sqlx::query(GET_RANGE_SQL).bind(file_id).bind(lo).bind(hi).fetch_all(&mut *conn).await?;
     let mut out = Vec::with_capacity(got.len());
     for r in got {
         let raw = r.try_get_raw("data")?;
@@ -662,11 +473,8 @@ async fn stream_pass_inner(
         None => (STREAM_PART_MAX_ROWS, 1), // A/B baseline: one query at a time
     };
     let file_id = m.file_id;
-    let ranges = (first_row..=last_row)
-        .step_by(step)
-        .map(move |lo| (lo..=(lo + step as i32 - 1).min(last_row)).collect::<Vec<i32>>());
-    let mut parts = futures::stream::iter(ranges)
-        .map(|nos| async move { fetch_part(pool, file_id, &nos).await })
+    let mut parts = futures::stream::iter(part_ranges(first_row, last_row, step))
+        .map(|(lo, hi)| fetch_part(pool, file_id, lo, hi))
         .buffered(inflight);
     while let Some(part) = parts.next().await {
         let mut part = part?;

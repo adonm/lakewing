@@ -34,6 +34,8 @@ def connect(stack: str, args, extensions: tuple = ()) -> duckdb.DuckDBPyConnecti
     # 30s response window is smaller than a big flush under load, and httpfs
     # refuses to retry an unknown-outcome Complete. Generous window.
     con.sql("SET http_timeout=300")
+    if getattr(args, "memory_limit", None):
+        con.sql(f"SET memory_limit='{args.memory_limit}'")
     for ext in ("postgres", "httpfs", "ducklake", *extensions):
         if stack == "plain" and ext in ("postgres", "httpfs", "ducklake"):
             continue
@@ -85,7 +87,7 @@ def gateway_stats():
         ).stdout.strip()
     except Exception:
         return None
-    return st if st.startswith(("cache:", "perf:")) else None
+    return st if st.startswith("perf:") else None
 
 
 def write_record(record: dict, out: str) -> None:

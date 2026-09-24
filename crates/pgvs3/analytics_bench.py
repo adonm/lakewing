@@ -152,6 +152,7 @@ def main() -> None:
                     help="clickbench fast loop: load N of the 100 1%% slices (0 = full hits.parquet)")
     ap.add_argument("--queries", default=None, help="range like 1-43 (default: all)")
     ap.add_argument("--query-timeout", type=float, default=0, help="per-query seconds (0 = unlimited)")
+    ap.add_argument("--memory-limit", default=None, help="DuckDB memory_limit (default: DuckDB's 80%% of RAM)")
     ap.add_argument("--src-dir", default=None)
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--plain-db", default=None)
@@ -201,8 +202,8 @@ def main() -> None:
         for k, v in errors.items():
             print(f"  {k}: {v}")
 
-    # Gateway cache telemetry (signed debug route) — the tuning surface for
-    # PGVS3_ADMIT_BYTES / PGVS3_CACHE_MIB, captured per run.
+    # Gateway telemetry (signed debug route): span histogram + GET stage
+    # counters, captured per run.
     if st := benchlib.gateway_stats():
         record["gateway_stats"] = st
         print("gateway:", st)
