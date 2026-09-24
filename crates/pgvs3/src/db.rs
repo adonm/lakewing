@@ -90,8 +90,9 @@ pub async fn connect(url: &str) -> Result<PgPool> {
         .max_connections(256)
         // Warm pool: cold-pool setup (TCP + TLS + SCRAM + session SETs to
         // Aurora) showed up as 10-13 ms average acquire wait per part (~40% of
-        // fetch time) in the c7gn A/B; keep DuckDB's in-flight GETs covered.
-        .min_connections(32)
+        // fetch time) in the c7gn A/B; at 32 SpatialBench's burst still waited
+        // 5-8 ms per part, so keep DuckDB's in-flight GETs covered.
+        .min_connections(64)
         // sqlx pings every connection on acquire by default (sqlx-core 0.8.6
         // pool/options.rs) - a full Aurora round trip per GET. Broken
         // connections still surface on use and get recycled.
