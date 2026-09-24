@@ -78,7 +78,7 @@ SPAT=(--bench spatial --data-path 's3://lake/run-32/'
 
 MIB=2048   # proxy row-cache MiB (PGVS3_CACHE_MIB)
 ADM=8388608  # cacheable span bytes (PGVS3_ADMIT_BYTES)
-SPLIT=1048576  # parallel part bytes (PGVS3_SPLIT_BYTES; 0 = one query per span)
+SPLIT=8388608  # parallel part bytes (PGVS3_SPLIT_BYTES; 0 = one query per span)
 
 fresh_catalogs() {
   for db in ducklake_click_lake_s3 ducklake_spatial_lake_s3; do
@@ -179,8 +179,8 @@ sweep)
   # views-only on the quick data: only the gateway config (MIB ADM SPLIT)
   # changes between runs; SPLIT=0 is the one-query-per-span baseline and
   # nocache isolates the proxy row cache's contribution.
-  for cfg in "2048 8388608 0 nosplit" "2048 8388608 524288 split512k" "2048 8388608 1048576 split1m" \
-             "2048 8388608 2097152 split2m" "0 8388608 1048576 nocache"; do
+  for cfg in "2048 8388608 0 nosplit" "2048 8388608 8388608 split8m" "2048 8388608 2097152 split2m" \
+             "0 8388608 8388608 nocache"; do
     read -r MIB ADM SPLIT TAG <<<"$cfg"
     run_one "sweep-click-$TAG" "${CLICK[@]}" --stack lake-s3 --catalog "$CAT_C3" --views-only --passes 2 --query-timeout 300
     # Q1-Q7 only: Q8-Q12 are DuckDB's CPU-bound spatial joins (timeouts /

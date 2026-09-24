@@ -6,10 +6,11 @@
 //! cache) and Aurora, purely to remove round trips. Objects are immutable by
 //! convention, so cache entries are populated at publish and dropped at
 //! delete; repeat reads (parquet footers, hot ranges) reach PostgreSQL zero
-//! times. Uncached rows fetch in parallel parts (PGVS3_SPLIT_BYTES, default
-//! 1 MiB, SPLIT_INFLIGHT per request on separate pool connections): one Aurora
-//! connection moves ~420-500 MB/s warm (per TLS flow) and ~300 MB/s cold
-//! (storage per backend), so large spans fan out across the pool.
+//! times. Spans above PGVS3_SPLIT_BYTES (default 8 MiB) fetch in parallel
+//! parts on separate pool connections: one Aurora connection moves ~420-500
+//! MB/s warm / ~300 MB/s cold, which binds a lone large read. At DuckDB's
+//! concurrency (many GETs already in flight) smaller parts measured no gain
+//! and 512 KiB parts hurt, so only big spans fan out.
 //!
 //! Write path: deliberately single-threaded per process — one binary COPY
 //! stream at a time (a global flush permit), rows cut across multipart part
@@ -60,15 +61,15 @@ const SPLIT_INFLIGHT: usize = 8;
 /// Pass-through parts never buffer more than ~8 MiB each.
 const STREAM_PART_MAX_ROWS: usize = 1024;
 
-/// Rows per parallel part (PGVS3_SPLIT_BYTES, default 1 MiB; 0 disables
-/// splitting: one query per span, the pre-split behaviour, for A/B runs).
+/// Rows per parallel part (PGVS3_SPLIT_BYTES, default 8 MiB = only spans above
+/// the admission gate split; 0 disables splitting entirely, for A/B runs).
 fn split_rows() -> Option<usize> {
     static N: OnceLock<Option<usize>> = OnceLock::new();
     *N.get_or_init(|| {
         let bytes = std::env::var("PGVS3_SPLIT_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1 << 20);
+            .unwrap_or(8 << 20);
         (bytes > 0).then(|| bytes.div_ceil(ROW_BYTES as usize))
     })
 }
@@ -85,9 +86,16 @@ pub async fn connect(url: &str) -> Result<PgPool> {
     // PGVS3_DURABLE=1 to require synchronous commits.
     let durable = std::env::var_os("PGVS3_DURABLE").is_some();
     Ok(PgPoolOptions::new()
-        // Parallel parts (SPLIT_INFLIGHT per request) multiply connection
-        // demand; Aurora allows ~1700 and sqlx opens connections lazily.
+        // Parallel parts multiply connection demand; Aurora allows ~1700.
         .max_connections(256)
+        // Warm pool: cold-pool setup (TCP + TLS + SCRAM + session SETs to
+        // Aurora) showed up as 10-13 ms average acquire wait per part (~40% of
+        // fetch time) in the c7gn A/B; keep DuckDB's in-flight GETs covered.
+        .min_connections(32)
+        // sqlx pings every connection on acquire by default (sqlx-core 0.8.6
+        // pool/options.rs) - a full Aurora round trip per GET. Broken
+        // connections still surface on use and get recycled.
+        .test_before_acquire(false)
         .after_connect(move |conn, _meta| {
             Box::pin(async move {
                 // Whole session setup in one round trip (simple-query batch).
