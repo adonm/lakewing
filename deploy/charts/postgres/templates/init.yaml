@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: postgres-init
-data:
-  00-databases.sql: |
-{{- range .Values.databases }}
-    CREATE DATABASE {{ . }};
-{{- end }}

@@ -1,15 +1,12 @@
 replicas: 2
 image: ghcr.io/adonm/pgvs3:latest
-# Object rows and DuckLake's catalog live in this PostgreSQL; Quickwit's
-# metastore is a file on the S3 endpoint (s3://quickwit/metastore).
-url: postgres://postgres:postgres@postgres:5432/pgvs3
-# Set to an existing Kubernetes Secret with key `url` for an external database
-# (the EC2 kind rig uses Aurora). Keep credentials out of Helm values/history.
-urlSecretName: ""
+# Local kind uses the postgres chart's Secret; EC2 kind overrides this with
+# Aurora's Secret. The URL never enters Helm values or release history.
+urlSecretName: postgres
 accessKey: cachebench
 secretKey: cachebench-local-only
-# Connection budget: the pool's ceiling is the gateway's share of a shared
-# database, so name it here and keep it in postgres's connectionBudget.
+# A per-replica ceiling: 2 x 64 gateway connections. Size the local Postgres
+# maxConnections (or external Aurora capacity) for the entire fleet.
 poolMax: 64
 poolMin: 64
 # pgvs3 is stateless (metadata cache is per-process, keyed by bucket/key), so
@@ -18,8 +15,8 @@ poolMin: 64
 resources:
   requests: { cpu: 250m, memory: 256Mi }
   limits: { memory: 4Gi }
-# Optional HPA: `just kind-stress` sweeps concurrency against a fixed replica
-# count; enable this to watch scaling instead.
+# Optional HPA; requires metrics-server (not installed in kind). Stress tests
+# use fixed replicas so the concurrency sweep is repeatable.
 autoscaling:
   enabled: false
   minReplicas: 2

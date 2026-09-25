@@ -11,7 +11,13 @@
 FROM rust:alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-COPY . .
+# Only Rust inputs invalidate the native image build. Chart/docs/benchmark
+# edits do not change the gateway binary and should not recompile it.
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/pgvs3/Cargo.toml crates/pgvs3/Cargo.toml
+COPY crates/pgvs3/schema.sql crates/pgvs3/schema.sql
+COPY crates/pgvs3/src/ crates/pgvs3/src/
 RUN cargo build --release --locked --manifest-path crates/pgvs3/Cargo.toml \
  && cp target/release/pgvs3 /pgvs3
 

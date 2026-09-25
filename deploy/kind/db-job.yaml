@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pgvs3-databases
+  namespace: pgvs3
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: psql
+          image: postgres:18
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PGHOST
+              valueFrom: { secretKeyRef: { name: __DB_SECRET__, key: host } }
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: __DB_SECRET__, key: user } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: __DB_SECRET__, key: password } }
+            - name: PGSSLMODE
+              valueFrom: { secretKeyRef: { name: __DB_SECRET__, key: sslmode } }
+          command: [sh, -ec]
+          args:
+            - |
+              for db in pgvs3 ducklake_catalog quickwit_metastore; do
+                exists=$(psql -v ON_ERROR_STOP=1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$db'")
+                if [ "$exists" != 1 ]; then
+                  psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE $db"
+                fi
+                echo "$db ready"
+              done
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { memory: 256Mi }

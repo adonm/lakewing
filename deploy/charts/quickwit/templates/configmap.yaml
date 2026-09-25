@@ -6,7 +6,7 @@ data:
   quickwit.yaml: |
     version: 0.7
     cluster_id: pgvs3-quickwit
-    metastore_uri: {{ .Values.metastoreUri }}
+    metastore_uri: ${QW_METASTORE_URI}
     default_index_root_uri: {{ .Values.indexRootUri }}
     storage:
 {{ toYaml .Values.storage | indent 6 }}

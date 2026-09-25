@@ -1,7 +1,7 @@
 image: quickwit/quickwit:0.9.1
-# Everything on the S3 endpoint: the metastore is a file at
-# s3://…/metastore and index splits at s3://…/indexes — no database needed.
-metastoreUri: s3://quickwit/metastore
+# Same PostgreSQL cluster as pgvs3 and DuckLake, third logical database.
+# The URI comes from a Secret; only immutable split files live on pgvs3.
+metastoreSecretName: postgres
 indexRootUri: s3://quickwit/indexes
 storage:
   s3:
@@ -11,26 +11,20 @@ storage:
     flavor: minio
     access_key_id: cachebench
     secret_access_key: cachebench-local-only
-# One node runs every service. Split indexer/searcher roles need gossip
+# One node runs the indexer/control plane and all services. The metastore can
+# safely be shared through PostgreSQL; scale read-only searchers separately
+# with direct pod discovery (never a ClusterIP seed).
+# REST on 7280 includes the OTLP HTTP route;
+# this release does not listen on 4317/4318. Split indexer/searcher roles need gossip
 # between pods, which a Service VIP does not give you (chitchat's UDP to a
 # ClusterIP never reaches a peer, so each node sees only itself — no shards,
 # no metastore). Scale roles out later over pod DNS.
-replicas: 1
 enableOtlpEndpoint: true
-# Tuning, passed straight into quickwit.yaml. Measured at 100M logs (see
-# README): caches and split_cache did not move latency where storage is
-# nearly free (warmups are ~13MB per split-search and pgvs3 serves cold ≈
-# warm) — split_cache stays as cheap insurance for slow object storage. The
-# lever for time-scoped log search is index layout: merged splits smear time
-# ranges and every window pays per-split timestamp-column work, so
-# `merge_policy: {type: no_merge}` kept 99.5% of fresh windowed queries
-# under 20ms where stable_log merges managed 12%.
-searcherConfig:
-  split_cache:
-    max_num_bytes: 20GiB
-    max_num_splits: 64
-    num_concurrent_downloads: 4
-    max_file_descriptors: 256
+# Quickwit already caches fast fields, split footers and partial results in
+# memory. Its optional whole-split cache is *disk-backed*: 20 GiB per searcher
+# did not improve the measured 100M-log local kind run. Leave it off until an
+# Aurora-backed A/B proves that the extra per-replica disk is worth it.
+searcherConfig: {}
 # Ingest: the per-shard limit defaults to 5 MiB/s (validation caps it at
 # 20 MiB); bulk loads need the headroom or they crawl on backpressure.
 ingestApiConfig:
@@ -39,3 +33,9 @@ ingestApiConfig:
 resources:
   requests: { cpu: 500m, memory: 2Gi }
   limits: { memory: 16Gi }
+# The core is always one writer; only this search-only Deployment scales.
+searcher:
+  replicas: 0
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { memory: 6Gi }

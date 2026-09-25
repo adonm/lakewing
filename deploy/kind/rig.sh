@@ -149,10 +149,10 @@ case ${1:-} in
         --query 'VolumeModification.[VolumeId,TargetThroughput,ModificationState]' --output text
     fi
     "${aws[@]}" ec2 wait instance-status-ok --instance-ids "$instance"
-    echo 'rig: waiting for cloud-init (Docker + mise)'
+    echo 'rig: waiting for cloud-init (mise installer)'
     ready=0
     for _ in $(seq 1 40); do
-      if ssh_run 'test -f /var/tmp/pgvs3-bootstrap-ready && test -x ~/.local/bin/mise && docker info >/dev/null 2>&1' 2>/dev/null; then
+      if ssh_run 'test -f /var/tmp/pgvs3-bootstrap-ready && test -x ~/.local/bin/mise' 2>/dev/null; then
         ready=1; break
       fi
       sleep 10
@@ -162,11 +162,12 @@ case ${1:-} in
   sync)
     check_account
     [ -s "$key_file" ] || die "missing SSH key: $key_file"
-    tar czf - Cargo.toml Cargo.lock .cargo crates deploy Dockerfile .dockerignore mise.toml justfile \
+    tar czf - Cargo.toml Cargo.lock .cargo crates deploy Dockerfile .dockerignore mise.toml mise.ec2.toml justfile \
       | ssh_run 'mkdir -p pgvs3 && tar xzf - -C pgvs3'
-    ssh_run 'cd pgvs3 && ~/.local/bin/mise trust mise.toml && ~/.local/bin/mise install'
+    ssh_run 'cd pgvs3 && ~/.local/bin/mise trust mise.toml && ~/.local/bin/mise trust mise.ec2.toml && ~/.local/bin/mise -E ec2 bootstrap --yes'
+    ssh_run 'docker info >/dev/null && echo "rig: Docker ready after mise bootstrap"'
     ssh_run "cd pgvs3 && ~/.local/bin/mise exec -- bash -c 'kind get clusters | grep -qx pgvs3 || kind create cluster --name pgvs3 --config deploy/kind/cluster.yaml'"
-    ssh_run 'cd pgvs3 && ~/.local/bin/mise exec -- kubectl create namespace pgvs3 --dry-run=client -o yaml | ~/.local/bin/mise exec -- kubectl apply -f -'
+    ssh_run 'cd pgvs3 && ~/.local/bin/mise exec -- kubectl --context kind-pgvs3 create namespace pgvs3 --dry-run=client -o yaml | ~/.local/bin/mise exec -- kubectl --context kind-pgvs3 apply -f -'
     cluster=$(output DbClusterIdentifier)
     endpoint=$(output DbEndpoint)
     secret_arn=$("${aws[@]}" rds describe-db-clusters --db-cluster-identifier "$cluster" \
@@ -175,15 +176,19 @@ case ${1:-} in
     "${aws[@]}" secretsmanager get-secret-value --secret-id "$secret_arn" \
       --query SecretString --output text \
       | python3 deploy/kind/rig-secret.py "$endpoint" \
-      | ssh_run 'cd pgvs3 && ~/.local/bin/mise exec -- kubectl apply -f -'
-    ssh_run 'cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora ~/.local/bin/mise exec -- just kind-up'
+      | ssh_run 'cd pgvs3 && ~/.local/bin/mise exec -- kubectl --context kind-pgvs3 apply -f -'
+    searchers=${QUICKWIT_SEARCHERS:-0}
+    [[ "$searchers" =~ ^[0-9]+$ ]] || die 'QUICKWIT_SEARCHERS must be a non-negative integer'
+    ssh_run "cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora QUICKWIT_SEARCHERS=$searchers ~/.local/bin/mise exec -- just kind-up"
     ssh_run 'cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora ~/.local/bin/mise exec -- just kind-validate'
     instance=$(output InstanceId)
     echo "rig: ready on $instance (kind on EC2, Aurora $endpoint)"
     ;;
   validate)
     check_account
-    ssh_run 'cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora ~/.local/bin/mise exec -- just smoke'
+    searchers=${QUICKWIT_SEARCHERS:-0}
+    [[ "$searchers" =~ ^[0-9]+$ ]] || die 'QUICKWIT_SEARCHERS must be a non-negative integer'
+    ssh_run "cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora QUICKWIT_SEARCHERS=$searchers ~/.local/bin/mise exec -- just smoke"
     copy_results
     ;;
   bench)

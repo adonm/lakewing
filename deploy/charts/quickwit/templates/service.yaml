@@ -3,9 +3,11 @@ kind: Service
 metadata:
   name: quickwit
 spec:
+  {{- if gt (int .Values.searcher.replicas) 0 }}
+  selector: { app: quickwit-searcher }
+  {{- else }}
   selector: { app: quickwit }
+  {{- end }}
   ports:
     - { port: 7280, name: rest }
     - { port: 7281, name: grpc }
-    - { port: 4317, name: otlp-grpc }
-    - { port: 4318, name: otlp-http }

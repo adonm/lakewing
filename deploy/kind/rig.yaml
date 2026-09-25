@@ -89,10 +89,8 @@ Resources:
         Fn::Base64: |
           #!/usr/bin/env bash
           set -euxo pipefail
-          # AL2023 includes curl-minimal; installing curl conflicts with it.
-          dnf install -y docker git tar gzip unzip gcc make rsync
-          systemctl enable --now docker
-          usermod -aG docker ec2-user
+          # AL2023 includes curl-minimal. After the checkout arrives,
+          # mise.ec2.toml installs host packages, Docker service and tools.
           sudo -iu ec2-user bash -c 'curl -fsSL https://mise.run | sh'
           touch /var/tmp/pgvs3-bootstrap-ready
       Tags:

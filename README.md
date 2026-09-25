@@ -19,7 +19,7 @@ Needs [mise](https://mise.jdx.dev/) and Docker (or any PostgreSQL 13+: pass
 `--url`).
 
 ```sh
-just setup    # toolchain (rust, just, python, uv, kind, helm, kubectl) + cargo fetch
+just setup    # toolchain (rust, mbx, just, python, uv, kind, helm, kubectl) + cargo fetch
 just dev-db   # PostgreSQL 18 in Docker, for running the gateway by hand
 just smoke    # the tests: kind cluster up, every workload once at smoke scale
 ```
@@ -82,7 +82,7 @@ A flag overrides the same-named variable.
 | `--access-key` | `PGVS3_ACCESS_KEY` | `cachebench` | SigV4 access key. |
 | `--secret-key` | `PGVS3_SECRET_KEY` | `cachebench-local-only` | SigV4 secret key. |
 | | `PGVS3_POOL_MIN` | 64 | Connections opened at start and kept warm. Clamped to the max. |
-| | `PGVS3_POOL_MAX` | 64 | Connections open at once: the gateway's share of a shared database, not the server's ceiling. A fleet multiplies it — the kind chart states the whole budget once (`connectionBudget`). |
+| | `PGVS3_POOL_MAX` | 64 | Connections open at once, per gateway. Include all replicas, rollout headroom and other clients in the local Postgres `maxConnections` or Aurora connection budget. |
 | | `PGVS3_DURABLE=1` | off | Synchronous commits. Off is safe for objects (sha256-addressed, idempotent: a lost commit only means a retried PUT). |
 
 `GET /healthz` is an unauthenticated liveness probe. `GET /_pgvs3/stats`
@@ -134,16 +134,18 @@ to send (`Client:ClientWrite`).
 ### kind cluster, 2026-09-25
 
 Three-node kind on a 16-core / 62 GiB workstation: PostgreSQL 18 in-cluster
-(single instance, 2 GiB `shared_buffers`), DuckLake over pgvs3, Quickwit
-0.9.1 single node with its metastore and splits on the S3 endpoint. Caches
-stay on, so the warm pass is the point. Reproduce with `just kind-up` and
-`just kind-bench`; results land in `.tmp/pgvs3/kind-bench.jsonl`.
+(single instance, 1 GiB `shared_buffers`), DuckLake over pgvs3, Quickwit
+0.9.1 single node. **This run used Quickwit's S3 file-backed metastore**;
+the current chart uses PostgreSQL for metadata and pgvs3 for index splits.
+Caches stay on, so the warm pass is the point. Reproduce the workload shape
+with `just kind-up` and `just kind-bench`; results land in
+`.tmp/pgvs3/kind-bench.jsonl`.
 
 | Measure | Result |
 | --- | --- |
 | pgbench scale 10, 16 clients | 1,487 tps · 10.8 ms average |
 | TPC-H SF 10, 22 queries over DuckLake | 9.9 s cold · 6.1 s warm; load 111 s |
-| ClickBench, full 10M-row `hits` (43 queries) | 8.4 s cold · 6.3 s warm; load 10 s |
+| ClickBench, 10% of canonical `hits` (10M rows, 43 queries) | 8.4 s cold · 6.3 s warm; load 10 s |
 | Quickwit search, 1M logs (template repeats — see below) | p50 7.9 ms · p95 18.6 ms; 96% under 20 ms |
 | GET p50, one client | 64 KiB 0.8 ms · 1 MiB 2.2 ms · 8 MiB 12.1 ms |
 | GET throughput, aggregate | 8 MiB 2.25 GiB/s at 128 readers · 1 MiB 1.89 GiB/s at 64 · 64 KiB 670 MiB/s |
@@ -155,10 +157,54 @@ and 128 concurrent ones 2.25 GiB/s, where the postgres process saturates
 before the gateway does. DuckDB's file cache works as designed — ClickBench's
 cold pass pulled 499 MiB through the gateway and the warm pass 209 MiB.
 
+### EC2 kind with Aurora I/O-Optimized, 2026-09-25 UTC
+
+Three-node kind on an m7i.4xlarge (16 vCPU, 64 GiB), two pgvs3 replicas,
+Quickwit core plus two search-only nodes, and Aurora PostgreSQL 18.6
+Serverless v2 (2–16 ACUs, I/O-Optimized) in the same AZ. Pgvs3 objects,
+DuckLake's catalog and Quickwit's metastore are separate databases on that
+Aurora cluster; Quickwit split files live on pgvs3. The full run used caches
+on and Quickwit's then-enabled disk split cache. The sample was `PARTS=10`
+(10M ClickBench rows), TPC-H SF10, 1M Quickwit logs and an 8 GiB object seed.
+
+| Measure | Result |
+| --- | --- |
+| pgbench scale 10, 16 clients | 1,763 TPS · 9.1 ms average |
+| TPC-H SF10, 22 queries | 7.4 s first pass · 5.8 s warm; load 110 s |
+| ClickBench 10M rows, 43 queries | 5.2 s first pass · 4.3 s warm; load 8.1 s |
+| Quickwit repeated templates, 1M logs | p50 6.9 ms · p95 8.8 ms; 0 errors |
+| 64 KiB GET, 32 readers | 847 MiB/s · 13.6k req/s |
+| 1 MiB / 8 MiB GET throughput | ~1.4 GiB/s aggregate at 32–64 readers |
+| Aurora direct floor, 256 KiB | p50 0.69 ms · 333 MiB/s |
+
+The ~1.4 GiB/s plateau is observed end-to-end throughput, **not** proof that
+Aurora itself is saturated; distinguish EC2 networking, pgvs3 and Aurora
+with node/CloudWatch metrics before tuning. The full JSONL record is saved
+locally under `.tmp/pgvs3/rig-out/` (not tracked in Git).
+
+To test the cost of Quickwit's disk split cache on this same 1,005,000-log
+index, we ran 400 fresh random 10%-time-window queries with the in-memory
+caches enabled in every pass:
+
+| Whole-split disk cache | p50 | p95 | Under 20 ms |
+| --- | ---: | ---: | ---: |
+| 20 GiB, before restart | 10.83 ms | 16.30 ms | 99.8% |
+| Disabled, first pass after restart | 10.94 ms | 16.15 ms | 99.8% |
+| Disabled, next pass | 11.11 ms | 16.41 ms | 99.8% |
+
+There is no measured win for spending 20 GiB **per searcher** on disk here,
+so the chart now leaves it disabled. This remote 1M-log A/B and the local
+100M-log result below both support that choice, but they do not substitute
+for an Aurora-backed 100M-log test. Quickwit's selective in-memory caches
+remain on; putting entire splits in tmpfs would spend much more RAM without
+evidence of a latency benefit.
+
 ### Quickwit search at 100M logs, 2026-09-25
 
-100M OTLP-schema logs through the ingest API (8 parallel batches, per-shard
-limit raised 5 → 20 MiB/s): 542 s, 185k docs/s, zero backpressure retries.
+This historical run used a file-backed S3 metastore; current deployments
+use PostgreSQL for metadata. 100M OTLP-schema logs through the ingest API
+(8 parallel batches, per-shard limit raised 5 → 20 MiB/s): 542 s, 185k
+docs/s, zero backpressure retries.
 Stored through pgvs3: 6.28 GB (12 published splits, 16.3 GiB uncompressed).
 
 | Query shape, fresh requests | p50 | p95 | under 20 ms |
@@ -176,7 +222,8 @@ What the code says and the measurements confirm:
   (whole splits on local disk), bigger caches, `count_all` off, an indexed
   timestamp field — all within noise. Warmups are ~13 MB per split-search
   and this rig's storage is nearly free (cold ≈ warm). Against slow object
-  storage, `split_cache` and the caches should matter far more.
+  storage, `split_cache` and the caches might matter more; the chart now
+  disables the disk cache by default until that is measured.
 - A time-scoped query pays per *overlapping split*: the window filter
   evaluates each split's timestamp column, and the default `stable_log`
   merges smear time ranges — a 10% window overlapped 38M docs across two
@@ -187,11 +234,59 @@ What the code says and the measurements confirm:
   20 ms) with `merge_policy: {type: no_merge}`. The trade-off is more
   splits for wide queries and no compaction.
 
+### Read-scaling topology
+
+Keep writes deliberately simple: one DuckLake catalog writer and one
+Quickwit indexer/control-plane node; add query-only DuckDB workers, pgvs3
+gateways and Quickwit **searcher-only** nodes as read load grows. Quickwit
+[recommends PostgreSQL for distributed metadata](https://quickwit.io/docs/configuration/metastore-config):
+the former file-backed S3 metastore has no cross-process write lock. The
+three databases share one PostgreSQL cluster (Aurora on EC2), while immutable
+Quickwit splits stay on pgvs3. The one-indexer chart uses a `Recreate` rollout
+to avoid temporarily running two writers. `QUICKWIT_SEARCHERS=2 just kind-up`
+adds search-only replicas behind the `quickwit` query Service; ingestion and
+admin calls use `quickwit-core`. A
+[headless DNS seed](https://quickwit.io/docs/configuration/node-config)
+exposes direct gossip **UDP 7280** and gRPC **TCP 7281**. In kind, the core
+and both searchers joined the same cluster, and the query service searched
+logs ingested through the core (100 queries, zero errors). This verifies
+discovery and routing, **not** performance scaling at 100M records. The
+earlier two-node experiment failed because a ClusterIP seed did not carry
+gossip.
+
+Search performance depends on time-pruning **and** bounded split counts.
+`no_merge` won on our sequential timestamped dataset, but Quickwit discourages
+it for general searches. A better next A/B is an ingest-time day/hour key and
+[partitioned splits](https://quickwit.io/docs/overview/concepts/querying#partitioning):
+Quickwit keeps partitions isolated during merges, so it can compact within a
+time bucket without smearing time ranges across buckets. Measure wide scans
+and scale transitions too, not only the 10%-window p95.
+
+KEDA can eventually control that searcher Deployment from Prometheus
+`quickwit_search_root_search_requests_total{kind="server"}` (QPS) and
+`quickwit_search_leaf_search_single_split_tasks{status="pending"}` (queue
+pressure); both are exposed by this Quickwit version. Keep at least one warm
+searcher and a slow scale-down to avoid cache churn; use the root-search
+latency histogram as an SLO check, not an untested scaling threshold. If a
+disk `split_cache` is enabled later, budget its full size per replica; do not
+mount whole splits in tmpfs just to cache them in RAM. Quickwit's fast-field
+and footer caches already do that selectively. Scale pgvs3 replicas from
+read concurrency, but cap the fleet by Aurora's
+connection budget (`replicas × PGVS3_POOL_MAX`, plus other clients and
+rollout headroom). Neither Aurora ACUs nor a KEDA trigger make connections
+unlimited. Do **not** autoscale the one ingest writer: Quickwit's ingest
+queue uses local disk, so reliable restart needs a persistent WAL or an
+upstream durable queue/replay path before treating that pod as disposable.
+
 ## Benchmarks
 
 Testing lives here too: `just smoke` is `kind-up`, the validate suite and a
 smoke-scale `kind-bench`, and CI runs exactly that (`just ci` = fmt, clippy,
 build, tests, smoke). One stack, one way to be wrong.
+Mise installs Mr Boxington (`mbx`) for the native Rust builds in `just ci`
+and the benchmark image build; the CI check job restores its Cargo cache with
+`jdx/mr-boxington-action`. The published multi-arch Docker image compiles
+inside its own builder without a remote compiler cache.
 
 ### The kind stack (local or EC2)
 
@@ -200,15 +295,32 @@ and runs every workload in well under an hour with caching on — the same
 commands on a laptop and on an EC2 instance, so numbers stay comparable.
 `QUICK=1 just kind-bench` runs the whole set at smoke scale first: minutes,
 to prove the wiring before spending an hour. `just kind-down` tears it down.
+The scripts always address Kubernetes context `kind-pgvs3` explicitly; they
+cannot accidentally install benchmarks into another current cluster.
+Use `QUICKWIT_SEARCHERS=2 just kind-up` to prove read-only searcher scaling;
+default zero additional searchers preserves the single-node CI shape.
 
-The stack: Postgres holds pgvs3's object rows and DuckLake's catalog — two
-logical databases on one cluster, the simple single-writer shape. Quickwit
-runs one node with its metastore and index splits on the endpoint
-(`s3://…/metastore`), so it needs no metadata database at all.
+The stack: one PostgreSQL cluster holds three logical databases — pgvs3's
+object rows, the DuckLake catalog and Quickwit's metastore. Quickwit runs
+one indexer/control-plane node and stores immutable index splits on pgvs3.
+One idempotent kind Job creates the three databases before Quickwit starts,
+both locally and against Aurora.
+
+| Chart | Local and CI kind | EC2 kind |
+| --- | --- | --- |
+| `postgres` | One standalone PostgreSQL 18 pod and PVC; not a PostgreSQL HA set | Omitted; Aurora is external |
+| `pgvs3` | Two stateless gateway replicas | Same Deployment; DB URL from a Kubernetes Secret |
+| `quickwit` | One core node + optional search-only replicas; PostgreSQL metastore, splits on pgvs3 | Same chart |
+| `kind-bench` | One short-lived Job per invocation | Same Jobs; DB settings from the same Secret |
+
+`just` is the interface; `deploy/kind/up.sh`, `db.sh` and `bench.sh`
+orchestrate these small charts. `PGVS3_DB_SECRET` selects an external database
+configuration; unset uses local PostgreSQL.
 
 The suites: `pgbench` (OLTP against the rows database), `tpch` (22 queries
-over DuckLake), `click` (43 ClickBench queries over the canonical 13.8 GiB
-`hits`), `search` (Quickwit on real OTLP-schema logs — latency against an
+over DuckLake), `click` (43 ClickBench queries; default `PARTS=10` runs 10%
+of the canonical 13.8 GiB / 100M-row `hits`, while `PARTS=0` loads all of
+it), `search` (Quickwit on real OTLP-schema logs — latency against an
 empty index is a lie) and `stress` (the gateway's concurrency ceiling: HEAD
 and GET sweeps reporting aggregate MiB/s and req/s; `just kind-stress` runs
 it alone).
@@ -216,11 +328,14 @@ it alone).
 Scale from the environment — `SF` (TPC-H), `PARTS` (ClickBench slices),
 `DOCS` and `WINDOW_FRAC` (Quickwit logs and query windows), `SEED_GB`,
 `REQUESTS`, `CONCURRENCY`, `SIZES`, `SECONDS_RUN` — for example
-`SF=30 CONCURRENCY=1,8,32,64,128 just kind-bench`. Each workload's share of
-PostgreSQL is stated once in `deploy/charts/postgres/values.yaml`
-(`connectionBudget`) and derives `max_connections`. Results land in
-`.tmp/pgvs3/kind-bench.jsonl`, one line per measurement; the full records are
-in the suite job logs.
+`SF=30 CONCURRENCY=1,8,32,64,128 just kind-bench`. The local-only PostgreSQL
+chart caps connections at 384: two 64-connection gateway pools normally,
+temporary warm pools during rolling updates, DuckLake/benchmark clients and
+headroom. If the gateway replica or pool count changes, update
+`maxConnections` in `deploy/charts/postgres/values.yaml`.
+Aurora-backed kind does not install that chart. Results land in
+`.tmp/pgvs3/kind-bench.jsonl`, one line per measurement; individual logs
+are in `.tmp/pgvs3/jobs/`.
 
 ### Harness entry points (development)
 
@@ -233,9 +348,9 @@ DuckLake harnesses directly (pass arguments through
 ### EC2 rig (kind with external Aurora PostgreSQL)
 
 CI and a laptop use in-kind PostgreSQL. The EC2 rig runs **the same kind
-charts and benchmark Jobs**, but pgvs3's object database and DuckLake's
-catalog are two logical databases on **Aurora PostgreSQL 18.6 Serverless v2,
-I/O-Optimized**. Quickwit remains single-node with its metastore and index
+charts and benchmark Jobs**, but pgvs3's objects, the DuckLake catalog and
+Quickwit's metastore are three logical databases on **Aurora PostgreSQL 18.6
+Serverless v2, I/O-Optimized**. Quickwit remains single-node with its index
 splits on pgvs3's S3 endpoint. This separates Aurora round trips and I/O from
 the kind host while retaining the CI workload shape.
 
@@ -256,6 +371,11 @@ The rig uses an m7i.4xlarge (16 vCPU, 64 GiB), a 250 GiB gp3 volume and
 Aurora scaling from 2 to 16 ACUs. Results are copied to
 `.tmp/pgvs3/rig-out/`. **Both EC2 and Aurora keep accruing charges** until
 `just rig-teardown`.
+
+The AMI needs only a small mise installer in cloud-init. After the checkout
+arrives, `mise -E ec2 bootstrap --yes` applies `mise.ec2.toml`: host Docker
+packages/service/group plus the same pinned tools as CI. CI and local
+development run only `mise install`, so EC2 host changes never leak into CI.
 
 ## Potential further gains
 
@@ -322,9 +442,11 @@ containers:
 - `crates/pgvs3/schema.sql`: the storage layout.
 - `crates/pgvs3/*.py` and `queries/`: the benchmark harness (ClickBench,
   SpatialBench, TPC-H).
-- `deploy/`: `kind/cluster.yaml`, `kind/rig.yaml` (the EC2 +
+- `deploy/`: `kind/cluster.yaml`, `kind/up.sh`, `kind/db.sh`, `kind/bench.sh`,
+  `kind/rig.yaml` (the EC2 +
   Aurora stack), `charts/` — `postgres`, `pgvs3`, `quickwit`, `kind-bench` —
   and `bench/`, the benchmark image (suite runners plus a copy of the
   harness, synced at build time).
-- `justfile`: every task (`just` lists them); `.env.example`: the rig's
+- `justfile`: every task (`just` lists them); `mise.ec2.toml`: the opt-in EC2
+  host bootstrap; `.env.example`: the rig's
   settings.

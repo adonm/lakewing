@@ -130,6 +130,7 @@ def wait_searchable(url, index, want, timeout=120.0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://quickwit:7280")
+    ap.add_argument("--ingest-url", default=None, help="REST endpoint of the one indexer node")
     ap.add_argument("--index", default="auto", help="'auto' picks the otel-logs index")
     ap.add_argument("--docs", type=int, default=100_000)
     ap.add_argument("--workers", type=int, default=8, help="parallel ingest batches")
@@ -140,13 +141,15 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    index = find_index(args.url, args.index)
+    ingest_url = args.ingest_url or args.url
+    index = find_index(ingest_url, args.index)
     pre = search(args.url, index, "*")["num_hits"]
     t0 = time.perf_counter()
     ingested, retries = (
-        ingest(args.url, index, args.docs, workers=args.workers) if args.docs else (0, 0)
+        ingest(ingest_url, index, args.docs, workers=args.workers) if args.docs else (0, 0)
     )
-    ingest_s = round(time.perf_counter() - t0, 1)
+    ingest_elapsed = time.perf_counter() - t0
+    ingest_s = round(ingest_elapsed, 3)
     if ingested:
         landed, waited_s = wait_searchable(args.url, index, pre + ingested)
         if landed < pre + ingested:
@@ -178,7 +181,7 @@ def main():
         "docs": ingested,
         "index_total": landed,
         "ingest_s": ingest_s,
-        "ingest_docs_per_s": round(ingested / max(ingest_s, 1e-9)),
+        "ingest_docs_per_s": round(ingested / max(ingest_elapsed, 1e-9)) if ingested else 0,
         "ingest_retries": retries,
         "ingest_wait_s": waited_s,
         "window_frac": args.window_frac,

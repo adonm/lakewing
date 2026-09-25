@@ -1,44 +1,38 @@
-{{- range $name := .Values.suites }}
----
+{{- if .Values.suite }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: "bench-{{ $name }}"
-  labels: { app: kind-bench, suite: {{ $name | quote }} }
+  name: "bench-{{ .Values.suite }}"
+  labels: { app: kind-bench, suite: {{ .Values.suite | quote }} }
 spec:
   backoffLimit: 0
   template:
     metadata:
-      labels: { app: kind-bench, suite: {{ $name | quote }} }
+      labels: { app: kind-bench, suite: {{ .Values.suite | quote }} }
     spec:
       restartPolicy: Never
       containers:
         - name: bench
-          image: {{ $.Values.image }}
+          image: {{ .Values.image }}
           imagePullPolicy: IfNotPresent
-          command: [bash, /bench/suites/run.sh, {{ $name | quote }}]
+          command: [bash, /bench/suites/run.sh, {{ .Values.suite | quote }}]
           env:
-            {{- if $.Values.pgSecretName }}
             - name: PG_HOST
-              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: host } }
+              valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: host } }
             - name: PG_USER
-              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: user } }
+              valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: user } }
             - name: PG_PASSWORD
-              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: password } }
+              valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: password } }
             - name: PG_URL
-              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: url } }
+              valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: url } }
             - name: PGSSLMODE
-              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: sslmode } }
-            {{- else }}
-            - { name: PG_HOST, value: {{ $.Values.pgHost | quote }} }
-            - { name: PG_USER, value: {{ $.Values.pgUser | quote }} }
-            - { name: PG_PASSWORD, value: {{ $.Values.pgPassword | quote }} }
-            {{- end }}
-            - { name: QUICKWIT_URL, value: {{ $.Values.quickwitUrl | quote }} }
-            - { name: PGVS3_URL, value: {{ $.Values.pgvs3Url | quote }} }
-            {{- range $k, $v := $.Values.suiteEnv }}
+              valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: sslmode } }
+            - { name: QUICKWIT_URL, value: {{ .Values.quickwitUrl | quote }} }
+            - { name: QUICKWIT_INGEST_URL, value: {{ .Values.quickwitIngestUrl | quote }} }
+            - { name: PGVS3_URL, value: {{ .Values.pgvs3Url | quote }} }
+            {{- range $k, $v := .Values.suiteEnv }}
             - { name: {{ $k }}, value: {{ $v | quote }} }
             {{- end }}
           resources:
-            {{- toYaml $.Values.resources | nindent 12 }}
+            {{- toYaml .Values.resources | nindent 12 }}
 {{- end }}

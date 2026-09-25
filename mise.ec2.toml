@@ -1,0 +1,24 @@
+# Opt-in host bootstrap for the Amazon Linux EC2 kind rig only:
+# `mise -E ec2 bootstrap --yes`. CI and local development use `mise install`
+# and never apply these host-wide Docker/system package declarations.
+[bootstrap.groups.docker]
+system = true
+
+[bootstrap.groups.ec2-user]
+
+[bootstrap.users.ec2-user]
+group = "ec2-user"
+groups = ["docker"]
+
+[bootstrap.packages]
+"dnf:docker" = "latest"
+"dnf:git" = "latest"
+"dnf:tar" = "latest"
+"dnf:gzip" = "latest"
+"dnf:unzip" = "latest"
+"dnf:gcc" = "latest"
+"dnf:make" = "latest"
+
+[bootstrap.services.docker]
+state = "running"
+enabled = true

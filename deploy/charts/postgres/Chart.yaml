@@ -1,6 +1,6 @@
 apiVersion: v2
 name: postgres
-description: PostgreSQL 18 for the object rows and DuckLake's catalog (Quickwit's metastore lives on the S3 endpoint)
+description: Single-node PostgreSQL 18 for CI/local kind (three logical databases; Aurora replaces it on EC2)
 type: application
 version: 0.1.0
 appVersion: "18"

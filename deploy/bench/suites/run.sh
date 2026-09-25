@@ -17,6 +17,7 @@ PG_URL=${PG_URL:-"postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:5432/pgvs3"}
 export PGPASSWORD="$PG_PASSWORD"
 # The harness talks to the gateway directly (DuckDB s3_endpoint, stats route).
 QW_URL=${QUICKWIT_URL:-http://quickwit:7280}
+QW_INGEST_URL=${QUICKWIT_INGEST_URL:-$QW_URL}
 PGVS3_URL=${PGVS3_URL:-http://pgvs3:8014}
 export PGVS3_URL
 export PGVS3_ENDPOINT=${PGVS3_ENDPOINT:-${PGVS3_URL#*://}}
@@ -58,27 +59,15 @@ validate)
     if out=$("$@" 2>&1); then echo "PASS  $name"; pass=$((pass + 1));
     else echo "FAIL  $name: $(echo "$out" | tail -1)"; fail=$((fail + 1)); fi
   }
-  http_ok() {
-    python3 -c "import sys,urllib.request as u
-try: sys.exit(0 if u.urlopen(sys.argv[1], timeout=10).status == 200 else 1)
-except Exception: sys.exit(1)" "$1"
-  }
   check "postgres (pg_isready)" pg_isready -h "$PG_HOST" -U "$PG_USER"
-  ensure_catalog() {
-    local exists
-    exists=$(psql -h "$PG_HOST" -U "$PG_USER" -d pgvs3 -tAc \
-      "SELECT 1 FROM pg_database WHERE datname = 'ducklake_catalog'")
-    if [ "$exists" != 1 ]; then
-      psql -v ON_ERROR_STOP=1 -h "$PG_HOST" -U "$PG_USER" -d pgvs3 \
-        -c 'CREATE DATABASE ducklake_catalog'
-    fi
-  }
-  check "ducklake (catalog database)" ensure_catalog
+  check "ducklake (catalog database)" psql -v ON_ERROR_STOP=1 -h "$PG_HOST" -U "$PG_USER" -d ducklake_catalog -tAc 'SELECT 1'
+  check "quickwit (metastore database)" psql -v ON_ERROR_STOP=1 -h "$PG_HOST" -U "$PG_USER" -d quickwit_metastore -tAc 'SELECT 1'
   # /healthz, not /_pgvs3/stats: the stats route is behind SigV4 (s3s
   # rejects unsigned GETs with 403), so it is not a probe path.
-  check "pgvs3 (healthz)" http_ok "$PGVS3_URL/healthz"
+  check "pgvs3 (healthz)" curl -fsS --max-time 10 "$PGVS3_URL/healthz"
   # Quickwit's REST API has no /healthz; /api/v1/cluster is the live node view.
-  check "quickwit (search API)" http_ok "$QW_URL/api/v1/cluster"
+  check "quickwit (search API)" curl -fsS --max-time 10 "$QW_URL/api/v1/cluster"
+  check "quickwit (ingest API)" curl -fsS --max-time 10 "$QW_INGEST_URL/api/v1/cluster"
   check "ducklake (attach + read)" python3 /bench/suites/duck_check.py
   check "pgvs3 (overwrite self-heal)" python3 /bench/suites/overwrite_check.py
   echo "validate: $pass passed, $fail failed"
@@ -131,6 +120,7 @@ click)
 search)
   # --docs seeds the index first: latency against an empty index is a lie.
   python3 /bench/suites/search_bench.py --url "$QW_URL" --docs "${DOCS:-1000000}" \
+    --ingest-url "$QW_INGEST_URL" \
     --index "${SEARCH_INDEX:-auto}" \
     --workers "${WORKERS:-8}" --window-frac "${WINDOW_FRAC:-0}" \
     --queries "${QUERIES:-200}" --out "$OUT/search.json"

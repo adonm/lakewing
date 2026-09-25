@@ -1,6 +1,6 @@
 apiVersion: v2
 name: kind-bench
-description: Four benchmark suites (pgbench / TPC-H / ClickBench / Quickwit) against Postgres+pgvs3+DuckLake
+description: One benchmark Job at a time (validate, pgbench, TPC-H, ClickBench, Quickwit or pgvs3 stress)
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

@@ -16,14 +16,16 @@ def main() -> None:
     password = source["password"]
     if not host or not user or not password:
         raise SystemExit("incomplete Aurora endpoint or master secret")
-    url = (f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
-           f"@{host}:5432/pgvs3?sslmode=require")
+    base = (f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+            f"@{host}:5432")
     print(json.dumps({
         "apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": "pgvs3-aurora", "namespace": "pgvs3"},
         "type": "Opaque",
         "stringData": {"host": host, "user": user, "password": password,
-                       "url": url, "sslmode": "require"},
+                       "url": f"{base}/pgvs3?sslmode=require",
+                       "metastoreUrl": f"{base}/quickwit_metastore?sslmode=require",
+                       "sslmode": "require"},
     }))
 
 

@@ -2,26 +2,18 @@
 # (DuckDB's external file cache, PostgreSQL's buffer cache, Quickwit's
 # fast-field/split-footer caches). Warm passes are the point.
 image: kind-bench:latest
-pgHost: postgres
-pgUser: postgres
-pgPassword: postgres
-# An external database provides `host`, `user`, `password`, `url`, and
-# `sslmode` from this Secret; local kind uses the values above instead.
-pgSecretName: ""
+# The same Secret shape for CI/local PostgreSQL and external Aurora.
+pgSecretName: postgres
 quickwitUrl: http://quickwit:7280
+quickwitIngestUrl: http://quickwit-core:7280
 pgvs3Url: http://pgvs3:8014
-# One Job per suite; `just kind-bench` runs them and concatenates the JSON
-# lines. Order here is the run order; the whole set targets <1 hour.
+# Only one Job is rendered at a time. `just kind-bench` sets this to each
+# requested suite in turn and collects the results.
+suite: ""
 # Suite knobs (QUICK=1 = smoke scale; SF, PARTS, DOCS, SEED_GB, REQUESTS,
 # CONCURRENCY, SIZES, ...) reach run.sh through here; the just recipe forwards
 # whatever the caller's environment sets.
 suiteEnv: {}
-suites:
-  - pgbench
-  - tpch
-  - click
-  - search
-  - stress
 resources:
   requests: { cpu: 500m, memory: 1Gi }
   limits: { memory: 8Gi }

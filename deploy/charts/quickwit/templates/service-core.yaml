@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: quickwit-core
+spec:
+  selector: { app: quickwit }
+  ports: [{ port: 7280, name: rest }]

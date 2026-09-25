@@ -1,9 +1,10 @@
-# Toolchain pins: `mise install` (runs on first use). Local PostgreSQL runs
-# in Docker via `just dev-db`; testing runs on kind (kind/helm/kubectl here,
-# so CI gets the same toolchain as a laptop).
+# Toolchain pins: `mise install` before just recipes, both locally and on EC2.
+# System packages only bootstrap Docker and native build prerequisites; mise
+# owns Rust, the kind/Helm/kubectl tools and the Cargo build cache (mbx).
 [tools]
 just = "1"
 rust = "stable"
+mr-boxington = "1.17.0"
 uv = "0.12.1"
 python = "3.12.14"
 duckdb = "1.5.5"

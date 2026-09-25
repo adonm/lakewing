@@ -1,17 +1,15 @@
+{{- if gt (int .Values.searcher.replicas) 0 }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: quickwit
+  name: quickwit-searcher
 spec:
-  replicas: 1
-  # One indexer/control-plane writer; do not surge a replacement alongside
-  # the old writer during a rollout.
-  strategy: { type: Recreate, rollingUpdate: null }
+  replicas: {{ .Values.searcher.replicas }}
   selector:
-    matchLabels: { app: quickwit }
+    matchLabels: { app: quickwit-searcher }
   template:
     metadata:
-      labels: { app: quickwit, quickwit-peer: "true" }
+      labels: { app: quickwit-searcher, quickwit-peer: "true" }
     spec:
       containers:
         - name: quickwit
@@ -20,11 +18,7 @@ spec:
           args: [run, --config, /etc/quickwit/quickwit.yaml]
           env:
             - name: QW_ENABLED_SERVICES
-              {{- if gt (int .Values.searcher.replicas) 0 }}
-              value: control_plane,metastore,indexer,janitor
-              {{- else }}
-              value: control_plane,metastore,indexer,janitor,searcher
-              {{- end }}
+              value: searcher
             - name: QW_LISTEN_ADDRESS
               value: 0.0.0.0
             - name: QW_PEER_SEEDS
@@ -42,7 +36,8 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/quickwit }
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml .Values.searcher.resources | nindent 12 }}
       volumes:
         - name: config
           configMap: { name: quickwit-config }
+{{- end }}

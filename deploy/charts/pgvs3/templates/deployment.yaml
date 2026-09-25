@@ -16,12 +16,8 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: PGVS3_URL
-              {{- if .Values.urlSecretName }}
               valueFrom:
                 secretKeyRef: { name: {{ .Values.urlSecretName | quote }}, key: url }
-              {{- else }}
-              value: {{ .Values.url | quote }}
-              {{- end }}
             - name: PGVS3_ACCESS_KEY
               value: {{ .Values.accessKey | quote }}
             - name: PGVS3_SECRET_KEY

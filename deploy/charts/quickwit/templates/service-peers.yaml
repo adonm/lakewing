@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: quickwit-peers
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { quickwit-peer: "true" }
+  ports:
+    - { port: 7280, name: gossip, protocol: UDP }
+    - { port: 7280, name: rest, protocol: TCP }
+    - { port: 7281, name: grpc, protocol: TCP }
