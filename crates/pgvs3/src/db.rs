@@ -76,9 +76,12 @@ pub async fn connect(url: &str) -> Result<Pool> {
         crate::pg::Options {
             // Opening a connection (TCP, TLS, SCRAM, the SETs) costs ~10 ms,
             // so keep enough open for DuckDB's bursts.
-            min: pool_min(),
-            // Parallel parts multiply connection demand; Aurora allows ~1700.
-            max: 256,
+            min: pool_min().min(pool_max()),
+            // The budget the cluster really has, not its ceiling: 64 covers a
+            // DuckDB worker's burst (measured wait-free), and the same default
+            // must fit a small shared Postgres alongside Quickwit and
+            // DuckLake. `PGVS3_POOL_MAX=256` where the cluster allows it.
+            max: pool_max(),
             session,
             range_sql: GET_RANGE_SQL,
             range_types: &[Type::INT8, Type::INT4, Type::INT4],
@@ -145,9 +148,19 @@ async fn init_locked(client: &Client) -> Result<()> {
 
 /// Warm connections per gateway (PGVS3_POOL_MIN, default 64: measured
 /// wait-free for one DuckDB worker's bursts). Every gateway holds this many
-/// Aurora backends open, so large fleets should lower it.
+/// backends open, so large fleets should lower it. Clamped to the max.
 fn pool_min() -> usize {
     std::env::var("PGVS3_POOL_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+}
+
+/// Connections open at once (PGVS3_POOL_MAX, default 64). Sized to the
+/// cluster's shared budget — the pool is one of several clients, and a fleet
+/// of gateways multiplies this — not to the server's ceiling.
+fn pool_max() -> usize {
+    std::env::var("PGVS3_POOL_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64)
@@ -242,55 +255,70 @@ pub async fn get_body(
     last: i64,
     suffix: i64,
 ) -> Result<Option<(SliceMeta, PieceBody)>> {
-    let Some(m) = meta(&pool, &bucket, &key).await? else {
-        return Ok(None);
-    };
-    let (start, end) = eff_range(m.size, first, last, suffix);
-    let smeta = SliceMeta {
-        size: m.size,
-        etag: m.etag.clone(),
-        created_at: m.created_at,
-        file_id: m.file_id,
-        start,
-        end,
-    };
-    let len = smeta.len() as usize;
-    if len == 0 {
-        return Ok(Some((smeta, PieceBody::OneShot(Bytes::new()))));
-    }
-    crate::stats::span_record(len);
-    let class = usize::from(len > SMALL_MAX);
-    let t0 = std::time::Instant::now();
-    // ~8 MiB of chunks queue for the response; parts buffer their own rows.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-    tokio::spawn(async move {
-        if let Err(e) = stream_span(&pool, &m, start, end, &tx).await {
-            let _ = tx.send(Err(io_err(e))).await;
+    // A stale meta-cache entry (the object replaced through another gateway,
+    // or behind all of them) shows up as missing rows — an overwrite reaps
+    // the old file's rows in the same transaction, so a stale entry can never
+    // quietly serve old bytes. Before any byte has gone out, retry once with
+    // the metadata looked up again: the client should never see that 500.
+    for attempt in 0..2 {
+        let Some(m) = meta(&pool, &bucket, &key).await? else {
+            return Ok(None);
+        };
+        let (start, end) = eff_range(m.size, first, last, suffix);
+        let smeta = SliceMeta {
+            size: m.size,
+            etag: m.etag.clone(),
+            created_at: m.created_at,
+            file_id: m.file_id,
+            start,
+            end,
+        };
+        let len = smeta.len() as usize;
+        if len == 0 {
+            return Ok(Some((smeta, PieceBody::OneShot(Bytes::new()))));
         }
-        let us = t0.elapsed().as_micros() as u64;
-        crate::stats::get_record(class, us, len as u64);
-    });
-    let head = rx.recv().await;
-    crate::stats::ttfb_record(class, t0.elapsed().as_micros() as u64);
-    match head {
-        Some(Ok(head)) if head.len() == len => Ok(Some((smeta, PieceBody::OneShot(head)))),
-        Some(Ok(head)) => Ok(Some((
-            smeta,
-            PieceBody::Streamed(PieceStream {
-                first: Some(head),
-                rx,
-            }),
-        ))),
-        Some(Err(e)) => {
-            // Perhaps a stale cache entry (the object replaced via another
-            // gateway): the retry looks the metadata up again.
-            meta_invalidate(&bucket, &key);
-            Err(e.into())
+        crate::stats::span_record(len);
+        let class = usize::from(len > SMALL_MAX);
+        let t0 = std::time::Instant::now();
+        // ~8 MiB of chunks queue for the response; parts buffer their own rows.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+        let pool_c = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stream_span(&pool_c, &m, start, end, &tx).await {
+                let _ = tx.send(Err(io_err(e))).await;
+            }
+            let us = t0.elapsed().as_micros() as u64;
+            crate::stats::get_record(class, us, len as u64);
+        });
+        let head = rx.recv().await;
+        crate::stats::ttfb_record(class, t0.elapsed().as_micros() as u64);
+        match head {
+            Some(Ok(head)) if head.len() == len => {
+                return Ok(Some((smeta, PieceBody::OneShot(head))))
+            }
+            Some(Ok(head)) => {
+                return Ok(Some((
+                    smeta,
+                    PieceBody::Streamed(PieceStream {
+                        first: Some(head),
+                        rx,
+                    }),
+                )))
+            }
+            Some(Err(e)) => {
+                meta_invalidate(&bucket, &key);
+                if attempt == 1 {
+                    return Err(e.into());
+                }
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "GET of {bucket}/{key} ended before any data"
+                ))
+            }
         }
-        None => Err(anyhow::anyhow!(
-            "GET of {bucket}/{key} ended before any data"
-        )),
     }
+    unreachable!("get_body returns on every attempt")
 }
 
 /// Response body for a served range: one buffer when the span fits in the

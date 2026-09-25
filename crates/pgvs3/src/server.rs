@@ -3,8 +3,13 @@
 //! implemented; everything else stays `NotImplemented` (s3s trait defaults).
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 
 use anyhow::Result;
+use bytes::Bytes;
+use hyper::service::Service as HyperService;
+use hyper::{Request, Response};
 use s3s::auth::SimpleAuth;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
@@ -15,7 +20,7 @@ use s3s::dto::{
     PutObjectInput, PutObjectOutput, Range, StreamingBlob, Timestamp, UploadPartInput,
     UploadPartOutput,
 };
-use s3s::service::S3ServiceBuilder;
+use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::db;
@@ -457,6 +462,29 @@ impl s3s::route::S3Route for StatsRoute {
     }
 }
 
+/// Dispatch layer: an unauthenticated health path for probes, everything else
+/// to the SigV4-protected S3 service. Kubernetes probes cannot sign requests,
+/// and `s3s` rejects them with 403 (which used to make liveness kill the pod).
+#[derive(Clone)]
+struct Gateway {
+    s3: S3Service,
+}
+
+impl HyperService<Request<hyper::body::Incoming>> for Gateway {
+    type Response = Response<s3s::Body>;
+    type Error = s3s::HttpError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
+        if req.uri().path() == "/healthz" {
+            let body = s3s::Body::from(Bytes::from_static(b"ok\n"));
+            return Box::pin(async move { Ok(Response::new(body)) });
+        }
+        let svc = self.s3.clone();
+        Box::pin(async move { HyperService::call(&svc, req).await })
+    }
+}
+
 pub struct ServeConfig {
     pub addr: String,
     pub access_key: String,
@@ -510,7 +538,9 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
         cfg.secret_key.as_str(),
     ));
     builder.set_route(StatsRoute);
-    let service = builder.build();
+    let service = Gateway {
+        s3: builder.build(),
+    };
 
     let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
     println!(

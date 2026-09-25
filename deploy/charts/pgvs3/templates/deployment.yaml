@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgvs3
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: { app: pgvs3 }
+  template:
+    metadata:
+      labels: { app: pgvs3 }
+    spec:
+      containers:
+        - name: pgvs3
+          image: {{ .Values.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PGVS3_URL
+              value: {{ .Values.url | quote }}
+            - name: PGVS3_ACCESS_KEY
+              value: {{ .Values.accessKey | quote }}
+            - name: PGVS3_SECRET_KEY
+              value: {{ .Values.secretKey | quote }}
+            - name: PGVS3_POOL_MAX
+              value: {{ .Values.poolMax | quote }}
+            - name: PGVS3_POOL_MIN
+              value: {{ .Values.poolMin | quote }}
+          ports: [{ containerPort: 8014, name: s3 }]
+          # Health is the stats route: cheap, and it proves the pool is
+          # reachable (the gateway connects lazily).
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8014 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8014 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

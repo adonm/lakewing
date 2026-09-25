@@ -34,7 +34,8 @@ const IDLE_MAX: Duration = Duration::from_secs(600);
 pub struct Options {
     /// Connections opened at start and kept however idle.
     pub min: usize,
-    /// Connections open at once, idle or checked out.
+    /// Connections open at once, idle or checked out. This is the client's
+    /// share of a shared database, not the server's ceiling.
     pub max: usize,
     /// Run on every new connection (one simple-query batch).
     pub session: String,

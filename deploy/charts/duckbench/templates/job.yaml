@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: duckbench
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app: duckbench }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: {{ .Values.image }}
+          command: [bash, -c, "pip install -q psycopg[binary] duckdb && python3 /bench/bench.py"]
+          env:
+            - name: PG_HOST
+              value: {{ .Values.pgHost | quote }}
+            - name: PG_USER
+              value: {{ .Values.pgUser | quote }}
+            - name: PG_PASSWORD
+              value: {{ .Values.pgPassword | quote }}
+            - name: QUICKWIT_URL
+              value: "http://quickwit:7280"
+          volumeMounts:
+            - { name: bench, mountPath: /bench }
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: bench
+          configMap: { name: duckbench }

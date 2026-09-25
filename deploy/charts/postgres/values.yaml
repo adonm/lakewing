@@ -1,0 +1,21 @@
+replicas: 1
+image: postgres:18
+storage: 20Gi
+resources:
+  requests: { cpu: 500m, memory: 2Gi }
+  limits: { memory: 8Gi }
+# Two logical databases: the object rows and DuckLake's catalog (PostgreSQL
+# is the simple single-client-plus-shared-readers catalog). Quickwit's
+# metastore lives on pgvs3 itself (s3://…/metastore).
+databases:
+  - pgvs3
+  - ducklake_catalog
+# One PostgreSQL, several clients: state the connection budget here and the
+# chart derives max_connections from it. Same numbers on a laptop kind cluster
+# and on an EC2 one; only memory/CPUs scale.
+connectionBudget:
+  pgvs3: 128        # gateway pool (PGVS3_POOL_MAX) x its replica count
+  ducklake: 20      # DuckDB catalog connections from the bench suites
+  bench: 64         # pgbench / stress load
+  headroom: 32
+sharedBuffers: 1GB

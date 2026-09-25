@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pgvs3
+description: S3-compatible object store over PostgreSQL byte rows
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

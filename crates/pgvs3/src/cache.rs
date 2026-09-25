@@ -1,5 +1,11 @@
 //! Pinned metadata cache: bucket/key -> Meta, count-capped, never evicted by
 //! byte pressure. Its only job is removing the lookup round trip per GET.
+//!
+//! Coherence: a write through this process updates or drops its entry, and a
+//! GET that finds stale rows (the object was replaced elsewhere) re-resolves
+//! and retries before failing. `HEAD` has no such check, so after an
+//! overwrite it can serve the old metadata until the entry is evicted — fine
+//! for the design center (objects are immutable), wrong for hot keys.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};

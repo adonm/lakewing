@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quickwit-config
+data:
+  quickwit.yaml: |
+    version: 0.7
+    cluster_id: pgvs3-quickwit
+    metastore_uri: {{ .Values.metastoreUri }}
+    default_index_root_uri: {{ .Values.indexRootUri }}
+    storage:
+{{ toYaml .Values.storage | indent 6 }}
+    indexer:
+      enable_otlp_endpoint: {{ .Values.enableOtlpEndpoint }}
+      split_store_max_num_bytes: 20G
+    {{- with .Values.searcherConfig }}
+    searcher:
+{{ toYaml . | indent 6 }}
+    {{- end }}
+    {{- with .Values.ingestApiConfig }}
+    ingest_api:
+{{ toYaml . | indent 6 }}
+    {{- end }}

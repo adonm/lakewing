@@ -72,6 +72,17 @@ fn stats(label: &str, mut v: Vec<Duration>, bytes: usize, wall: Duration) {
         mib / wall_s,
         v.len() as f64 / wall_s
     );
+    // Same row as one JSON line, for the results JSONL.
+    println!(
+        "{{\"suite\":\"stress\",\"op\":\"{label}\",\"n\":{},\"p50_ms\":{:.3},\"p95_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\"mib_s\":{:.1},\"req_s\":{:.0}}}",
+        v.len(),
+        at(0.50),
+        at(0.95),
+        at(0.99),
+        at(1.0),
+        mib / wall_s,
+        v.len() as f64 / wall_s
+    );
 }
 
 type Op = Arc<

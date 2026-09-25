@@ -1,0 +1,23 @@
+replicas: 2
+image: ghcr.io/adonm/pgvs3:latest
+# Object rows and DuckLake's catalog live in this PostgreSQL; Quickwit's
+# metastore is a file on the S3 endpoint (s3://quickwit/metastore).
+url: postgres://postgres:postgres@postgres:5432/pgvs3
+accessKey: cachebench
+secretKey: cachebench-local-only
+# Connection budget: the pool's ceiling is the gateway's share of a shared
+# database, so name it here and keep it in postgres's connectionBudget.
+poolMax: 64
+poolMin: 64
+# pgvs3 is stateless (metadata cache is per-process, keyed by bucket/key), so
+# replicas scale reads linearly; writes are serialized in PostgreSQL.
+resources:
+  requests: { cpu: 500m, memory: 1Gi }
+  limits: { memory: 4Gi }
+# Optional HPA: `just kind-stress` sweeps concurrency against a fixed replica
+# count; enable this to watch scaling instead.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70

@@ -7,3 +7,4 @@
 *.pem
 __pycache__/
 duckdb_temp_*
+deploy/bench/pgvs3-bin

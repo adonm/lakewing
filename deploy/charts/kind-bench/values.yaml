@@ -1,0 +1,24 @@
+# Caching is intentionally ON everywhere: this is "real world" performance
+# (DuckDB's external file cache, PostgreSQL's buffer cache, Quickwit's
+# fast-field/split-footer caches). Warm passes are the point.
+image: kind-bench:latest
+pgHost: postgres
+pgUser: postgres
+pgPassword: postgres
+quickwitUrl: http://quickwit:7280
+pgvs3Url: http://pgvs3:8014
+# One Job per suite; `just kind-bench` runs them and concatenates the JSON
+# lines. Order here is the run order; the whole set targets <1 hour.
+# Suite knobs (QUICK=1 = smoke scale; SF, PARTS, DOCS, SEED_GB, REQUESTS,
+# CONCURRENCY, SIZES, ...) reach run.sh through here; the just recipe forwards
+# whatever the caller's environment sets.
+suiteEnv: {}
+suites:
+  - pgbench
+  - tpch
+  - click
+  - search
+  - stress
+resources:
+  requests: { cpu: 500m, memory: 2Gi }
+  limits: { memory: 8Gi }

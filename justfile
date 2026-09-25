@@ -49,13 +49,15 @@ dev-db:
 dev-db-clean:
     docker rm -f pgvs3-pg || true
 
-# Build, seed 256 MiB, serve, and check one cross-row ranged GET byte for byte.
+# Build, seed, serve; a ranged GET byte for byte, then again after an overwrite behind the gateway.
 [group('dev')]
 smoke: dev-db
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p pgvs3
-    ./target/release/pgvs3 --url "{{ PG_URL }}" seed --gigabytes 0.25 --object-mib 8 --tasks 2 >/dev/null
+    # The seeds only need a small pool — the gateway holds 64 and the dev DB
+    # has 100 connections.
+    PGVS3_POOL_MIN=2 PGVS3_POOL_MAX=8 ./target/release/pgvs3 --url "{{ PG_URL }}" seed --gigabytes 0.25 --object-mib 8 --tasks 2 >/dev/null
     ./target/release/pgvs3 --url "{{ PG_URL }}" serve --addr 127.0.0.1:8014 & SRV=$!
     trap 'kill $SRV 2>/dev/null || true' EXIT
     for _ in $(seq 1 30); do
@@ -66,6 +68,17 @@ smoke: dev-db
       --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
       http://127.0.0.1:8014/lake/obj-00000.bin | wc -c)
     [ "$BYTES" = "10000" ] && echo "smoke ok: cross-row ranged GET returned exactly 10000 bytes"
+    # Overwrite the same keys behind the running gateway (seed writes straight
+    # to the database, and overwrite reaps the old rows): the gateway's meta
+    # cache goes stale and the GET must re-resolve and serve, not fail. curl
+    # does not retry, so this fails exactly the way a client sees it.
+    # The seeds only need a small pool — the gateway holds 64 and the dev DB
+    # has 100 connections.
+    PGVS3_POOL_MIN=2 PGVS3_POOL_MAX=8 ./target/release/pgvs3 --url "{{ PG_URL }}" seed --gigabytes 0.25 --object-mib 8 --tasks 2 >/dev/null
+    BYTES=$(curl -sf -H 'Range: bytes=8000-17999' \
+      --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
+      http://127.0.0.1:8014/lake/obj-00000.bin | wc -c)
+    [ "$BYTES" = "10000" ] && echo "smoke ok: ranged GET after an overwrite self-healed on a stale cache"
 
 # Load generator: 8 GiB of 64 MiB objects (a stable set for `just micro`).
 [group('bench')]
@@ -81,16 +94,20 @@ micro:
 # GHCR path.
 IMAGE := "ghcr.io/adonm/pgvs3"
 
-# Build the container image (multi-arch: linux/amd64 + linux/arm64, so AWS
-# Graviton works). `push=true` publishes to GHCR as a multi-arch index.
+# Build the container image (amd64 + arm64, so AWS Graviton works); push=true publishes to GHCR.
 [group('image')]
 image push="false":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p pgvs3
-    args=(--platform linux/amd64,linux/arm64 -t "{{ IMAGE }}:latest" .)
-    [ "{{ push }}" = "true" ] && args+=(--push) || args+=(--load)
-    docker buildx build "${args[@]}"
+    # buildx cannot --load a multi-platform build; only the publish needs both.
+    args=(-t "{{ IMAGE }}:latest")
+    if [ "{{ push }}" = "true" ]; then
+      args+=(--platform linux/amd64,linux/arm64 --push)
+    else
+      args+=(--load)
+    fi
+    docker buildx build "${args[@]}" .
 
 # Run the image against a PostgreSQL (PG_URL, default local dev-db).
 [group('image')]
@@ -99,8 +116,7 @@ image-test:
     sleep 3
     curl -sf -o /dev/null http://127.0.0.1:8014/ && echo "image ok"
 
-# What CI runs. Keep the workflow pointing here. Postgres: `dev-db` locally,
-# the workflow's service container in CI (both via PG_URL).
+# What CI runs (fmt, clippy, build, tests, smoke). Postgres via PG_URL.
 [group('ci')]
 ci:
     #!/usr/bin/env bash
@@ -110,6 +126,118 @@ ci:
     cargo build --release --locked
     cargo test --workspace
     just smoke
+
+# --- kind: Postgres 18 + pgvs3 + DuckLake + Quickwit on one disk -----------
+# One command per step. `kind-bench` runs all four suites in under an hour
+# with caching on (real-world numbers). Results: .tmp/pgvs3/kind-bench.jsonl.
+
+# Stand up the cluster (Postgres 18, pgvs3, DuckLake, Quickwit); idempotent, same on laptop and EC2.
+[group('kind')]
+kind-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kind create cluster --name pgvs3 --config deploy/kind/cluster.yaml 2>/dev/null || true
+    # Benchmark this checkout's code, not whatever image is lying around.
+    docker build -q -t {{ IMAGE }}:latest .
+    kind load docker-image {{ IMAGE }}:latest --name pgvs3
+    # PG_STORAGE sizes the rows database (20Gi default; 200Gi for 100M-log
+    # search runs — the splits live in PostgreSQL through pgvs3).
+    helm upgrade --install postgres deploy/charts/postgres --namespace pgvs3 --create-namespace \
+      --set storage="${PG_STORAGE:-20Gi}"
+    helm upgrade --install pgvs3 deploy/charts/pgvs3 --namespace pgvs3 \
+      --set image={{ IMAGE }}:latest
+    helm upgrade --install quickwit deploy/charts/quickwit --namespace pgvs3
+    kubectl -n pgvs3 rollout status statefulset/postgres --timeout 180s
+    kubectl -n pgvs3 rollout status deployment/pgvs3 --timeout 180s
+    kubectl -n pgvs3 rollout status deployment/quickwit --timeout 180s
+    echo "kind up. next: just kind-validate && just kind-bench"
+
+# Smoke-test every workload once so a benchmark failure is never "not ready".
+[group('kind')]
+kind-validate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p pgvs3
+    cp target/release/pgvs3 deploy/bench/pgvs3-bin
+    trap 'rm -f deploy/bench/pgvs3-bin' EXIT
+    # Harness sources live in crates/pgvs3; sync so the image cannot drift.
+    cp crates/pgvs3/benchlib.py crates/pgvs3/tpch_bench.py crates/pgvs3/analytics_bench.py deploy/bench/harness/
+    cp crates/pgvs3/queries/*.sql deploy/bench/harness/queries/
+    docker build -q -t kind-bench:latest -f deploy/bench/Dockerfile deploy/bench
+    kind load docker-image kind-bench:latest --name pgvs3
+    # Jobs are immutable: delete so the new image actually runs.
+    kubectl -n pgvs3 delete job bench-validate --ignore-not-found
+    helm upgrade --install kind-bench deploy/charts/kind-bench --namespace pgvs3 \
+      --set image=kind-bench:latest --set suites="{validate}"
+    # Poll: kubectl wait for complete never fails fast on a failed Job.
+    for _ in $(seq 1 150); do
+      s=$(kubectl -n pgvs3 get job bench-validate -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true)
+      case "$s" in *Complete=True*|*Failed=True*) break ;; esac
+      sleep 2
+    done
+    kubectl -n pgvs3 logs job/bench-validate
+
+# All five suites; QUICK=1 = smoke scale; scale knobs (SF, DOCS, ...) from the environment.
+[group('kind')]
+kind-bench:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p pgvs3
+    cp target/release/pgvs3 deploy/bench/pgvs3-bin
+    trap 'rm -f deploy/bench/pgvs3-bin' EXIT
+    # Harness sources live in crates/pgvs3; sync so the image cannot drift.
+    cp crates/pgvs3/benchlib.py crates/pgvs3/tpch_bench.py crates/pgvs3/analytics_bench.py deploy/bench/harness/
+    cp crates/pgvs3/queries/*.sql deploy/bench/harness/queries/
+    docker build -q -t kind-bench:latest -f deploy/bench/Dockerfile deploy/bench
+    mkdir -p .tmp/pgvs3
+    kind load docker-image kind-bench:latest --name pgvs3
+    # Jobs are immutable: clear stale ones so the fresh image actually runs.
+    suites="${SUITES:-pgbench,tpch,click,search,stress}"
+    for suite in ${suites//,/ }; do
+      kubectl -n pgvs3 delete job "bench-$suite" --ignore-not-found >/dev/null 2>&1 || true
+    done
+    # Suite knobs flow through the caller's environment to run.sh.
+    env_args=()
+    for k in QUICK SCALE CLIENTS SECONDS_RUN SF PASSES PARTS QUERIES DOCS WORKERS WINDOW_FRAC SEARCH_INDEX SEED_GB REQUESTS CONCURRENCY SIZES; do
+      [ -n "${!k:-}" ] && env_args+=(--set-string "suiteEnv.$k=${!k}")
+    done
+    helm upgrade --install kind-bench deploy/charts/kind-bench --namespace pgvs3 \
+      --set image=kind-bench:latest "${env_args[@]}" \
+      --set suites="{$suites}"
+    : > .tmp/pgvs3/kind-bench.jsonl
+    # Smoke runs are minutes, full runs can be tens of minutes per suite.
+    wait=2700; case "${QUICK:-}" in 1 | true) wait=300 ;; esac
+    for suite in ${suites//,/ }; do
+      echo "=== $suite ==="
+      # Poll: kubectl wait for complete never fails fast on a failed Job.
+      waited=0
+      while :; do
+        s=$(kubectl -n pgvs3 get job "bench-$suite" -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true)
+        case "$s" in *Complete=True*|*Failed=True*) break ;; esac
+        [ "$waited" -ge "$wait" ] && { echo "TIMEOUT $suite"; break; }
+        sleep 2; waited=$((waited + 2))
+      done
+      kubectl -n pgvs3 logs job/bench-$suite 2>/dev/null | tee /tmp/kind-$suite.log
+      grep '^{.*}$' /tmp/kind-$suite.log >> .tmp/pgvs3/kind-bench.jsonl || true
+    done
+    echo "----"
+    echo "results: .tmp/pgvs3/kind-bench.jsonl"
+
+# pgvs3 ceiling: concurrency sweep; reports aggregate MiB/s and req/s.
+[group('kind')]
+kind-stress concurrency="1,8,32,64" requests="4000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    helm upgrade --install kind-bench deploy/charts/kind-bench --namespace pgvs3 \
+      --set image=kind-bench:latest --set suites="{stress}" \
+      --set-string 'extraArgs.CONCURRENCY={{ concurrency }}' --set-string 'extraArgs.REQUESTS={{ requests }}'
+    kubectl -n pgvs3 wait --for=condition=complete job/bench-stress --timeout=900s 2>/dev/null || true
+    kubectl -n pgvs3 logs job/bench-stress 2>/dev/null | tee -a .tmp/pgvs3/kind-stress.log
+
+# Tear down the kind cluster.
+[group('kind')]
+kind-down:
+    kind delete cluster --name pgvs3
 
 # TPC-H on DuckLake through the gateway, stable DuckDB (extra = harness args).
 [group('bench')]

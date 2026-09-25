@@ -1,0 +1,31 @@
+{{- range $name := .Values.suites }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "bench-{{ $name }}"
+  labels: { app: kind-bench, suite: {{ $name | quote }} }
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app: kind-bench, suite: {{ $name | quote }} }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: {{ $.Values.image }}
+          imagePullPolicy: IfNotPresent
+          command: [bash, /bench/suites/run.sh, {{ $name | quote }}]
+          env:
+            - { name: PG_HOST, value: {{ $.Values.pgHost | quote }} }
+            - { name: PG_USER, value: {{ $.Values.pgUser | quote }} }
+            - { name: PG_PASSWORD, value: {{ $.Values.pgPassword | quote }} }
+            - { name: QUICKWIT_URL, value: {{ $.Values.quickwitUrl | quote }} }
+            - { name: PGVS3_URL, value: {{ $.Values.pgvs3Url | quote }} }
+            {{- range $k, $v := $.Values.suiteEnv }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+{{- end }}

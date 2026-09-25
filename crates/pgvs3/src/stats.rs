@@ -78,7 +78,8 @@ pub fn stage_stats_line() -> String {
     let s: Vec<u64> = SPANS.iter().map(|a| a.load(Relaxed)).collect();
     let lat: Vec<u64> = LAT.iter().map(|a| a.load(Relaxed)).collect();
     format!(
-        "perf: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small n={} ttfb={:.0}ms total={:.0}ms | stream n={} ttfb={:.0}ms total={:.0}ms | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+        "perf: pid={} spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small n={} ttfb={:.0}ms total={:.0}ms | stream n={} ttfb={:.0}ms total={:.0}ms | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+        std::process::id(),
         s[0],
         s[1],
         s[2],
