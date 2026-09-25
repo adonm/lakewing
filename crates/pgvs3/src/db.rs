@@ -14,11 +14,10 @@
 //! can take any part, and Complete only checks and publishes. An object
 //! appears atomically when its `objects` row is written.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock};
 use std::task::Context;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
@@ -27,7 +26,10 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Row, Transaction};
 
+use crate::cache::{epoch, meta_get, meta_invalidate, meta_put, Meta};
+use crate::ingest::{IngestMsg, IngestResult, RowFramer, COPY_HEADER, COPY_SQL, SEND_BATCH};
 pub use crate::pg::Pool;
+use crate::stats::SMALL_MAX;
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
 
@@ -35,18 +37,11 @@ pub const SCHEMA: &str = include_str!("../schema.sql");
 /// tuple 8160 bytes = one row per 8 KB page.
 pub const ROW_BYTES: i64 = 8120;
 
-const COPY_SQL: &str = "COPY s3p.chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)";
-const COPY_HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\x00\x00\x00\x00\x00\x00\x00\x00";
-const COPY_TRAILER: &[u8] = &[0xFF, 0xFF];
-const SEND_BATCH: usize = 4 << 20;
-
 /// Whole rows for a contiguous `no` range (cheaper than `= ANY` on Aurora:
 /// 1.74 vs 2.02 ms server time per warm 8 MiB span).
 const GET_RANGE_SQL: &str =
     "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3";
 
-/// Spans up to this size are one query, and "small" in the stats.
-const SMALL_MAX: usize = 8 << 20;
 /// Rows per part: any span up to SMALL_MAX (it may start mid-row) fits one.
 const PART_ROWS: usize = SMALL_MAX / ROW_BYTES as usize + 2;
 /// Parts in flight per GET, each on its own pool connection. Smaller parts
@@ -158,80 +153,6 @@ fn pool_min() -> usize {
         .unwrap_or(64)
 }
 
-/// Load the chunk primary-key indexes into shared_buffers when they are small
-/// beside it (a cold btree leaf was ~1/3 of a cold small GET on Aurora).
-/// Past ~10% of shared_buffers (the index is ~0.4% of the data, so multi-TB)
-/// they are left to the buffer manager: prewarming on every gateway start
-/// would evict the working set. Returns the blocks loaded, or None if skipped.
-pub async fn prewarm_index(pool: &Pool) -> Result<Option<i64>> {
-    let conn = pool.get().await?;
-    let _ = conn
-        .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm")
-        .await;
-    let mut idx: Vec<(String, i64)> = Vec::new();
-    for r in conn
-        .query_typed(
-            "SELECT i.indexrelid::regclass::text, pg_relation_size(i.indexrelid) \
-             FROM pg_partition_tree('s3p.chunks') p JOIN pg_index i ON i.indrelid = p.relid \
-             WHERE p.isleaf AND i.indisprimary",
-            &[],
-        )
-        .await?
-    {
-        idx.push((r.try_get(0)?, r.try_get(1)?));
-    }
-    let budget: i64 = conn
-        .query_typed_one(
-            "SELECT setting::int8 * 8192 / 10 FROM pg_settings WHERE name = 'shared_buffers'",
-            &[],
-        )
-        .await?
-        .try_get(0)?;
-    if idx.iter().map(|(_, bytes)| bytes).sum::<i64>() > budget {
-        return Ok(None);
-    }
-    let mut blocks = 0;
-    for (name, _) in &idx {
-        blocks += conn
-            .query_typed_one("SELECT pg_prewarm($1::regclass)", &[(name, Type::TEXT)])
-            .await?
-            .try_get::<_, i64>(0)?;
-    }
-    Ok(Some(blocks))
-}
-
-#[derive(Debug, Clone)]
-pub struct Meta {
-    pub size: i64,
-    pub etag: Vec<u8>,
-    pub created_at: SystemTime,
-    pub file_id: i64,
-    /// Multipart objects: part file_ids in order and cumulative end offsets.
-    /// None = one file (`file_id`) holds all `size` bytes.
-    pub parts: Option<Vec<i64>>,
-    pub part_ends: Option<Vec<i64>>,
-}
-
-impl Meta {
-    /// `(file_id, object byte offset, length)` of each stored segment.
-    fn segments(&self) -> Vec<(i64, i64, i64)> {
-        match (&self.parts, &self.part_ends) {
-            (Some(ids), Some(ends)) if ids.len() == ends.len() => {
-                let mut prev = 0;
-                ids.iter()
-                    .zip(ends)
-                    .map(|(&id, &end)| {
-                        let seg = (id, prev, end - prev);
-                        prev = end;
-                        seg
-                    })
-                    .collect()
-            }
-            _ => vec![(self.file_id, 0, self.size)],
-        }
-    }
-}
-
 /// Everything but the body of a served range: `[start, end]` inclusive.
 pub struct SliceMeta {
     pub size: i64,
@@ -278,143 +199,12 @@ fn io_err(e: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-fn epoch(secs: f64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs.max(0.0))
-}
-
-// ---------------------------------------------------------------------------
-// Pinned metadata cache: bucket/key -> Meta, count-capped, never evicted by
-// byte pressure. Its only job is removing the lookup round trip per GET.
-// ---------------------------------------------------------------------------
-
-const META_CAP: usize = 1 << 18;
-
-fn meta_cache() -> &'static Mutex<MetaCache> {
-    static C: OnceLock<Mutex<MetaCache>> = OnceLock::new();
-    C.get_or_init(|| {
-        Mutex::new(MetaCache {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        })
-    })
-}
-
-struct MetaCache {
-    map: HashMap<(String, String), Meta>,
-    order: VecDeque<(String, String)>,
-}
-
-fn meta_put(bucket: &str, key: &str, meta: Meta) {
-    let mut c = meta_cache().lock().unwrap();
-    let k = (bucket.to_owned(), key.to_owned());
-    if c.map.insert(k.clone(), meta).is_none() {
-        c.order.push_back(k);
-        if c.map.len() > META_CAP {
-            if let Some(old) = c.order.pop_front() {
-                c.map.remove(&old);
-            }
-        }
-    }
-}
-
-fn meta_invalidate(bucket: &str, key: &str) {
-    meta_cache()
-        .lock()
-        .unwrap()
-        .map
-        .remove(&(bucket.to_owned(), key.to_owned()));
-}
-
-// ---------------------------------------------------------------------------
-// GET telemetry for bottleneck hunting: span-size histogram, time to the first
-// and the last byte handed to the response, parts and pool waits. Read via
-// `stage_stats_line` (the stats route and the log timer print it).
-// ---------------------------------------------------------------------------
-static SPANS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-// GET latency histogram: quarter-octave buckets of microseconds (~19%
-// resolution), read back as p50/p95/p99.
-static LAT: [std::sync::atomic::AtomicU64; 128] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 128];
-
-fn lat_record(us: u64) {
-    let idx = ((us.max(1) as f64).log2() * 4.0) as usize;
-    LAT[idx.min(127)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Upper bound (ms) of the bucket holding the `p` quantile.
-fn lat_pct(counts: &[u64], p: f64) -> f64 {
-    let total: u64 = counts.iter().sum();
-    let target = (total as f64 * p).ceil() as u64;
-    let mut seen = 0;
-    for (i, c) in counts.iter().enumerate() {
-        seen += c;
-        if total > 0 && seen >= target {
-            return 2f64.powf((i + 1) as f64 / 4.0) / 1e3;
-        }
-    }
-    0.0
-}
-// Per span class (0 = small, 1 = larger): GETs, summed time to the first byte
-// handed to the response, summed time to the last.
-static GETS: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-static TTFB_US: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-static TOTAL_US: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-// Per part query, both paths: count and pool-acquire wait (summed, so it can
-// exceed wall time under concurrency; growth means the pool is the limit).
-static PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// `spans=[..] small n=.. ttfb=.. total=.. | stream n=.. ttfb=.. total=.. | parts=.. wait(sum)=.. | served=..`
-pub fn stage_stats_line() -> String {
-    use std::sync::atomic::Ordering::Relaxed;
-    let ms = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed) as f64 / 1e3;
-    let s: Vec<u64> = SPANS.iter().map(|a| a.load(Relaxed)).collect();
-    let lat: Vec<u64> = LAT.iter().map(|a| a.load(Relaxed)).collect();
-    format!(
-        "perf: spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small n={} ttfb={:.0}ms total={:.0}ms | stream n={} ttfb={:.0}ms total={:.0}ms | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
-        s[0],
-        s[1],
-        s[2],
-        s[3],
-        s[4],
-        GETS[0].load(Relaxed),
-        ms(&TTFB_US[0]),
-        ms(&TOTAL_US[0]),
-        GETS[1].load(Relaxed),
-        ms(&TTFB_US[1]),
-        ms(&TOTAL_US[1]),
-        PARTS.load(Relaxed),
-        ms(&WAIT_US),
-        SERVED.load(Relaxed) >> 20,
-        lat_pct(&lat, 0.50),
-        lat_pct(&lat, 0.95),
-        lat_pct(&lat, 0.99),
-    )
-}
-
-/// Span-size histogram buckets: <64K <512K <2M <8M >=8M (the workload's read
-/// shapes; the last boundary is SMALL_MAX).
-fn span_bucket(span: usize) -> usize {
-    const T: [usize; 4] = [65536, 524_288, 2_097_152, 8_388_608];
-    T.iter().position(|&t| span < t).unwrap_or(4)
-}
-
 // ---------------------------------------------------------------------------
 
 /// Metadata lookup, cached (a repeat open costs no round trip).
 pub async fn meta(pool: &Pool, bucket: &str, key: &str) -> Result<Option<Meta>> {
-    if let Some(m) = meta_cache()
-        .lock()
-        .unwrap()
-        .map
-        .get(&(bucket.to_owned(), key.to_owned()))
-    {
-        return Ok(Some(m.clone()));
+    if let Some(m) = meta_get(bucket, key) {
+        return Ok(Some(m));
     }
     let row = pool
         .get()
@@ -452,7 +242,6 @@ pub async fn get_body(
     last: i64,
     suffix: i64,
 ) -> Result<Option<(SliceMeta, PieceBody)>> {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(m) = meta(&pool, &bucket, &key).await? else {
         return Ok(None);
     };
@@ -469,7 +258,7 @@ pub async fn get_body(
     if len == 0 {
         return Ok(Some((smeta, PieceBody::OneShot(Bytes::new()))));
     }
-    SPANS[span_bucket(len)].fetch_add(1, Relaxed);
+    crate::stats::span_record(len);
     let class = usize::from(len > SMALL_MAX);
     let t0 = std::time::Instant::now();
     // ~8 MiB of chunks queue for the response; parts buffer their own rows.
@@ -479,13 +268,10 @@ pub async fn get_body(
             let _ = tx.send(Err(io_err(e))).await;
         }
         let us = t0.elapsed().as_micros() as u64;
-        GETS[class].fetch_add(1, Relaxed);
-        TOTAL_US[class].fetch_add(us, Relaxed);
-        lat_record(us);
-        SERVED.fetch_add(len as u64, Relaxed);
+        crate::stats::get_record(class, us, len as u64);
     });
     let head = rx.recv().await;
-    TTFB_US[class].fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+    crate::stats::ttfb_record(class, t0.elapsed().as_micros() as u64);
     match head {
         Some(Ok(head)) if head.len() == len => Ok(Some((smeta, PieceBody::OneShot(head)))),
         Some(Ok(head)) => Ok(Some((
@@ -665,11 +451,9 @@ async fn fetch_part(
     p: Piece,
     tx: &tokio::sync::mpsc::Sender<Result<Row>>,
 ) -> Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
     let mut conn = pool.get().await?;
-    WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
-    PARTS.fetch_add(1, Relaxed);
+    crate::stats::part_record(t0.elapsed().as_micros() as u64);
     let params: [&(dyn ToSql + Sync); 3] = [&p.file_id, &p.lo, &p.hi];
     let range = conn.range().await?.clone();
     let mut rows = std::pin::pin!(conn.query_raw(&range, params).await?);
@@ -772,14 +556,6 @@ pub struct ChunkWriter {
     done: Option<tokio::task::JoinHandle<IngestResult>>,
 }
 
-/// `(size, sha256)` of the bytes an ingest streamed.
-type IngestResult = Result<(i64, Vec<u8>)>;
-
-pub enum IngestMsg {
-    Data(Bytes),
-    Abort,
-}
-
 impl ChunkWriter {
     pub async fn start(pool: Pool) -> Result<Self> {
         Self::begin(pool, None).await
@@ -875,67 +651,21 @@ async fn ingest_writer(
     let mut sink = std::pin::pin!(tx.copy_in::<_, Bytes>(COPY_SQL).await?);
     sink.send(Bytes::from_static(COPY_HEADER)).await?;
 
-    let mut hasher = Sha256::new();
-    // Bytes not yet framed: always less than one row between pushes.
-    let mut pending: Vec<u8> = Vec::new();
-    let mut frame = BytesMut::with_capacity(SEND_BATCH);
-    let mut next_no = 0i32;
-    let mut total = 0i64;
+    let mut framer = RowFramer::new(file_id);
     while let Some(msg) = rx.recv().await {
-        let chunk = match msg {
-            IngestMsg::Data(b) => b,
-            IngestMsg::Abort => anyhow::bail!("ingest aborted"),
-        };
-        hasher.update(&chunk);
-        total += chunk.len() as i64;
-        pending.extend_from_slice(&chunk);
-        let whole = pending.len() - pending.len() % ROW_BYTES as usize;
-        if whole > 0 {
-            frame_rows(file_id, next_no, &pending[..whole], &mut frame);
-            next_no += (whole / ROW_BYTES as usize) as i32;
-            pending.drain(..whole);
-            if frame.len() >= SEND_BATCH {
-                sink.send(frame.split().freeze()).await?;
+        match msg {
+            IngestMsg::Data(b) => {
+                if let Some(buf) = framer.push(&b) {
+                    sink.send(buf).await?;
+                }
             }
+            IngestMsg::Abort => anyhow::bail!("ingest aborted"),
         }
     }
-    if !pending.is_empty() {
-        frame_rows(file_id, next_no, &pending, &mut frame);
-    }
-    frame.extend_from_slice(COPY_TRAILER);
-    sink.send(frame.split().freeze()).await?;
+    let (last, (total, sum)) = framer.finish();
+    sink.send(last).await?;
     sink.as_mut().finish().await?;
-    let sum = hasher.finalize().to_vec();
-    // A multipart part records itself in the same transaction as its rows; a
-    // re-sent part replaces the earlier attempt, rows included. Unpublished
-    // rows are invisible: objects appear atomically at publish / Complete.
-    if let Some((upload_id, part_no)) = &part {
-        let old = tx
-            .query_typed_opt(
-                "DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2 RETURNING file_id",
-                &[(upload_id, Type::TEXT), (part_no, Type::INT4)],
-            )
-            .await?;
-        if let Some(old) = old {
-            let old: i64 = old.try_get(0)?;
-            tx.query_typed(
-                "DELETE FROM s3p.chunks WHERE file_id = $1",
-                &[(&old, Type::INT8)],
-            )
-            .await?;
-        }
-        tx.query_typed(
-            "INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256) VALUES ($1, $2, $3, $4, $5)",
-            &[
-                (upload_id, Type::TEXT),
-                (part_no, Type::INT4),
-                (&file_id, Type::INT8),
-                (&total, Type::INT8),
-                (&sum, Type::BYTEA),
-            ],
-        )
-        .await?;
-    }
+    commit_part(&tx, part, file_id, total, &sum).await?;
     tx.commit().await?;
     eprintln!(
         "pgvs3: ingest {:.1} MiB at {:.0} MiB/s",
@@ -943,6 +673,47 @@ async fn ingest_writer(
         total as f64 / 1024.0 / 1024.0 / t0.elapsed().as_secs_f64().max(1e-9)
     );
     Ok((total, sum))
+}
+
+/// Record a multipart part in the same transaction as its rows; a re-sent
+/// part replaces the earlier attempt, rows included. Unpublished rows are
+/// invisible: objects appear atomically at publish / Complete.
+async fn commit_part(
+    tx: &Transaction<'_>,
+    part: Option<(String, i32)>,
+    file_id: i64,
+    total: i64,
+    sum: &[u8],
+) -> Result<()> {
+    let Some((upload_id, part_no)) = part else {
+        return Ok(());
+    };
+    let old = tx
+        .query_typed_opt(
+            "DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2 RETURNING file_id",
+            &[(&upload_id, Type::TEXT), (&part_no, Type::INT4)],
+        )
+        .await?;
+    if let Some(old) = old {
+        let old: i64 = old.try_get(0)?;
+        tx.query_typed(
+            "DELETE FROM s3p.chunks WHERE file_id = $1",
+            &[(&old, Type::INT8)],
+        )
+        .await?;
+    }
+    tx.query_typed(
+        "INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256) VALUES ($1, $2, $3, $4, $5)",
+        &[
+            (&upload_id, Type::TEXT),
+            (&part_no, Type::INT4),
+            (&file_id, Type::INT8),
+            (&total, Type::INT8),
+            (&sum, Type::BYTEA),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Publish an object row: pointer-swap on overwrite (old rows reap after the
@@ -1036,22 +807,6 @@ fn publish_cache(
             part_ends,
         },
     );
-}
-
-/// Binary COPY framing: stream header once per stream, then row tuples.
-fn frame_rows(file_id: i64, first_no: i32, data: &[u8], out: &mut BytesMut) {
-    let nrows = data.len().div_ceil(ROW_BYTES as usize);
-    for i in 0..nrows {
-        let start = i * ROW_BYTES as usize;
-        let end = ((i + 1) * ROW_BYTES as usize).min(data.len());
-        out.extend_from_slice(&3i16.to_be_bytes()); // field count
-        out.extend_from_slice(&8i32.to_be_bytes());
-        out.extend_from_slice(&file_id.to_be_bytes());
-        out.extend_from_slice(&4i32.to_be_bytes());
-        out.extend_from_slice(&(first_no + i as i32).to_be_bytes());
-        out.extend_from_slice(&((end - start) as i32).to_be_bytes());
-        out.extend_from_slice(&data[start..end]);
-    }
 }
 
 pub async fn delete(pool: &Pool, bucket: &str, key: &str) -> Result<bool> {
@@ -1199,105 +954,6 @@ pub async fn abort_upload(pool: &Pool, upload_id: &str) -> Result<()> {
     .await?;
     tx.commit().await?;
     Ok(())
-}
-
-/// Unreferenced chunk files of one partition with ids in [$1, $2): a loose
-/// index scan (one probe of that partition's primary key per distinct file,
-/// not per row; per partition because a scan of the parent would probe all
-/// 32 per step) anti-joined, all by index, against everything that can own a
-/// file: published objects (single file, or parts via GIN) and upload parts.
-fn orphans_sql(partition: &str) -> String {
-    format!(
-        "WITH RECURSIVE f(file_id) AS ( \
-             SELECT min(file_id) FROM {partition} WHERE file_id >= $1 AND file_id < $2 \
-           UNION ALL \
-             SELECT (SELECT min(c.file_id) FROM {partition} c WHERE c.file_id > f.file_id AND c.file_id < $2) \
-             FROM f WHERE f.file_id IS NOT NULL \
-         ) \
-         SELECT f.file_id FROM f \
-         WHERE f.file_id IS NOT NULL \
-           AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f.file_id) \
-           AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts @> ARRAY[f.file_id]) \
-           AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f.file_id)"
-    )
-}
-
-/// Reap chunk files nothing references once provably older than `grace`: a
-/// PUT whose publish never ran (its rows commit before the object row), or a
-/// pre-part-file multipart flush cut short by a killed gateway. file_ids come
-/// from one sequence (cache 1), so every id below the newest object published
-/// before now-grace was allocated before then: no per-row timestamp needed.
-/// Scans ids in [from, horizon); returns (files, rows, horizon) so the caller
-/// resumes there. Interrupted writes of every other kind are single
-/// transactions and leave nothing behind.
-pub async fn sweep_orphans(pool: &Pool, grace: Duration, from: i64) -> Result<(usize, u64, i64)> {
-    let mut conn = pool.get().await?;
-    let horizon: Option<i64> = conn
-        .query_typed_one(
-            "SELECT max(file_id) FROM s3p.objects WHERE created_at < now() - make_interval(secs => $1)",
-            &[(&grace.as_secs_f64(), Type::FLOAT8)],
-        )
-        .await?
-        .try_get(0)?;
-    let horizon = match horizon {
-        Some(h) if h > from => h,
-        _ => return Ok((0, 0, from)),
-    };
-    // Partition names come from the catalog (regclass text, already quoted).
-    let mut partitions: Vec<String> = Vec::new();
-    for r in conn
-        .query_typed(
-            "SELECT relid::regclass::text FROM pg_partition_tree('s3p.chunks') WHERE isleaf",
-            &[],
-        )
-        .await?
-    {
-        partitions.push(r.try_get(0)?);
-    }
-    let tx = conn.transaction().await?;
-    // The loose scan wants index probes; gateway sessions default to bitmaps.
-    tx.batch_execute("SET LOCAL enable_indexscan = on").await?;
-    let mut orphans: Vec<i64> = Vec::new();
-    for partition in &partitions {
-        for r in tx
-            .query_typed(
-                &orphans_sql(partition),
-                &[(&from, Type::INT8), (&horizon, Type::INT8)],
-            )
-            .await?
-        {
-            orphans.push(r.try_get(0)?);
-        }
-    }
-    tx.commit().await?;
-    let mut rows = 0;
-    for id in &orphans {
-        rows += conn
-            .execute("DELETE FROM s3p.chunks WHERE file_id = $1", &[id])
-            .await?;
-    }
-    Ok((orphans.len(), rows, horizon))
-}
-
-/// Abort uploads abandoned for longer than `age` (S3's incomplete-upload
-/// lifecycle): their parts are committed rows, so something must reap them.
-pub async fn expire_uploads(pool: &Pool, age: Duration) -> Result<usize> {
-    let mut ids: Vec<String> = Vec::new();
-    for r in pool
-        .get()
-        .await?
-        .query_typed(
-            "SELECT upload_id FROM s3p.uploads WHERE created_at < now() - make_interval(secs => $1)",
-            &[(&age.as_secs_f64(), Type::FLOAT8)],
-        )
-        .await?
-    {
-        ids.push(r.try_get(0)?);
-    }
-    for id in &ids {
-        abort_upload(pool, id).await?;
-    }
-    Ok(ids.len())
 }
 
 #[derive(Debug, Clone)]

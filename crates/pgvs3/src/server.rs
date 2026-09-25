@@ -19,6 +19,7 @@ use s3s::service::S3ServiceBuilder;
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::db;
+use crate::janitor;
 
 /// Stateless over Aurora: multipart upload state lives in `s3p.uploads`, so
 /// any gateway instance can serve any request of any upload.
@@ -57,6 +58,44 @@ fn range_params(range: Option<Range>) -> (i64, i64, i64) {
         }
         Some(Range::Suffix { length }) => (0, -1, length as i64),
     }
+}
+
+/// One row of a `list_objects_v2` scan: push it onto `contents` or, past a
+/// `delimiter`, onto `common`. Returns the new cursor and whether the listing
+/// is full.
+fn listing_step(
+    r: &db::Listed,
+    prefix: &str,
+    delimiter: &str,
+    max: usize,
+    contents: &mut Vec<Object>,
+    common: &mut Vec<CommonPrefix>,
+    seen: &mut BTreeSet<String>,
+) -> (String, bool) {
+    let rest = &r.key[prefix.len()..];
+    if !delimiter.is_empty() {
+        if let Some(idx) = rest.find(delimiter) {
+            let cp = format!("{prefix}{}", &rest[..idx + delimiter.len()]);
+            if seen.insert(cp.clone()) {
+                if contents.len() + common.len() >= max {
+                    return (r.key.clone(), true);
+                }
+                common.push(CommonPrefix { prefix: Some(cp) });
+            }
+            return (r.key.clone(), false);
+        }
+    }
+    if contents.len() + common.len() >= max {
+        return (r.key.clone(), true);
+    }
+    contents.push(Object {
+        key: Some(r.key.clone()),
+        size: Some(r.size),
+        e_tag: etag(&r.etag),
+        last_modified: Some(Timestamp::from(r.created_at)),
+        ..Default::default()
+    });
+    (r.key.clone(), false)
 }
 
 #[async_trait::async_trait]
@@ -316,33 +355,20 @@ impl S3 for PgS3 {
             }
             let last_row = rows.len() < 1024;
             for r in rows {
-                let rest = &r.key[prefix.len()..];
-                if !delimiter.is_empty() {
-                    if let Some(idx) = rest.find(&delimiter) {
-                        let cp = format!("{prefix}{}", &rest[..idx + delimiter.len()]);
-                        if seen.insert(cp.clone()) {
-                            if contents.len() + common.len() >= max {
-                                truncated = true;
-                                break 'outer;
-                            }
-                            common.push(CommonPrefix { prefix: Some(cp) });
-                        }
-                        after = r.key;
-                        continue;
-                    }
-                }
-                if contents.len() + common.len() >= max {
+                let (cursor, full) = listing_step(
+                    &r,
+                    &prefix,
+                    &delimiter,
+                    max,
+                    &mut contents,
+                    &mut common,
+                    &mut seen,
+                );
+                after = cursor;
+                if full {
                     truncated = true;
                     break 'outer;
                 }
-                contents.push(Object {
-                    key: Some(r.key.clone()),
-                    size: Some(r.size),
-                    e_tag: etag(&r.etag),
-                    last_modified: Some(Timestamp::from(r.created_at)),
-                    ..Default::default()
-                });
-                after = r.key;
             }
             if last_row {
                 break;
@@ -426,7 +452,7 @@ impl s3s::route::S3Route for StatsRoute {
         *method == hyper::http::Method::GET && uri.path() == "/_pgvs3/stats"
     }
     async fn call(&self, _req: S3Request<s3s::Body>) -> S3Result<S3Response<s3s::Body>> {
-        let line = format!("{}\n", db::stage_stats_line());
+        let line = format!("{}\n", crate::stats::stage_stats_line());
         Ok(S3Response::new(s3s::Body::from(bytes::Bytes::from(line))))
     }
 }
@@ -439,10 +465,10 @@ pub struct ServeConfig {
 
 pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
     // Keep the chunk index hot while it is small beside shared_buffers (see
-    // db::prewarm_index). Best-effort, in the background.
+    // janitor::prewarm_index). Best-effort, in the background.
     let warm = pool.clone();
     tokio::spawn(async move {
-        match db::prewarm_index(&warm).await {
+        match janitor::prewarm_index(&warm).await {
             Ok(Some(blocks)) => eprintln!("pgvs3: prewarmed chunk index ({blocks} blocks)"),
             Ok(None) => eprintln!("pgvs3: chunk index exceeds 10% of shared_buffers: left cold"),
             Err(e) => eprintln!("pgvs3: prewarm skipped: {e}"),
@@ -460,12 +486,12 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
-            match db::expire_uploads(&gc, grace).await {
+            match janitor::expire_uploads(&gc, grace).await {
                 Ok(0) => {}
                 Ok(n) => eprintln!("pgvs3: janitor expired {n} abandoned multipart uploads"),
                 Err(e) => eprintln!("pgvs3: janitor upload expiry failed: {e}"),
             }
-            match db::sweep_orphans(&gc, grace, from).await {
+            match janitor::sweep_orphans(&gc, grace, from).await {
                 Ok((files, rows, next)) => {
                     if files > 0 {
                         let mib = rows as i64 * db::ROW_BYTES / (1 << 20);
@@ -496,7 +522,7 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tick.tick().await;
-            eprintln!("{}", crate::db::stage_stats_line());
+            eprintln!("{}", crate::stats::stage_stats_line());
         }
     });
     loop {
