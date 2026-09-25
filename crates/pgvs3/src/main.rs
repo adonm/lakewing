@@ -3,9 +3,20 @@ use clap::{Parser, Subcommand};
 use pgvs3::{bench, db, seed, server};
 
 #[derive(Parser)]
-#[command(name = "pgvs3", about = "Lowest-overhead S3-compatible service over PostgreSQL byte rows")]
+#[command(
+    name = "pgvs3",
+    about = "Lowest-overhead S3-compatible service over PostgreSQL byte rows"
+)]
 struct Cli {
-    #[arg(long, global = true, default_value = "postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench")]
+    /// PostgreSQL URL. Every setting also reads from the environment, so a
+    /// container can be configured with `docker run -e PGVS3_URL=...` alone;
+    /// a flag overrides the env var.
+    #[arg(
+        long,
+        global = true,
+        env = "PGVS3_URL",
+        default_value = "postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench"
+    )]
     url: String,
     #[command(subcommand)]
     cmd: Cmd,
@@ -15,11 +26,16 @@ struct Cli {
 enum Cmd {
     /// Serve the S3 gateway (SigV4 auth).
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8014")]
+        /// Listen address. In a container use `PGVS3_ADDR=0.0.0.0:8014`.
+        #[arg(long, env = "PGVS3_ADDR", default_value = "127.0.0.1:8014")]
         addr: String,
-        #[arg(long, default_value = "cachebench")]
+        #[arg(long, env = "PGVS3_ACCESS_KEY", default_value = "cachebench")]
         access_key: String,
-        #[arg(long, default_value = "cachebench-local-only")]
+        #[arg(
+            long,
+            env = "PGVS3_SECRET_KEY",
+            default_value = "cachebench-local-only"
+        )]
         secret_key: String,
     },
     /// Seed deterministic incompressible objects.
@@ -43,7 +59,11 @@ enum Cmd {
         access_key: String,
         #[arg(long, default_value = "cachebench-local-only")]
         secret_key: String,
-        #[arg(long, value_delimiter = ',', default_value = "4096,65536,262144,1048576,8388608")]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "4096,65536,262144,1048576,8388608"
+        )]
         sizes: Vec<usize>,
         #[arg(long, value_delimiter = ',', default_value = "1,16")]
         concurrency: Vec<usize>,
@@ -60,16 +80,51 @@ enum Cmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, access_key, secret_key } => {
+        Cmd::Serve {
+            addr,
+            access_key,
+            secret_key,
+        } => {
             let pool = db::connect(&cli.url).await?;
             db::init(&pool).await?;
-            server::serve(pool, server::ServeConfig { addr, access_key, secret_key }).await
+            server::serve(
+                pool,
+                server::ServeConfig {
+                    addr,
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await
         }
-        Cmd::Seed { bucket, gigabytes, object_mib, tasks } => {
+        Cmd::Seed {
+            bucket,
+            gigabytes,
+            object_mib,
+            tasks,
+        } => {
             let pool = db::connect(&cli.url).await?;
-            seed::run(&pool, seed::SeedConfig { bucket, gigabytes, object_mib, tasks }).await
+            seed::run(
+                &pool,
+                seed::SeedConfig {
+                    bucket,
+                    gigabytes,
+                    object_mib,
+                    tasks,
+                },
+            )
+            .await
         }
-        Cmd::Bench { endpoint, bucket, access_key, secret_key, sizes, concurrency, requests, sample } => {
+        Cmd::Bench {
+            endpoint,
+            bucket,
+            access_key,
+            secret_key,
+            sizes,
+            concurrency,
+            requests,
+            sample,
+        } => {
             bench::run(bench::BenchConfig {
                 endpoint,
                 bucket,

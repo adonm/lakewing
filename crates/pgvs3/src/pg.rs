@@ -21,7 +21,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::tls::{ChannelBinding, MakeTlsConnect, TlsConnect, TlsStream};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Socket, Statement};
@@ -58,7 +58,9 @@ struct Inner {
 
 struct Conn {
     client: Client,
-    range: Statement,
+    /// Prepared on first use, not at connect: the pool's warm-up connections
+    /// come up before `db::init` has created the schema the statement names.
+    range: OnceCell<Statement>,
     idle_since: Instant,
 }
 
@@ -78,7 +80,8 @@ impl Pool {
             opts,
             idle: Mutex::new(Vec::new()),
         }));
-        let warm = futures::future::try_join_all((0..pool.0.opts.min).map(|_| pool.0.open())).await?;
+        let warm =
+            futures::future::try_join_all((0..pool.0.opts.min).map(|_| pool.0.open())).await?;
         pool.0.idle.lock().unwrap().extend(warm);
         Ok(pool)
     }
@@ -96,7 +99,11 @@ impl Pool {
                 None => break self.0.open().await?,
             }
         };
-        Ok(Pooled { conn: Some(conn), pool: self.clone(), _slot: slot })
+        Ok(Pooled {
+            conn: Some(conn),
+            pool: self.clone(),
+            _slot: slot,
+        })
     }
 }
 
@@ -109,8 +116,11 @@ impl Inner {
             }
         });
         client.batch_execute(&self.opts.session).await?;
-        let range = client.prepare_typed(self.opts.range_sql, self.opts.range_types).await?;
-        Ok(Conn { client, range, idle_since: Instant::now() })
+        Ok(Conn {
+            client,
+            range: OnceCell::new(),
+            idle_since: Instant::now(),
+        })
     }
 }
 
@@ -125,9 +135,19 @@ pub struct Pooled {
 }
 
 impl Pooled {
-    /// This connection's prepared `Options::range_sql`.
-    pub fn range(&self) -> &Statement {
-        &self.live().range
+    /// This connection's prepared `Options::range_sql`, prepared on first use.
+    pub async fn range(&mut self) -> Result<&Statement> {
+        let Pooled {
+            conn,
+            pool,
+            _slot: _,
+        } = self;
+        let conn = conn.as_mut().expect("live until drop");
+        let opts = &pool.0.opts;
+        Ok(conn
+            .range
+            .get_or_try_init(|| conn.client.prepare_typed(opts.range_sql, opts.range_types))
+            .await?)
     }
 
     fn live(&self) -> &Conn {
@@ -151,7 +171,9 @@ impl DerefMut for Pooled {
 
 impl Drop for Pooled {
     fn drop(&mut self) {
-        let Some(mut conn) = self.conn.take() else { return };
+        let Some(mut conn) = self.conn.take() else {
+            return;
+        };
         if conn.client.is_closed() {
             return;
         }
@@ -160,7 +182,8 @@ impl Drop for Pooled {
             let mut idle = self.pool.0.idle.lock().unwrap();
             idle.push(conn);
             // The bottom of the stack is the least recently used.
-            (idle.len() > self.pool.0.opts.min && idle[0].idle_since.elapsed() > IDLE_MAX).then(|| idle.remove(0))
+            (idle.len() > self.pool.0.opts.min && idle[0].idle_since.elapsed() > IDLE_MAX)
+                .then(|| idle.remove(0))
         };
         drop(stale); // closes it outside the lock
     }
@@ -225,13 +248,21 @@ impl TlsStream for RustlsStream {
 }
 
 impl AsyncRead for RustlsStream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for RustlsStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
     }
 
@@ -279,7 +310,12 @@ impl ServerCertVerifier for EncryptOnly {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -288,7 +324,12 @@ impl ServerCertVerifier for EncryptOnly {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {

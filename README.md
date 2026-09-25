@@ -146,6 +146,45 @@ building.
 Before more tuning: integration tests against a local PostgreSQL (range
 edges, multipart lifecycle, overwrite/delete, the orphan sweep).
 
+## Running in a container
+
+Published to GHCR on every push to `main` (amd64 and arm64, so AWS Graviton
+works), built by `just image` from a two-stage Dockerfile: `rust:alpine` builds
+a static musl binary, and the image is `scratch` — no shell, no libc, 14 MB.
+All config comes from the environment, so Kubernetes only needs a Deployment:
+
+```sh
+docker run -p 8014:8014 \
+  -e PGVS3_URL="postgres://user:pass@host/db?sslmode=require" \
+  -e PGVS3_SECRET_KEY=change-me \
+  ghcr.io/adonm/pgvs3:latest
+```
+
+```yaml
+containers:
+  - name: pgvs3
+    image: ghcr.io/adonm/pgvs3:latest
+    env:
+      - name: PGVS3_URL
+        valueFrom: { secretKeyRef: { name: pgvs3, key: url } }
+      - name: PGVS3_SECRET_KEY
+        valueFrom: { secretKeyRef: { name: pgvs3, key: secret-key } }
+      - name: PGVS3_ACCESS_KEY
+        value: admin
+    ports: [{ containerPort: 8014 }]
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PGVS3_URL` | local dev DB | PostgreSQL URL. `sslmode=require` encrypts, no certificate check. |
+| `PGVS3_ADDR` | `127.0.0.1:8014` | Listen address; use `0.0.0.0:8014` in a container. |
+| `PGVS3_ACCESS_KEY` | `cachebench` | SigV4 access key. |
+| `PGVS3_SECRET_KEY` | `cachebench-local-only` | SigV4 secret key. |
+
+A flag overrides the same-named variable: `--url`, `--addr`, `--access-key`,
+`--secret-key`. The remaining knobs in the table above are `PGVS3_POOL_MIN` and
+`PGVS3_DURABLE`.
+
 ## Benchmarks
 
 - Local: `just clickbench`, `just spatialbench sf=10` and `just tpch sf=10`

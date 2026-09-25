@@ -102,20 +102,30 @@ pub const LAYOUT_VERSION: i32 = 2;
 pub async fn init(pool: &Pool) -> Result<()> {
     const LOCK: i64 = 0x7067_7673; // "pgvs"
     let conn = pool.get().await?;
-    conn.query_typed("SELECT pg_advisory_lock($1)", &[(&LOCK, Type::INT8)]).await?;
+    conn.query_typed("SELECT pg_advisory_lock($1)", &[(&LOCK, Type::INT8)])
+        .await?;
     let result = init_locked(&conn).await;
-    let _ = conn.query_typed("SELECT pg_advisory_unlock($1)", &[(&LOCK, Type::INT8)]).await;
+    let _ = conn
+        .query_typed("SELECT pg_advisory_unlock($1)", &[(&LOCK, Type::INT8)])
+        .await;
     result
 }
 
 async fn init_locked(client: &Client) -> Result<()> {
-    let chunks: bool =
-        client.query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[]).await?.try_get(0)?;
+    let chunks: bool = client
+        .query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[])
+        .await?
+        .try_get(0)?;
     if chunks {
-        let marked: bool =
-            client.query_typed_one("SELECT to_regclass('s3p.layout') IS NOT NULL", &[]).await?.try_get(0)?;
+        let marked: bool = client
+            .query_typed_one("SELECT to_regclass('s3p.layout') IS NOT NULL", &[])
+            .await?
+            .try_get(0)?;
         let found: Option<i32> = if marked {
-            client.query_typed_one("SELECT max(version) FROM s3p.layout", &[]).await?.try_get(0)?
+            client
+                .query_typed_one("SELECT max(version) FROM s3p.layout", &[])
+                .await?
+                .try_get(0)?
         } else {
             Some(1) // v1 predates the marker (unpartitioned s3p.chunks)
         };
@@ -142,7 +152,10 @@ async fn init_locked(client: &Client) -> Result<()> {
 /// wait-free for one DuckDB worker's bursts). Every gateway holds this many
 /// Aurora backends open, so large fleets should lower it.
 fn pool_min() -> usize {
-    std::env::var("PGVS3_POOL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+    std::env::var("PGVS3_POOL_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
 }
 
 /// Load the chunk primary-key indexes into shared_buffers when they are small
@@ -152,7 +165,9 @@ fn pool_min() -> usize {
 /// would evict the working set. Returns the blocks loaded, or None if skipped.
 pub async fn prewarm_index(pool: &Pool) -> Result<Option<i64>> {
     let conn = pool.get().await?;
-    let _ = conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm").await;
+    let _ = conn
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm")
+        .await;
     let mut idx: Vec<(String, i64)> = Vec::new();
     for r in conn
         .query_typed(
@@ -166,7 +181,10 @@ pub async fn prewarm_index(pool: &Pool) -> Result<Option<i64>> {
         idx.push((r.try_get(0)?, r.try_get(1)?));
     }
     let budget: i64 = conn
-        .query_typed_one("SELECT setting::int8 * 8192 / 10 FROM pg_settings WHERE name = 'shared_buffers'", &[])
+        .query_typed_one(
+            "SELECT setting::int8 * 8192 / 10 FROM pg_settings WHERE name = 'shared_buffers'",
+            &[],
+        )
         .await?
         .try_get(0)?;
     if idx.iter().map(|(_, bytes)| bytes).sum::<i64>() > budget {
@@ -228,6 +246,10 @@ impl SliceMeta {
     pub fn len(&self) -> i64 {
         (self.end - self.start + 1).max(0)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A cut-through response body: the first chunk (fetched before the response
@@ -240,7 +262,10 @@ pub struct PieceStream {
 impl Stream for PieceStream {
     type Item = Result<Bytes, std::io::Error>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this.first.take() {
             Some(head) => std::task::Poll::Ready(Some(Ok(head))),
@@ -293,7 +318,11 @@ fn meta_put(bucket: &str, key: &str, meta: Meta) {
 }
 
 fn meta_invalidate(bucket: &str, key: &str) {
-    meta_cache().lock().unwrap().map.remove(&(bucket.to_owned(), key.to_owned()));
+    meta_cache()
+        .lock()
+        .unwrap()
+        .map
+        .remove(&(bucket.to_owned(), key.to_owned()));
 }
 
 // ---------------------------------------------------------------------------
@@ -301,10 +330,12 @@ fn meta_invalidate(bucket: &str, key: &str) {
 // and the last byte handed to the response, parts and pool waits. Read via
 // `stage_stats_line` (the stats route and the log timer print it).
 // ---------------------------------------------------------------------------
-static SPANS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static SPANS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 // GET latency histogram: quarter-octave buckets of microseconds (~19%
 // resolution), read back as p50/p95/p99.
-static LAT: [std::sync::atomic::AtomicU64; 128] = [const { std::sync::atomic::AtomicU64::new(0) }; 128];
+static LAT: [std::sync::atomic::AtomicU64; 128] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 128];
 
 fn lat_record(us: u64) {
     let idx = ((us.max(1) as f64).log2() * 4.0) as usize;
@@ -326,9 +357,12 @@ fn lat_pct(counts: &[u64], p: f64) -> f64 {
 }
 // Per span class (0 = small, 1 = larger): GETs, summed time to the first byte
 // handed to the response, summed time to the last.
-static GETS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-static TTFB_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-static TOTAL_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static GETS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static TTFB_US: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static TOTAL_US: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 // Per part query, both paths: count and pool-acquire wait (summed, so it can
 // exceed wall time under concurrency; growth means the pool is the limit).
 static PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -374,7 +408,12 @@ fn span_bucket(span: usize) -> usize {
 
 /// Metadata lookup, cached (a repeat open costs no round trip).
 pub async fn meta(pool: &Pool, bucket: &str, key: &str) -> Result<Option<Meta>> {
-    if let Some(m) = meta_cache().lock().unwrap().map.get(&(bucket.to_owned(), key.to_owned())) {
+    if let Some(m) = meta_cache()
+        .lock()
+        .unwrap()
+        .map
+        .get(&(bucket.to_owned(), key.to_owned()))
+    {
         return Ok(Some(m.clone()));
     }
     let row = pool
@@ -414,7 +453,9 @@ pub async fn get_body(
     suffix: i64,
 ) -> Result<Option<(SliceMeta, PieceBody)>> {
     use std::sync::atomic::Ordering::Relaxed;
-    let Some(m) = meta(&pool, &bucket, &key).await? else { return Ok(None) };
+    let Some(m) = meta(&pool, &bucket, &key).await? else {
+        return Ok(None);
+    };
     let (start, end) = eff_range(m.size, first, last, suffix);
     let smeta = SliceMeta {
         size: m.size,
@@ -447,14 +488,22 @@ pub async fn get_body(
     TTFB_US[class].fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
     match head {
         Some(Ok(head)) if head.len() == len => Ok(Some((smeta, PieceBody::OneShot(head)))),
-        Some(Ok(head)) => Ok(Some((smeta, PieceBody::Streamed(PieceStream { first: Some(head), rx })))),
+        Some(Ok(head)) => Ok(Some((
+            smeta,
+            PieceBody::Streamed(PieceStream {
+                first: Some(head),
+                rx,
+            }),
+        ))),
         Some(Err(e)) => {
             // Perhaps a stale cache entry (the object replaced via another
             // gateway): the retry looks the metadata up again.
             meta_invalidate(&bucket, &key);
             Err(e.into())
         }
-        None => Err(anyhow::anyhow!("GET of {bucket}/{key} ended before any data")),
+        None => Err(anyhow::anyhow!(
+            "GET of {bucket}/{key} ended before any data"
+        )),
     }
 }
 
@@ -485,7 +534,12 @@ fn plan(m: &Meta, start: i64, end: i64, step: usize) -> Vec<Piece> {
         }
         let lo = ((start.max(base) - base) / ROW_BYTES) as i32;
         let hi = ((end.min(base + len - 1) - base) / ROW_BYTES) as i32;
-        out.extend(part_ranges(lo, hi, step).map(|(lo, hi)| Piece { file_id, base, lo, hi }));
+        out.extend(part_ranges(lo, hi, step).map(|(lo, hi)| Piece {
+            file_id,
+            base,
+            lo,
+            hi,
+        }));
     }
     out
 }
@@ -527,7 +581,9 @@ async fn stream_span(
             let Some(p) = todo.next() else { break };
             running.push_back((p, spawn_part(pool, p)));
         }
-        let Some((p, mut rows)) = running.pop_front() else { break };
+        let Some((p, mut rows)) = running.pop_front() else {
+            break;
+        };
         // Bitmap heap scans return TID order: hold any row that runs ahead.
         let mut early: BTreeMap<i32, Row> = BTreeMap::new();
         let mut next = p.lo;
@@ -552,7 +608,13 @@ async fn stream_span(
                 chunk.reserve(CHUNK + ROW_BYTES as usize);
             }
         }
-        anyhow::ensure!(next > p.hi, "file {} rows {}..={}: row {next} missing", p.file_id, p.lo, p.hi);
+        anyhow::ensure!(
+            next > p.hi,
+            "file {} rows {}..={}: row {next} missing",
+            p.file_id,
+            p.lo,
+            p.hi
+        );
     }
     anyhow::ensure!(
         sent + chunk.len() as i64 == end - start + 1,
@@ -567,7 +629,14 @@ async fn stream_span(
 }
 
 /// Append row `no`'s part of `[start, end]` to `chunk`.
-fn put_row(chunk: &mut BytesMut, p: &Piece, no: i32, row: &Row, start: i64, end: i64) -> Result<()> {
+fn put_row(
+    chunk: &mut BytesMut,
+    p: &Piece,
+    no: i32,
+    row: &Row,
+    start: i64,
+    end: i64,
+) -> Result<()> {
     if let Some(s) = row_slice(p.base, no, row.try_get(1)?, start, end) {
         chunk.extend_from_slice(s);
     }
@@ -591,14 +660,19 @@ fn spawn_part(pool: &Pool, p: Piece) -> tokio::sync::mpsc::Receiver<Result<Row>>
 /// One contiguous row-range query (the prepared GET_RANGE_SQL) on its own
 /// pool connection; rows go to `tx` as they arrive. Each keeps its bytes in
 /// the connection's receive buffer until copied into a response chunk.
-async fn fetch_part(pool: &Pool, p: Piece, tx: &tokio::sync::mpsc::Sender<Result<Row>>) -> Result<()> {
+async fn fetch_part(
+    pool: &Pool,
+    p: Piece,
+    tx: &tokio::sync::mpsc::Sender<Result<Row>>,
+) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
-    let conn = pool.get().await?;
+    let mut conn = pool.get().await?;
     WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
     PARTS.fetch_add(1, Relaxed);
     let params: [&(dyn ToSql + Sync); 3] = [&p.file_id, &p.lo, &p.hi];
-    let mut rows = std::pin::pin!(conn.query_raw(conn.range(), params).await?);
+    let range = conn.range().await?.clone();
+    let mut rows = std::pin::pin!(conn.query_raw(&range, params).await?);
     while let Some(row) = rows.try_next().await? {
         if tx.send(Ok(row)).await.is_err() {
             break; // the span was abandoned
@@ -612,14 +686,35 @@ fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
     if suffix >= 0 {
         ((size - suffix).max(0), size - 1)
     } else {
-        (first.max(0), if last >= 0 { last.min(size - 1) } else { size - 1 })
+        (
+            first.max(0),
+            if last >= 0 {
+                last.min(size - 1)
+            } else {
+                size - 1
+            },
+        )
     }
 }
 
 /// Buffered variant (tests, bench floor).
-pub async fn get(pool: &Pool, bucket: &str, key: &str, first: i64, last: i64, suffix: i64) -> Result<Option<Slice>> {
-    let Some((meta, body)) =
-        get_body(pool.clone(), bucket.to_owned(), key.to_owned(), first, last, suffix).await?
+pub async fn get(
+    pool: &Pool,
+    bucket: &str,
+    key: &str,
+    first: i64,
+    last: i64,
+    suffix: i64,
+) -> Result<Option<Slice>> {
+    let Some((meta, body)) = get_body(
+        pool.clone(),
+        bucket.to_owned(),
+        key.to_owned(),
+        first,
+        last,
+        suffix,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -674,8 +769,11 @@ pub async fn put(pool: &Pool, bucket: &str, key: &str, data: &[u8], etag: &[u8])
 pub struct ChunkWriter {
     pub file_id: i64,
     tx: Option<tokio::sync::mpsc::Sender<IngestMsg>>,
-    done: Option<tokio::task::JoinHandle<Result<(i64, Vec<u8>)>>>,
+    done: Option<tokio::task::JoinHandle<IngestResult>>,
 }
+
+/// `(size, sha256)` of the bytes an ingest streamed.
+type IngestResult = Result<(i64, Vec<u8>)>;
 
 pub enum IngestMsg {
     Data(Bytes),
@@ -697,7 +795,10 @@ impl ChunkWriter {
         let file_id: i64 = pool
             .get()
             .await?
-            .query_typed_one("SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))", &[])
+            .query_typed_one(
+                "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
+                &[],
+            )
             .await?
             .try_get(0)?;
         let (tx, rx) = tokio::sync::mpsc::channel::<IngestMsg>(8);
@@ -817,7 +918,11 @@ async fn ingest_writer(
             .await?;
         if let Some(old) = old {
             let old: i64 = old.try_get(0)?;
-            tx.query_typed("DELETE FROM s3p.chunks WHERE file_id = $1", &[(&old, Type::INT8)]).await?;
+            tx.query_typed(
+                "DELETE FROM s3p.chunks WHERE file_id = $1",
+                &[(&old, Type::INT8)],
+            )
+            .await?;
         }
         tx.query_typed(
             "INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256) VALUES ($1, $2, $3, $4, $5)",
@@ -902,11 +1007,22 @@ async fn swap_object(
 async fn reap(tx: &Transaction<'_>, file_id: i64, parts: Option<Vec<i64>>) -> Result<()> {
     let mut dead = parts.unwrap_or_default();
     dead.push(file_id);
-    tx.query_typed("DELETE FROM s3p.chunks WHERE file_id = ANY($1)", &[(&dead, Type::INT8_ARRAY)]).await?;
+    tx.query_typed(
+        "DELETE FROM s3p.chunks WHERE file_id = ANY($1)",
+        &[(&dead, Type::INT8_ARRAY)],
+    )
+    .await?;
     Ok(())
 }
 
-fn publish_cache(bucket: &str, key: &str, file_id: i64, size: i64, etag: &[u8], parts: Option<(Vec<i64>, Vec<i64>)>) {
+fn publish_cache(
+    bucket: &str,
+    key: &str,
+    file_id: i64,
+    size: i64,
+    etag: &[u8],
+    parts: Option<(Vec<i64>, Vec<i64>)>,
+) {
     let (parts, part_ends) = parts.unzip();
     meta_put(
         bucket,
@@ -974,13 +1090,21 @@ pub async fn upload_exists(pool: &Pool, upload_id: &str) -> Result<bool> {
     Ok(pool
         .get()
         .await?
-        .query_typed_opt("SELECT 1 FROM s3p.uploads WHERE upload_id = $1", &[(&upload_id, Type::TEXT)])
+        .query_typed_opt(
+            "SELECT 1 FROM s3p.uploads WHERE upload_id = $1",
+            &[(&upload_id, Type::TEXT)],
+        )
         .await?
         .is_some())
 }
 
 pub enum Completed {
-    Done { bucket: String, key: String, etag: Vec<u8>, size: i64 },
+    Done {
+        bucket: String,
+        key: String,
+        etag: Vec<u8>,
+        size: i64,
+    },
     InvalidPart,
     NoSuchUpload,
 }
@@ -988,7 +1112,11 @@ pub enum Completed {
 /// Complete: every recorded part listed exactly once with a matching ETag (any
 /// listing order), then the object publishes as its ordered part files. No
 /// data moves. ETag = sha256 over the part sha256s (S3's hash-of-part-hashes).
-pub async fn complete_upload(pool: &Pool, upload_id: &str, listed: &[(i32, String)]) -> Result<Completed> {
+pub async fn complete_upload(
+    pool: &Pool,
+    upload_id: &str,
+    listed: &[(i32, String)],
+) -> Result<Completed> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
     let Some(up) = tx
@@ -1012,7 +1140,11 @@ pub async fn complete_upload(pool: &Pool, upload_id: &str, listed: &[(i32, Strin
     if want.is_empty() || want.len() != rows.len() {
         return Ok(Completed::InvalidPart);
     }
-    let (mut ids, mut ends, mut size) = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), 0i64);
+    let (mut ids, mut ends, mut size) = (
+        Vec::with_capacity(rows.len()),
+        Vec::with_capacity(rows.len()),
+        0i64,
+    );
     let mut hasher = Sha256::new();
     for (p, r) in want.iter().zip(&rows) {
         let sha: Vec<u8> = r.try_get(3)?;
@@ -1026,10 +1158,19 @@ pub async fn complete_upload(pool: &Pool, upload_id: &str, listed: &[(i32, Strin
     }
     let etag = hasher.finalize().to_vec();
     swap_object(&tx, &bucket, &key, ids[0], size, &etag, Some((&ids, &ends))).await?;
-    tx.query_typed("DELETE FROM s3p.uploads WHERE upload_id = $1", &[(&upload_id, Type::TEXT)]).await?;
+    tx.query_typed(
+        "DELETE FROM s3p.uploads WHERE upload_id = $1",
+        &[(&upload_id, Type::TEXT)],
+    )
+    .await?;
     tx.commit().await?;
     publish_cache(&bucket, &key, ids[0], size, &etag, Some((ids, ends)));
-    Ok(Completed::Done { bucket, key, etag, size })
+    Ok(Completed::Done {
+        bucket,
+        key,
+        etag,
+        size,
+    })
 }
 
 /// Drop a multipart upload and the rows of every part it recorded.
@@ -1038,13 +1179,24 @@ pub async fn abort_upload(pool: &Pool, upload_id: &str) -> Result<()> {
     let tx = conn.transaction().await?;
     let mut ids: Vec<i64> = Vec::new();
     for r in tx
-        .query_typed("SELECT file_id FROM s3p.upload_parts WHERE upload_id = $1", &[(&upload_id, Type::TEXT)])
+        .query_typed(
+            "SELECT file_id FROM s3p.upload_parts WHERE upload_id = $1",
+            &[(&upload_id, Type::TEXT)],
+        )
         .await?
     {
         ids.push(r.try_get(0)?);
     }
-    tx.query_typed("DELETE FROM s3p.uploads WHERE upload_id = $1", &[(&upload_id, Type::TEXT)]).await?;
-    tx.query_typed("DELETE FROM s3p.chunks WHERE file_id = ANY($1)", &[(&ids, Type::INT8_ARRAY)]).await?;
+    tx.query_typed(
+        "DELETE FROM s3p.uploads WHERE upload_id = $1",
+        &[(&upload_id, Type::TEXT)],
+    )
+    .await?;
+    tx.query_typed(
+        "DELETE FROM s3p.chunks WHERE file_id = ANY($1)",
+        &[(&ids, Type::INT8_ARRAY)],
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1094,7 +1246,10 @@ pub async fn sweep_orphans(pool: &Pool, grace: Duration, from: i64) -> Result<(u
     // Partition names come from the catalog (regclass text, already quoted).
     let mut partitions: Vec<String> = Vec::new();
     for r in conn
-        .query_typed("SELECT relid::regclass::text FROM pg_partition_tree('s3p.chunks') WHERE isleaf", &[])
+        .query_typed(
+            "SELECT relid::regclass::text FROM pg_partition_tree('s3p.chunks') WHERE isleaf",
+            &[],
+        )
         .await?
     {
         partitions.push(r.try_get(0)?);
@@ -1105,7 +1260,10 @@ pub async fn sweep_orphans(pool: &Pool, grace: Duration, from: i64) -> Result<(u
     let mut orphans: Vec<i64> = Vec::new();
     for partition in &partitions {
         for r in tx
-            .query_typed(&orphans_sql(partition), &[(&from, Type::INT8), (&horizon, Type::INT8)])
+            .query_typed(
+                &orphans_sql(partition),
+                &[(&from, Type::INT8), (&horizon, Type::INT8)],
+            )
             .await?
         {
             orphans.push(r.try_get(0)?);
@@ -1114,7 +1272,9 @@ pub async fn sweep_orphans(pool: &Pool, grace: Duration, from: i64) -> Result<(u
     tx.commit().await?;
     let mut rows = 0;
     for id in &orphans {
-        rows += conn.execute("DELETE FROM s3p.chunks WHERE file_id = $1", &[id]).await?;
+        rows += conn
+            .execute("DELETE FROM s3p.chunks WHERE file_id = $1", &[id])
+            .await?;
     }
     Ok((orphans.len(), rows, horizon))
 }
@@ -1190,7 +1350,15 @@ pub async fn list(
 
 pub async fn buckets(pool: &Pool) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for r in pool.get().await?.query_typed("SELECT DISTINCT bucket FROM s3p.objects ORDER BY bucket", &[]).await? {
+    for r in pool
+        .get()
+        .await?
+        .query_typed(
+            "SELECT DISTINCT bucket FROM s3p.objects ORDER BY bucket",
+            &[],
+        )
+        .await?
+    {
         out.push(r.try_get(0)?);
     }
     Ok(out)

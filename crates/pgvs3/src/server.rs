@@ -10,10 +10,10 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketOutput,
     CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketOutput,
-    DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, Range, StreamingBlob,
-    Timestamp, UploadPartInput, UploadPartOutput,
+    DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
+    PutObjectInput, PutObjectOutput, Range, StreamingBlob, Timestamp, UploadPartInput,
+    UploadPartOutput,
 };
 use s3s::service::S3ServiceBuilder;
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
@@ -52,14 +52,19 @@ fn prefix_end(prefix: &str) -> String {
 fn range_params(range: Option<Range>) -> (i64, i64, i64) {
     match range {
         None => (0, -1, -1),
-        Some(Range::Int { first, last }) => (first as i64, last.map(|v| v as i64).unwrap_or(-1), -1),
+        Some(Range::Int { first, last }) => {
+            (first as i64, last.map(|v| v as i64).unwrap_or(-1), -1)
+        }
         Some(Range::Suffix { length }) => (0, -1, length as i64),
     }
 }
 
 #[async_trait::async_trait]
 impl S3 for PgS3 {
-    async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
         let meta = db::meta(&self.pool, &input.bucket, &input.key)
             .await
@@ -75,15 +80,25 @@ impl S3 for PgS3 {
         Ok(S3Response::new(out))
     }
 
-    async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
         let ranged = input.range.is_some();
         let (first, last, suffix) = range_params(input.range);
         // One round trip: metadata + a stream of exactly the requested bytes.
-        let (meta, body) = db::get_body(self.pool.clone(), input.bucket, input.key, first, last, suffix)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
+        let (meta, body) = db::get_body(
+            self.pool.clone(),
+            input.bucket,
+            input.key,
+            first,
+            last,
+            suffix,
+        )
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| s3_error!(NoSuchKey))?;
 
         if meta.size > 0 && (meta.start > meta.end || meta.start >= meta.size) {
             return Err(s3_error!(InvalidRange));
@@ -96,7 +111,8 @@ impl S3 for PgS3 {
                 db::PieceBody::Streamed(s) => StreamingBlob::wrap(s),
             }),
             content_length: Some(body_len),
-            content_range: ranged.then(|| format!("bytes {}-{}/{}", meta.start, meta.end, meta.size)),
+            content_range: ranged
+                .then(|| format!("bytes {}-{}/{}", meta.start, meta.end, meta.size)),
             content_type: Some("application/octet-stream".to_owned()),
             e_tag: etag(&meta.etag),
             last_modified: Some(Timestamp::from(meta.created_at)),
@@ -105,11 +121,19 @@ impl S3 for PgS3 {
         Ok(S3Response::new(out))
     }
 
-    async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
         let mut input = req.input;
-        let body = input.body.take().unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
+        let body = input
+            .body
+            .take()
+            .unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
         // Streams into its own COPY (never buffered whole); the writer hashes.
-        let writer = db::ChunkWriter::start(self.pool.clone()).await.map_err(internal)?;
+        let writer = db::ChunkWriter::start(self.pool.clone())
+            .await
+            .map_err(internal)?;
         let file_id = writer.file_id;
         let (size, sum) = db::ingest_body(writer, body).await.map_err(internal)?;
         db::publish(&self.pool, &input.bucket, &input.key, file_id, size, &sum)
@@ -150,20 +174,36 @@ impl S3 for PgS3 {
         }))
     }
 
-    async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
         let mut input = req.input;
-        if !db::upload_exists(&self.pool, &input.upload_id).await.map_err(internal)? {
+        if !db::upload_exists(&self.pool, &input.upload_id)
+            .await
+            .map_err(internal)?
+        {
             return Err(s3_error!(NoSuchUpload));
         }
         // Each part streams straight into its own COPY, in any arrival order
         // and in parallel with its siblings; a re-sent part replaces the
         // earlier attempt atomically.
-        let writer = db::ChunkWriter::start_part(self.pool.clone(), input.upload_id.clone(), input.part_number)
-            .await
-            .map_err(internal)?;
-        let body = input.body.take().unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
+        let writer = db::ChunkWriter::start_part(
+            self.pool.clone(),
+            input.upload_id.clone(),
+            input.part_number,
+        )
+        .await
+        .map_err(internal)?;
+        let body = input
+            .body
+            .take()
+            .unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
         let (size, sum) = db::ingest_body(writer, body).await.map_err(internal)?;
-        eprintln!("pgvs3: upload_part {} no={} {size} bytes", input.upload_id, input.part_number);
+        eprintln!(
+            "pgvs3: upload_part {} no={} {size} bytes",
+            input.upload_id, input.part_number
+        );
         Ok(S3Response::new(UploadPartOutput {
             e_tag: etag(&sum),
             ..Default::default()
@@ -183,13 +223,30 @@ impl S3 for PgS3 {
         let mut parts = Vec::with_capacity(listed.len());
         for cp in &listed {
             let no = cp.part_number.ok_or_else(|| s3_error!(InvalidPart))?;
-            parts.push((no, cp.e_tag.as_ref().map(|e| e.value().to_owned()).unwrap_or_default()));
+            parts.push((
+                no,
+                cp.e_tag
+                    .as_ref()
+                    .map(|e| e.value().to_owned())
+                    .unwrap_or_default(),
+            ));
         }
         // Parts are already rows in Aurora: Complete validates and publishes,
         // moving no data (so no long response window to lose).
-        match db::complete_upload(&self.pool, &input.upload_id, &parts).await.map_err(internal)? {
-            db::Completed::Done { bucket, key, etag: sum, size } => {
-                eprintln!("pgvs3: multipart {bucket}/{key} = {size} bytes in {} parts", parts.len());
+        match db::complete_upload(&self.pool, &input.upload_id, &parts)
+            .await
+            .map_err(internal)?
+        {
+            db::Completed::Done {
+                bucket,
+                key,
+                etag: sum,
+                size,
+            } => {
+                eprintln!(
+                    "pgvs3: multipart {bucket}/{key} = {size} bytes in {} parts",
+                    parts.len()
+                );
                 Ok(S3Response::new(CompleteMultipartUploadOutput {
                     location: Some(format!("/{bucket}/{key}")),
                     bucket: Some(bucket),
@@ -203,7 +260,10 @@ impl S3 for PgS3 {
                 // Retried after a lost success response: the object is
                 // already published (S3 clients treat identical
                 // re-completion as success).
-                match db::meta(&self.pool, &input.bucket, &input.key).await.map_err(internal)? {
+                match db::meta(&self.pool, &input.bucket, &input.key)
+                    .await
+                    .map_err(internal)?
+                {
                     Some(meta) => Ok(S3Response::new(CompleteMultipartUploadOutput {
                         bucket: Some(input.bucket),
                         key: Some(input.key),
@@ -265,10 +325,7 @@ impl S3 for PgS3 {
                                 truncated = true;
                                 break 'outer;
                             }
-                            common.push(CommonPrefix {
-                                prefix: Some(cp),
-                                ..Default::default()
-                            });
+                            common.push(CommonPrefix { prefix: Some(cp) });
                         }
                         after = r.key;
                         continue;
@@ -359,7 +416,13 @@ struct StatsRoute;
 
 #[async_trait::async_trait]
 impl s3s::route::S3Route for StatsRoute {
-    fn is_match(&self, method: &hyper::http::Method, uri: &hyper::http::Uri, _: &hyper::http::HeaderMap, _: &mut hyper::http::Extensions) -> bool {
+    fn is_match(
+        &self,
+        method: &hyper::http::Method,
+        uri: &hyper::http::Uri,
+        _: &hyper::http::HeaderMap,
+        _: &mut hyper::http::Extensions,
+    ) -> bool {
         *method == hyper::http::Method::GET && uri.path() == "/_pgvs3/stats"
     }
     async fn call(&self, _req: S3Request<s3s::Body>) -> S3Result<S3Response<s3s::Body>> {
@@ -416,7 +479,10 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
     });
     let s3 = PgS3 { pool };
     let mut builder = S3ServiceBuilder::new(s3);
-    builder.set_auth(SimpleAuth::from_single(cfg.access_key.as_str(), cfg.secret_key.as_str()));
+    builder.set_auth(SimpleAuth::from_single(
+        cfg.access_key.as_str(),
+        cfg.secret_key.as_str(),
+    ));
     builder.set_route(StatsRoute);
     let service = builder.build();
 
@@ -439,7 +505,8 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
         let io = hyper_util::rt::TokioIo::new(stream);
         let svc = service.clone();
         tokio::spawn(async move {
-            let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             if let Err(e) = builder.serve_connection(io, svc).await {
                 eprintln!("connection {peer}: {e}");
             }

@@ -3,6 +3,8 @@
 set dotenv-load
 
 URL := "postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench"
+# Test database for `smoke`/`ci`. CI points this at its Postgres service.
+PG_URL := env("PG_URL", URL)
 
 # List the recipes.
 default:
@@ -15,22 +17,26 @@ setup:
     cargo fetch
     @echo "ready. next: just dev-db && just smoke"
 
-# PostgreSQL 18 in Docker (any reachable PostgreSQL works: pass --url).
+# PostgreSQL 18 in Docker (any reachable PostgreSQL works: set PG_URL).
 [group('dev')]
 dev-db:
     #!/usr/bin/env bash
     set -euo pipefail
+    if [ -n "${PG_URL:-}" ] && [ "${PG_URL:-}" != "{{ URL }}" ]; then
+      echo "using PG_URL=$PG_URL"
+      exit 0
+    fi
     if (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null; then
       echo "postgres already listening on :5432"
     elif docker inspect pgvs3-pg >/dev/null 2>&1; then
       docker start pgvs3-pg >/dev/null
     else
       docker run -d --name pgvs3-pg -p 127.0.0.1:5432:5432 \
-        -e POSTGRES_PASSWORD=postgres -v pgvs3-pg-data:/var/lib/postgresql/data postgres:18
+        -e POSTGRES_PASSWORD=postgres postgres:18
     fi
     for i in $(seq 1 30); do
-      docker exec pgvs3-pg pg_isready -U postgres >/dev/null 2>&1 && break
-      (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null && break
+      docker exec pgvs3-pg psql -U postgres -c 'SELECT 1' >/dev/null 2>&1 && break
+      [ "$i" = 30 ] && { echo "postgres did not come up; try: just dev-db-clean && just dev-db"; docker logs --tail 5 pgvs3-pg; exit 1; }
       sleep 1
     done
     for db in pgvs3_bench ducklake_catalog ducklake_catalog_local; do
@@ -42,18 +48,20 @@ dev-db:
 [group('dev')]
 dev-db-clean:
     docker rm -f pgvs3-pg || true
-    docker volume rm pgvs3-pg-data || true
 
 # Build, seed 256 MiB, serve, and check one cross-row ranged GET byte for byte.
 [group('dev')]
-smoke:
+smoke: dev-db
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p pgvs3
-    ./target/release/pgvs3 seed --gigabytes 0.25 --object-mib 8 --tasks 2 >/dev/null
-    ./target/release/pgvs3 serve --addr 127.0.0.1:8014 & SRV=$!
+    ./target/release/pgvs3 --url "{{ PG_URL }}" seed --gigabytes 0.25 --object-mib 8 --tasks 2 >/dev/null
+    ./target/release/pgvs3 --url "{{ PG_URL }}" serve --addr 127.0.0.1:8014 & SRV=$!
     trap 'kill $SRV 2>/dev/null || true' EXIT
-    sleep 1
+    for _ in $(seq 1 30); do
+      curl -s -o /dev/null --max-time 1 http://127.0.0.1:8014/ && break
+      sleep 0.5
+    done
     BYTES=$(curl -sf -H 'Range: bytes=8000-17999' \
       --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
       http://127.0.0.1:8014/lake/obj-00000.bin | wc -c)
@@ -68,6 +76,40 @@ seed:
 [group('bench')]
 micro:
     ./target/release/pgvs3 bench --endpoint http://127.0.0.1:8014 --bucket lake --requests 2000
+
+# Image name for `just image`/`image-test`. CI overrides it with the repo's
+# GHCR path.
+IMAGE := "ghcr.io/adonm/pgvs3"
+
+# Build the container image (multi-arch: linux/amd64 + linux/arm64, so AWS
+# Graviton works). `push=true` publishes to GHCR as a multi-arch index.
+[group('image')]
+image push="false":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p pgvs3
+    args=(--platform linux/amd64,linux/arm64 -t "{{ IMAGE }}:latest" .)
+    [ "{{ push }}" = "true" ] && args+=(--push) || args+=(--load)
+    docker buildx build "${args[@]}"
+
+# Run the image against a PostgreSQL (PG_URL, default local dev-db).
+[group('image')]
+image-test:
+    docker run --rm -p 8014:8014 -e PGVS3_URL="${PG_URL:-{{ URL }}}" {{ IMAGE }}:latest &
+    sleep 3
+    curl -sf -o /dev/null http://127.0.0.1:8014/ && echo "image ok"
+
+# What CI runs. Keep the workflow pointing here. Postgres: `dev-db` locally,
+# the workflow's service container in CI (both via PG_URL).
+[group('ci')]
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo build --release --locked
+    cargo test --workspace
+    just smoke
 
 # TPC-H on DuckLake through the gateway, stable DuckDB (extra = harness args).
 [group('bench')]

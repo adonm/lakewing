@@ -1,0 +1,12 @@
+.git
+.tmp
+target
+.env
+*.pem
+mise-oci
+**/__pycache__
+*.duckdb
+*.db
+*.db-journal
+*.db-wal
+duckdb_temp_*

@@ -2,12 +2,18 @@
 name = "pgvs3"
 version = "0.1.0"
 edition = "2021"
+description = "Lowest-overhead S3-compatible object store over PostgreSQL byte rows"
+license = "Apache-2.0"
+repository = "https://github.com/adonm/pgvs3"
+readme = "../../README.md"
+keywords = ["s3", "object-storage", "postgresql", "ducklake", "http"]
+categories = ["database", "web-programming", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }

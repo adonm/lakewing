@@ -23,6 +23,7 @@ impl Filler {
         z ^ (z >> 31)
     }
 
+    #[allow(clippy::chunks_exact_to_as_chunks)] // the tail is filled, not iterated
     pub fn fill(&mut self, out: &mut [u8]) {
         let mut chunks = out.chunks_exact_mut(8);
         for c in &mut chunks {

@@ -74,7 +74,11 @@ fn stats(label: &str, mut v: Vec<Duration>, bytes: usize, wall: Duration) {
     );
 }
 
-type Op = Arc<dyn Fn(Arc<dyn ObjectStore>, String, u64, usize) -> BoxFuture<'static, Result<Duration>> + Send + Sync>;
+type Op = Arc<
+    dyn Fn(Arc<dyn ObjectStore>, String, u64, usize) -> BoxFuture<'static, Result<Duration>>
+        + Send
+        + Sync,
+>;
 
 /// Spawn `concurrency` tasks, each running `per_task` sequential ops against its
 /// own store handle. `op(store, key, offset, size)` performs one measured call;
@@ -146,7 +150,9 @@ pub async fn run(cfg: BenchConfig) -> Result<()> {
     assert!(!keys.is_empty(), "no objects found; run `pgvs3 seed` first");
     println!(
         "bench against {} (bucket {}, {} objects sampled)",
-        cfg.endpoint, cfg.bucket, keys.len()
+        cfg.endpoint,
+        cfg.bucket,
+        keys.len()
     );
 
     let head_op: Op = Arc::new(|store, key, _off, _size| {
@@ -162,7 +168,15 @@ pub async fn run(cfg: BenchConfig) -> Result<()> {
         let conc = *conc;
         let per_task = cfg.requests.div_ceil(conc.max(1));
         let t0 = Instant::now();
-        let lat = load(conc, per_task, 0, cfg.clone_fields(), keys.clone(), head_op.clone()).await?;
+        let lat = load(
+            conc,
+            per_task,
+            0,
+            cfg.clone_fields(),
+            keys.clone(),
+            head_op.clone(),
+        )
+        .await?;
         stats(&format!("HEAD conc={conc}"), lat, 0, t0.elapsed());
     }
 
@@ -170,7 +184,11 @@ pub async fn run(cfg: BenchConfig) -> Result<()> {
         let size = *size;
         // Only objects at least this large: a read clamped at EOF would count
         // as a full one.
-        let fit: Vec<(String, u64)> = keys.iter().filter(|(_, s)| *s >= size as u64).cloned().collect();
+        let fit: Vec<(String, u64)> = keys
+            .iter()
+            .filter(|(_, s)| *s >= size as u64)
+            .cloned()
+            .collect();
         if fit.is_empty() {
             println!("GET {size}B: no sampled object that large, skipped");
             continue;
@@ -181,7 +199,15 @@ pub async fn run(cfg: BenchConfig) -> Result<()> {
             let n = (cfg.requests * (1 << 20) / size.max(1 << 20)).max(conc);
             let per_task = n.div_ceil(conc.max(1));
             let t0 = Instant::now();
-            let lat = load(conc, per_task, size, cfg.clone_fields(), fit.clone(), get_op(size)).await?;
+            let lat = load(
+                conc,
+                per_task,
+                size,
+                cfg.clone_fields(),
+                fit.clone(),
+                get_op(size),
+            )
+            .await?;
             stats(&format!("GET {size}B conc={conc}"), lat, size, t0.elapsed());
         }
     }
