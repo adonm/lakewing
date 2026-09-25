@@ -149,6 +149,8 @@ def main():
     ingest_s = round(time.perf_counter() - t0, 1)
     if ingested:
         landed, waited_s = wait_searchable(args.url, index, pre + ingested)
+        if landed < pre + ingested:
+            raise SystemExit(f"only {landed} of {pre + ingested} documents searchable after 120s")
     else:
         landed, waited_s = pre, 0.0
 
@@ -194,6 +196,8 @@ def main():
         with open(args.out, "w") as f:
             f.write(line + "\n")
     print(line)
+    if errors:
+        raise SystemExit(f"{errors} search queries failed: {first_err}")
 
 
 if __name__ == "__main__":

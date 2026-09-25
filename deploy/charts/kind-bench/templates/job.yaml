@@ -18,9 +18,22 @@ spec:
           imagePullPolicy: IfNotPresent
           command: [bash, /bench/suites/run.sh, {{ $name | quote }}]
           env:
+            {{- if $.Values.pgSecretName }}
+            - name: PG_HOST
+              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: host } }
+            - name: PG_USER
+              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: user } }
+            - name: PG_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: password } }
+            - name: PG_URL
+              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: url } }
+            - name: PGSSLMODE
+              valueFrom: { secretKeyRef: { name: {{ $.Values.pgSecretName | quote }}, key: sslmode } }
+            {{- else }}
             - { name: PG_HOST, value: {{ $.Values.pgHost | quote }} }
             - { name: PG_USER, value: {{ $.Values.pgUser | quote }} }
             - { name: PG_PASSWORD, value: {{ $.Values.pgPassword | quote }} }
+            {{- end }}
             - { name: QUICKWIT_URL, value: {{ $.Values.quickwitUrl | quote }} }
             - { name: PGVS3_URL, value: {{ $.Values.pgvs3Url | quote }} }
             {{- range $k, $v := $.Values.suiteEnv }}

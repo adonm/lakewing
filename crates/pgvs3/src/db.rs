@@ -258,13 +258,18 @@ pub async fn get_body(
     // A stale meta-cache entry (the object replaced through another gateway,
     // or behind all of them) shows up as missing rows — an overwrite reaps
     // the old file's rows in the same transaction, so a stale entry can never
-    // quietly serve old bytes. Before any byte has gone out, retry once with
-    // the metadata looked up again: the client should never see that 500.
+    // quietly serve old bytes — or as a bogus 416, because range clamping
+    // uses the old size. Before any byte has gone out, retry once with the
+    // metadata looked up again: the client should never see either.
     for attempt in 0..2 {
         let Some(m) = meta(&pool, &bucket, &key).await? else {
             return Ok(None);
         };
         let (start, end) = eff_range(m.size, first, last, suffix);
+        if m.size > 0 && (start > end || start >= m.size) && attempt == 0 {
+            meta_invalidate(&bucket, &key);
+            continue;
+        }
         let smeta = SliceMeta {
             size: m.size,
             etag: m.etag.clone(),

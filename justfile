@@ -1,9 +1,9 @@
-# pgvs3 tasks. Toolchain: `mise install`. Local PostgreSQL: Docker.
-# The rig recipes read their settings from .env (start from .env.example).
+# pgvs3 tasks. Toolchain: `mise install`. Testing runs in kind.
+# The AWS rig recipes read their settings from .env (start from .env.example).
 set dotenv-load
 
 URL := "postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench"
-# Test database for `smoke`/`ci`. CI points this at its Postgres service.
+# Local development database. Smoke and CI use the kind stack instead.
 PG_URL := env("PG_URL", URL)
 
 # List the recipes.
@@ -15,7 +15,7 @@ default:
 setup:
     mise install
     cargo fetch
-    @echo "ready. next: just dev-db && just smoke"
+    @echo "ready. next: just smoke (or just dev-db for local development)"
 
 # PostgreSQL 18 in Docker (any reachable PostgreSQL works: set PG_URL).
 [group('dev')]
@@ -49,36 +49,12 @@ dev-db:
 dev-db-clean:
     docker rm -f pgvs3-pg || true
 
-# Build, seed, serve; a ranged GET byte for byte, then again after an overwrite behind the gateway.
-[group('dev')]
-smoke: dev-db
+# The tests, all on kind: cluster up, validate and every workload at smoke scale.
+[group('kind')]
+smoke: kind-up
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release -p pgvs3
-    # The seeds only need a small pool — the gateway holds 64 and the dev DB
-    # has 100 connections.
-    PGVS3_POOL_MIN=2 PGVS3_POOL_MAX=8 ./target/release/pgvs3 --url "{{ PG_URL }}" seed --gigabytes 0.25 --object-mib 8 --tasks 2 >/dev/null
-    ./target/release/pgvs3 --url "{{ PG_URL }}" serve --addr 127.0.0.1:8014 & SRV=$!
-    trap 'kill $SRV 2>/dev/null || true' EXIT
-    for _ in $(seq 1 30); do
-      curl -s -o /dev/null --max-time 1 http://127.0.0.1:8014/ && break
-      sleep 0.5
-    done
-    BYTES=$(curl -sf -H 'Range: bytes=8000-17999' \
-      --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
-      http://127.0.0.1:8014/lake/obj-00000.bin | wc -c)
-    [ "$BYTES" = "10000" ] && echo "smoke ok: cross-row ranged GET returned exactly 10000 bytes"
-    # Overwrite the same keys behind the running gateway (seed writes straight
-    # to the database, and overwrite reaps the old rows): the gateway's meta
-    # cache goes stale and the GET must re-resolve and serve, not fail. curl
-    # does not retry, so this fails exactly the way a client sees it.
-    # The seeds only need a small pool — the gateway holds 64 and the dev DB
-    # has 100 connections.
-    PGVS3_POOL_MIN=2 PGVS3_POOL_MAX=8 ./target/release/pgvs3 --url "{{ PG_URL }}" seed --gigabytes 0.25 --object-mib 8 --tasks 2 >/dev/null
-    BYTES=$(curl -sf -H 'Range: bytes=8000-17999' \
-      --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
-      http://127.0.0.1:8014/lake/obj-00000.bin | wc -c)
-    [ "$BYTES" = "10000" ] && echo "smoke ok: ranged GET after an overwrite self-healed on a stale cache"
+    QUICK=1 SUITES=validate,pgbench,tpch,click,search,stress {{ just_executable() }} kind-bench
 
 # Load generator: 8 GiB of 64 MiB objects (a stable set for `just micro`).
 [group('bench')]
@@ -92,7 +68,7 @@ micro:
 
 # Image name for `just image`/`image-test`. CI overrides it with the repo's
 # GHCR path.
-IMAGE := "ghcr.io/adonm/pgvs3"
+IMAGE := env("IMAGE", "ghcr.io/adonm/pgvs3")
 
 # Build the container image (amd64 + arm64, so AWS Graviton works); push=true publishes to GHCR.
 [group('image')]
@@ -116,7 +92,7 @@ image-test:
     sleep 3
     curl -sf -o /dev/null http://127.0.0.1:8014/ && echo "image ok"
 
-# What CI runs (fmt, clippy, build, tests, smoke). Postgres via PG_URL.
+# What CI runs (fmt, clippy, build, tests, then `just smoke` on kind).
 [group('ci')]
 ci:
     #!/usr/bin/env bash
@@ -128,7 +104,7 @@ ci:
     just smoke
 
 # --- kind: Postgres 18 + pgvs3 + DuckLake + Quickwit on one disk -----------
-# One command per step. `kind-bench` runs all four suites in under an hour
+# One command per step. `kind-bench` runs all five suites in under an hour
 # with caching on (real-world numbers). Results: .tmp/pgvs3/kind-bench.jsonl.
 
 # Stand up the cluster (Postgres 18, pgvs3, DuckLake, Quickwit); idempotent, same on laptop and EC2.
@@ -136,48 +112,43 @@ ci:
 kind-up:
     #!/usr/bin/env bash
     set -euo pipefail
-    kind create cluster --name pgvs3 --config deploy/kind/cluster.yaml 2>/dev/null || true
-    # Benchmark this checkout's code, not whatever image is lying around.
+    if ! kind get clusters | grep -qx pgvs3; then
+      kind create cluster --name pgvs3 --config deploy/kind/cluster.yaml
+    fi
+    # Benchmark this checkout's code, not whatever image is lying around. The
+    # tag never changes, so restart to pick up the build.
     docker build -q -t {{ IMAGE }}:latest .
     kind load docker-image {{ IMAGE }}:latest --name pgvs3
-    # PG_STORAGE sizes the rows database (20Gi default; 200Gi for 100M-log
-    # search runs — the splits live in PostgreSQL through pgvs3).
-    helm upgrade --install postgres deploy/charts/postgres --namespace pgvs3 --create-namespace \
-      --set storage="${PG_STORAGE:-20Gi}"
-    helm upgrade --install pgvs3 deploy/charts/pgvs3 --namespace pgvs3 \
-      --set image={{ IMAGE }}:latest
+    kubectl create namespace pgvs3 --dry-run=client -o yaml | kubectl apply -f -
+    if [ -n "${PGVS3_DB_SECRET:-}" ]; then
+      # EC2 kind: the Secret points to Aurora; do not deploy another Postgres.
+      kubectl -n pgvs3 get secret "$PGVS3_DB_SECRET" >/dev/null
+      helm upgrade --install pgvs3 deploy/charts/pgvs3 --namespace pgvs3 \
+        --set image={{ IMAGE }}:latest --set-string "urlSecretName=$PGVS3_DB_SECRET"
+    else
+      # Local / CI: the same workloads use a PostgreSQL pod in kind.
+      helm upgrade --install postgres deploy/charts/postgres --namespace pgvs3 \
+        --set storage="${PG_STORAGE:-20Gi}"
+      helm upgrade --install pgvs3 deploy/charts/pgvs3 --namespace pgvs3 \
+        --set image={{ IMAGE }}:latest --set urlSecretName=
+    fi
     helm upgrade --install quickwit deploy/charts/quickwit --namespace pgvs3
-    kubectl -n pgvs3 rollout status statefulset/postgres --timeout 180s
+    kubectl -n pgvs3 rollout restart deployment/pgvs3
+    # ConfigMap changes do not change a Deployment's pod template.
+    kubectl -n pgvs3 rollout restart deployment/quickwit
+    if [ -z "${PGVS3_DB_SECRET:-}" ]; then
+      kubectl -n pgvs3 rollout status statefulset/postgres --timeout 180s
+    fi
     kubectl -n pgvs3 rollout status deployment/pgvs3 --timeout 180s
     kubectl -n pgvs3 rollout status deployment/quickwit --timeout 180s
     echo "kind up. next: just kind-validate && just kind-bench"
 
-# Smoke-test every workload once so a benchmark failure is never "not ready".
+# Verify services and the overwrite regression in the same kind test runner.
 [group('kind')]
 kind-validate:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release -p pgvs3
-    cp target/release/pgvs3 deploy/bench/pgvs3-bin
-    trap 'rm -f deploy/bench/pgvs3-bin' EXIT
-    # Harness sources live in crates/pgvs3; sync so the image cannot drift.
-    cp crates/pgvs3/benchlib.py crates/pgvs3/tpch_bench.py crates/pgvs3/analytics_bench.py deploy/bench/harness/
-    cp crates/pgvs3/queries/*.sql deploy/bench/harness/queries/
-    docker build -q -t kind-bench:latest -f deploy/bench/Dockerfile deploy/bench
-    kind load docker-image kind-bench:latest --name pgvs3
-    # Jobs are immutable: delete so the new image actually runs.
-    kubectl -n pgvs3 delete job bench-validate --ignore-not-found
-    helm upgrade --install kind-bench deploy/charts/kind-bench --namespace pgvs3 \
-      --set image=kind-bench:latest --set suites="{validate}"
-    # Poll: kubectl wait for complete never fails fast on a failed Job.
-    for _ in $(seq 1 150); do
-      s=$(kubectl -n pgvs3 get job bench-validate -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true)
-      case "$s" in *Complete=True*|*Failed=True*) break ;; esac
-      sleep 2
-    done
-    kubectl -n pgvs3 logs job/bench-validate
+    SUITES=validate {{ just_executable() }} kind-bench
 
-# All five suites; QUICK=1 = smoke scale; scale knobs (SF, DOCS, ...) from the environment.
+# Run selected suites sequentially; QUICK=1 is smoke scale.
 [group('kind')]
 kind-bench:
     #!/usr/bin/env bash
@@ -191,33 +162,51 @@ kind-bench:
     docker build -q -t kind-bench:latest -f deploy/bench/Dockerfile deploy/bench
     mkdir -p .tmp/pgvs3
     kind load docker-image kind-bench:latest --name pgvs3
-    # Jobs are immutable: clear stale ones so the fresh image actually runs.
     suites="${SUITES:-pgbench,tpch,click,search,stress}"
-    for suite in ${suites//,/ }; do
-      kubectl -n pgvs3 delete job "bench-$suite" --ignore-not-found >/dev/null 2>&1 || true
-    done
     # Suite knobs flow through the caller's environment to run.sh.
     env_args=()
+    if [ -n "${PGVS3_DB_SECRET:-}" ]; then
+      kubectl -n pgvs3 get secret "$PGVS3_DB_SECRET" >/dev/null
+      env_args+=(--set-string "pgSecretName=$PGVS3_DB_SECRET")
+    fi
     for k in QUICK SCALE CLIENTS SECONDS_RUN SF PASSES PARTS QUERIES DOCS WORKERS WINDOW_FRAC SEARCH_INDEX SEED_GB REQUESTS CONCURRENCY SIZES; do
-      [ -n "${!k:-}" ] && env_args+=(--set-string "suiteEnv.$k=${!k}")
+      if [ -n "${!k:-}" ]; then
+        value=${!k}
+        # Helm parses commas in --set-string as separators unless escaped.
+        value=${value//,/\\,}
+        env_args+=(--set-string "suiteEnv.$k=$value")
+      fi
     done
-    helm upgrade --install kind-bench deploy/charts/kind-bench --namespace pgvs3 \
-      --set image=kind-bench:latest "${env_args[@]}" \
-      --set suites="{$suites}"
     : > .tmp/pgvs3/kind-bench.jsonl
-    # Smoke runs are minutes, full runs can be tens of minutes per suite.
+    # Only one Job runs at a time: they share a database and a CI runner.
     wait=2700; case "${QUICK:-}" in 1 | true) wait=300 ;; esac
     for suite in ${suites//,/ }; do
+      case "$suite" in validate|pgbench|tpch|click|search|stress) ;; *) echo "unknown suite: $suite" >&2; exit 2 ;; esac
       echo "=== $suite ==="
-      # Poll: kubectl wait for complete never fails fast on a failed Job.
+      # Jobs are immutable: a new image needs a new Job, even with :latest.
+      kubectl -n pgvs3 delete job "bench-$suite" --ignore-not-found --wait=true >/dev/null
+      helm upgrade --install kind-bench deploy/charts/kind-bench --namespace pgvs3 \
+        --set image=kind-bench:latest "${env_args[@]}" --set "suites={$suite}"
       waited=0
       while :; do
         s=$(kubectl -n pgvs3 get job "bench-$suite" -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true)
         case "$s" in *Complete=True*|*Failed=True*) break ;; esac
-        [ "$waited" -ge "$wait" ] && { echo "TIMEOUT $suite"; break; }
+        if [ "$waited" -ge "$wait" ]; then
+          echo "TIMEOUT $suite after ${wait}s" >&2
+          kubectl -n pgvs3 describe job "bench-$suite" >&2
+          exit 1
+        fi
         sleep 2; waited=$((waited + 2))
       done
-      kubectl -n pgvs3 logs job/bench-$suite 2>/dev/null | tee /tmp/kind-$suite.log
+      kubectl -n pgvs3 logs "job/bench-$suite" | tee "/tmp/kind-$suite.log"
+      if [[ "$s" != *Complete=True* ]]; then
+        echo "FAILED $suite: $s" >&2
+        exit 1
+      fi
+      if [ "$suite" != validate ] && ! grep -q '^{.*}$' "/tmp/kind-$suite.log"; then
+        echo "FAILED $suite: no result JSON" >&2
+        exit 1
+      fi
       grep '^{.*}$' /tmp/kind-$suite.log >> .tmp/pgvs3/kind-bench.jsonl || true
     done
     echo "----"
@@ -226,13 +215,7 @@ kind-bench:
 # pgvs3 ceiling: concurrency sweep; reports aggregate MiB/s and req/s.
 [group('kind')]
 kind-stress concurrency="1,8,32,64" requests="4000":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    helm upgrade --install kind-bench deploy/charts/kind-bench --namespace pgvs3 \
-      --set image=kind-bench:latest --set suites="{stress}" \
-      --set-string 'extraArgs.CONCURRENCY={{ concurrency }}' --set-string 'extraArgs.REQUESTS={{ requests }}'
-    kubectl -n pgvs3 wait --for=condition=complete job/bench-stress --timeout=900s 2>/dev/null || true
-    kubectl -n pgvs3 logs job/bench-stress 2>/dev/null | tee -a .tmp/pgvs3/kind-stress.log
+    SUITES=stress CONCURRENCY='{{ concurrency }}' REQUESTS='{{ requests }}' {{ just_executable() }} kind-bench
 
 # Tear down the kind cluster.
 [group('kind')]
@@ -259,273 +242,43 @@ clickbench stack="lake-s3" passes="3" extra="":
 spatialbench sf="10" stack="lake-s3" passes="3" extra="":
     uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/analytics_bench.py --bench spatial --sf {{ sf }} --stack {{ stack }} --download --load --passes {{ passes }} {{ extra }}
 
-# Run a benchmark on the AWS rig; results land in .tmp/pgvs3/rig-out/.
+# Stand up an EC2 kind rig and Aurora Serverless v2 I/O-Optimized.
 [group('rig')]
-rig mode="quick" target="all":
-    #!/usr/bin/env bash
-    # Modes: `load [quick|full|all]` writes the datasets (once per storage
-    # layout); `quick`, `full`, `micro` and `verify` only read them.
-    # BENCH_EXTRA='--set name=value' passes DuckDB settings to the harness.
-    set -euo pipefail
-    case {{ quote(mode) }} in
-      load | quick | full | micro | verify) ;;
-      *) echo "unknown mode {{ quote(mode) }}: load | quick | full | micro | verify"; exit 2 ;;
-    esac
-    ip=$({{ just_executable() }} _rig-ip)
-    ssh=(ssh -i "$RIG_SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 "$RIG_SSH_USER@$ip")
-    echo "rig: $ip (mode: {{ mode }})"
-    # Ship the repo, and .env (the rig side needs the Aurora login), into ~.
-    tar czf - Cargo.toml Cargo.lock .cargo crates mise.toml justfile .env | "${ssh[@]}" 'tar xzf -'
-    # Build on the rig (Fedora builds do not run on AL2023), only when the Rust
-    # inputs changed: a fat-LTO build takes ~1.5 min.
-    hash=$(find crates Cargo.toml Cargo.lock .cargo -type f \( -name '*.rs' -o -name Cargo.toml \
-             -o -name Cargo.lock -o -name schema.sql -o -path '.cargo/*' \) -print0 \
-           | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
-    "${ssh[@]}" "if [ -x target/release/pgvs3 ] && [ \"\$(cat .pgvs3-build 2>/dev/null)\" = $hash ]; then
-        echo 'binary current ($hash)'
-      elif touch crates/pgvs3/src/lib.rs && ~/.cargo/bin/cargo build --release -p pgvs3 >/tmp/pgvs3-build.log 2>&1; then
-        tail -1 /tmp/pgvs3-build.log; echo $hash > .pgvs3-build
-      else
-        tail -20 /tmp/pgvs3-build.log; exit 1
-      fi"
-    # nohup: the job outlives this SSH session (`just rig-wait` re-attaches).
-    "${ssh[@]}" "rm -f BENCH.DONE; BENCH_EXTRA=$(printf %q "${BENCH_EXTRA:-}") \
-      nohup ~/.local/bin/mise exec -- just _rig-run {{ quote(mode) }} {{ quote(target) }} \
-      >bench-driver-{{ mode }}-\$(date +%H%M%S).log 2>&1 & echo started"
-    {{ just_executable() }} rig-wait
+rig-up:
+    bash deploy/kind/rig.sh up
 
-# Wait for the rig job to finish, then fetch its results.
+# Ship this checkout, refresh the Aurora Secret and deploy the kind charts.
 [group('rig')]
-rig-wait:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    ip=$({{ just_executable() }} _rig-ip)
-    ssh=(ssh -i "$RIG_SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 "$RIG_SSH_USER@$ip")
-    echo "waiting for the rig job ..."
-    until "${ssh[@]}" 'test -f BENCH.DONE' 2>/dev/null; do sleep 30; done
-    mkdir -p .tmp/pgvs3/rig-out
-    scp -i "$RIG_SSH_KEY" -o StrictHostKeyChecking=accept-new -q "$RIG_SSH_USER@$ip:bench-out/*" .tmp/pgvs3/rig-out/ || true
-    "${ssh[@]}" 'cat "$(ls -t bench-driver-*.log | head -1)"'
-    echo "results in .tmp/pgvs3/rig-out/"
+rig-sync:
+    bash deploy/kind/rig.sh sync
 
-# Stop the rig job and its gateway (safe any time).
+# Run the same smoke gate as CI, but with Aurora outside kind.
 [group('rig')]
-rig-stop:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    ssh -i "$RIG_SSH_KEY" -o StrictHostKeyChecking=accept-new "$RIG_SSH_USER@$({{ just_executable() }} _rig-ip)" \
-      "pkill -f '[_]rig-run'; pkill -x uv; pkill -x python; pkill -x pgvs3; rm -f BENCH.DONE /tmp/pgvs3-bench.lock; echo stopped"
+rig-validate:
+    bash deploy/kind/rig.sh validate
 
-# Open a shell on the rig.
+# Run the kind benchmark suites on EC2; SUITES, QUICK, SF, DOCS, etc. work here too.
+[group('rig')]
+rig-bench:
+    bash deploy/kind/rig.sh bench
+
+# Inspect only this rig's stack and endpoints (no credentials).
+[group('rig')]
+rig-status:
+    bash deploy/kind/rig.sh status
+
+# Download the latest results even if a remote session disconnected.
+[group('rig')]
+rig-results:
+    bash deploy/kind/rig.sh results
+
+# Open an SSH shell on the rig (restricted to the current operator IP).
 [group('rig')]
 rig-ssh:
-    ssh -i "$RIG_SSH_KEY" -o StrictHostKeyChecking=accept-new "$RIG_SSH_USER@$({{ just_executable() }} _rig-ip)"
+    bash deploy/kind/rig.sh ssh
 
-# Delete the rig: every Aurora instance, the cluster, the EC2 instance, the key pair.
+# Delete only this rig's stack and SSH key pair; stops ongoing AWS charges.
 [group('rig')]
-[confirm("Delete the AWS rig (Aurora cluster, EC2 instance, key pair)?")]
+[confirm("Terminate the pgvs3 EC2 kind rig AND its Aurora Serverless cluster?")]
 rig-teardown:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    aws=(aws --profile "$RIG_AWS_PROFILE" --region "$RIG_AWS_REGION")
-    for db in $("${aws[@]}" rds describe-db-clusters --db-cluster-identifier "$RIG_DB_CLUSTER" \
-                  --query 'DBClusters[0].DBClusterMembers[].DBInstanceIdentifier' --output text); do
-      "${aws[@]}" rds delete-db-instance --db-instance-identifier "$db"  # snapshots/backups are the cluster's
-    done
-    "${aws[@]}" rds delete-db-cluster --db-cluster-identifier "$RIG_DB_CLUSTER" --skip-final-snapshot
-    "${aws[@]}" ec2 terminate-instances --instance-ids "$RIG_INSTANCE"
-    "${aws[@]}" ec2 delete-key-pair --key-name "$RIG_KEY_PAIR"
-    echo "deleted; check: aws --profile $RIG_AWS_PROFILE rds describe-db-clusters --db-cluster-identifier $RIG_DB_CLUSTER"
-
-# The rig's public IP. It changes on stop/start; without an AWS session (e.g.
-# an expired SSO login) fall back to the last one seen.
-_rig-ip:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    : "${RIG_INSTANCE:?rig settings missing: copy .env.example to .env}"
-    mkdir -p .tmp/pgvs3
-    if ip=$(aws ec2 describe-instances --profile "$RIG_AWS_PROFILE" --region "$RIG_AWS_REGION" \
-              --instance-ids "$RIG_INSTANCE" --query 'Reservations[0].Instances[0].PublicIpAddress' \
-              --output text 2>/dev/null); then
-      echo "$ip" > .tmp/pgvs3/rig-ip
-    else
-      ip=$(cat .tmp/pgvs3/rig-ip)
-      echo "(aws unavailable, using the last rig IP; refresh: aws sso login --profile $RIG_AWS_PROFILE)" >&2
-    fi
-    echo "$ip"
-
-# Runs on the rig, in ~ (where `just rig` unpacks the repo): one benchmark
-# mode. Every run gets a fresh gateway and DuckDB; ~/BENCH.DONE marks the end.
-_rig-run mode target="all":
-    #!/usr/bin/env bash
-    set -uo pipefail
-    exec 9>/tmp/pgvs3-bench.lock
-    flock -n 9 || { echo "another rig job is running"; exit 3; }
-    mode={{ quote(mode) }}
-    target={{ quote(target) }}
-    pg="postgres://$RIG_PG_USER:$RIG_PG_PASSWORD@$RIG_PG_HOST:5432"
-    base="$pg/pgvs3_bench?sslmode=require"
-    catalog() { echo "dbname=$1 host=$RIG_PG_HOST user=$RIG_PG_USER password=$RIG_PG_PASSWORD sslmode=require"; }
-    mkdir -p bench-out bench-data
-    rm -f BENCH.DONE
-    d=$HOME/bench-data
-    click=(--bench click --stack lake-s3 --src-dir "$d/clickbench" --local-dir "$d/click-lake-local"
-           --plain-db "$d/click-plain.duckdb" --scratch-db "$d/scratch-click.duckdb")
-    spatial=(--bench spatial --stack lake-s3 --src-dir "$d/spatialbench" --local-dir "$d/spatial-lake-local"
-             --plain-db "$d/spatial-plain.duckdb" --scratch-db "$d/scratch-spatial.duckdb")
-    spatial_tables=trip,customer,driver,vehicle,zone,building
-    # Read runs: 3 passes with DuckDB's file cache off, so every pass reads
-    # through the gateway.
-    reads=(--views-only --passes 3 --no-file-cache)
-
-    s3() { curl -sf --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only "$@"; }
-
-    fresh_catalogs() {
-      for db in "$@"; do
-        psql "$pg/postgres?sslmode=require" -qc "DROP DATABASE IF EXISTS $db" >/dev/null
-        psql "$pg/postgres?sslmode=require" -qc "CREATE DATABASE $db" >/dev/null
-      done
-    }
-
-    gw_start() {  # a fresh gateway on :8014
-      pkill -x pgvs3
-      sleep 1
-      nohup ./target/release/pgvs3 --url "$base" serve --addr 127.0.0.1:8014 >/tmp/s-bench.log 2>&1 &
-      for _ in $(seq 1 20); do
-        curl -s -o /dev/null --max-time 1 http://127.0.0.1:8014/ && return 0
-        sleep 0.5
-      done
-      echo "gateway failed to start"
-      tail -5 /tmp/s-bench.log
-      exit 1
-    }
-
-    bench() {  # label, harness args...
-      local label=$1
-      shift
-      echo "=== $label${BENCH_EXTRA:+ [$BENCH_EXTRA]} $(date -u +%T) ==="
-      gw_start
-      # shellcheck disable=SC2086  # BENCH_EXTRA splits into arguments on purpose
-      uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/analytics_bench.py "$@" ${BENCH_EXTRA:-} \
-        --out "$HOME/bench-out/$label.json" 2>&1 | tail -8
-      echo "--- $label stats:"
-      s3 http://127.0.0.1:8014/_pgvs3/stats
-      echo
-    }
-
-    # A second gateway (:8015, its own metadata cache) and a fresh DuckDB must
-    # see the same tables and rows: any worker can join the same catalog and
-    # storage and see the same state.
-    multi_check() {  # label, catalog, data path, tables
-      echo "=== multi-setup check: $1 ==="
-      nohup ./target/release/pgvs3 --url "$base" serve --addr 127.0.0.1:8015 >/tmp/s-bench2.log 2>&1 &
-      local gw2=$!
-      sleep 1
-      uv run --with "duckdb==$DUCKDB_PY_PRE" python - "$2" "$3" "$4" <<'PY' || echo "multi-setup $1: FAIL"
-    import sys
-    import duckdb
-
-    cat, data_path, tables = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
-    con = duckdb.connect()
-    for e in ("postgres", "httpfs", "ducklake"):
-        con.sql(f"INSTALL {e}")
-        con.sql(f"LOAD {e}")
-    con.sql("SET s3_endpoint='127.0.0.1:8015'")
-    con.sql("SET s3_use_ssl=false")
-    con.sql("SET s3_url_style='path'")
-    con.sql("SET s3_access_key_id='cachebench'")
-    con.sql("SET s3_secret_access_key='cachebench-local-only'")
-    con.sql(f"ATTACH 'ducklake:postgres:{cat}' AS lake (DATA_PATH '{data_path}')")
-    names = sorted(r[0] for r in con.sql("SHOW TABLES FROM lake").fetchall())
-    print("tables:", ",".join(names))
-    for t in tables:
-        print(f"  {t}: {con.sql(f'SELECT count(*) FROM lake.{t}').fetchone()[0]} rows")
-    row = con.sql(f"SELECT * FROM lake.{tables[0]} LIMIT 1").fetchall()
-    print("multi-setup:", "PASS" if names and row else "FAIL")
-    PY
-      kill $gw2 2>/dev/null || true
-    }
-
-    # GET content check: whole objects against their sha256 ETag (single-file
-    # objects) and against odd-sized ranged reads, which cross row, chunk, part
-    # and file boundaries at other offsets than the whole GET.
-    verify() {
-      gw_start
-      local step=$((3 * 1024 * 1024 + 12345)) fail=0 key size etag single whole ranged ok off
-      while IFS='|' read -r key size etag single; do
-        whole=$(s3 "http://127.0.0.1:8014/lake/$key" | sha256sum | cut -c1-64)
-        ranged=$(for ((off = 0; off < size; off += step)); do
-                   s3 -H "Range: bytes=$off-$((off + step - 1))" "http://127.0.0.1:8014/lake/$key"
-                 done | sha256sum | cut -c1-64)
-        ok=ok
-        [ "$whole" = "$ranged" ] || ok=RANGED-MISMATCH
-        if [ "$single" = t ] && [ "$whole" != "$etag" ]; then ok=ETAG-MISMATCH; fi
-        [ "$ok" = ok ] || fail=1
-        printf '%-15s %11s  %s\n' "$ok" "$size" "$key"
-      done < <(psql "$base" -XqAt -c "
-        (SELECT key, size, encode(etag, 'hex'), parts IS NULL FROM s3p.objects
-          WHERE bucket = 'lake' AND parts IS NOT NULL ORDER BY size DESC LIMIT 2)
-        UNION ALL
-        (SELECT key, size, encode(etag, 'hex'), parts IS NULL FROM s3p.objects
-          WHERE bucket = 'lake' AND parts IS NULL ORDER BY size DESC LIMIT 2)")
-      if [ "$fail" = 0 ]; then echo "verify: PASS"; else echo "verify: FAIL"; fi
-    }
-
-    case $mode in
-    load)
-      if [ "$target" != full ]; then
-        fresh_catalogs ducklake_click_lake_s3 ducklake_spatial_lake_s3
-        bench load-click "${click[@]}" --catalog "$(catalog ducklake_click_lake_s3)" \
-          --data-path s3://lake/run-31/ --parts 10 --download --load --passes 0
-        multi_check click "$(catalog ducklake_click_lake_s3)" s3://lake/run-31/ hits
-        # sf1, not sf0.1: at sf0.1 the generator emits no buildings and DuckLake
-        # inlines the small tables into the catalog (no gateway traffic at all).
-        bench load-spatial "${spatial[@]}" --catalog "$(catalog ducklake_spatial_lake_s3)" \
-          --data-path s3://lake/run-32/ --sf 1 --download --load --passes 0
-        multi_check spatial "$(catalog ducklake_spatial_lake_s3)" s3://lake/run-32/ "$spatial_tables"
-      fi
-      if [ "$target" != quick ]; then
-        fresh_catalogs ducklake_click_full ducklake_spatial_full
-        bench load-click-full "${click[@]}" --catalog "$(catalog ducklake_click_full)" \
-          --data-path s3://lake/run-33/ --download --load --passes 0
-        multi_check click-full "$(catalog ducklake_click_full)" s3://lake/run-33/ hits
-        bench load-spatial-full "${spatial[@]}" --catalog "$(catalog ducklake_spatial_full)" \
-          --data-path s3://lake/run-34/ --sf 10 --download --load --passes 0
-        multi_check spatial-full "$(catalog ducklake_spatial_full)" s3://lake/run-34/ "$spatial_tables"
-      fi
-      ;;
-    quick)
-      # SpatialBench Q1-Q7: Q8-Q12 are CPU-bound spatial joins, no read signal.
-      bench click-quick "${click[@]}" "${reads[@]}" --catalog "$(catalog ducklake_click_lake_s3)" \
-        --data-path s3://lake/run-31/ --query-timeout 300
-      bench spatial-quick "${spatial[@]}" "${reads[@]}" --catalog "$(catalog ducklake_spatial_lake_s3)" \
-        --data-path s3://lake/run-32/ --sf 1 --queries 1-7 --query-timeout 120
-      ;;
-    full)
-      bench click-full "${click[@]}" "${reads[@]}" --catalog "$(catalog ducklake_click_full)" \
-        --data-path s3://lake/run-33/ --query-timeout 600
-      bench spatial-full "${spatial[@]}" "${reads[@]}" --catalog "$(catalog ducklake_spatial_full)" \
-        --data-path s3://lake/run-34/ --sf 10 --queries 1-7 --query-timeout 600
-      ;;
-    micro)
-      # The read path without an engine: GET latency/throughput over the loaded
-      # objects, plus the direct-PostgreSQL floor.
-      gw_start
-      ./target/release/pgvs3 --url "$base" bench --endpoint http://127.0.0.1:8014 --bucket lake \
-        --requests 2000 --sizes 65536,262144,1048576,8388608,67108864 --concurrency 1,8,32 2>&1 \
-        | tee bench-out/micro.txt
-      echo "--- micro stats:"
-      s3 http://127.0.0.1:8014/_pgvs3/stats
-      echo
-      ;;
-    verify)
-      verify
-      ;;
-    *)
-      echo "unknown mode: $mode"
-      ;;
-    esac
-    pkill -x pgvs3
-    cp /tmp/s-bench.log bench-out/gateway-last.log 2>/dev/null
-    touch BENCH.DONE
-    echo DONE
+    bash deploy/kind/rig.sh teardown

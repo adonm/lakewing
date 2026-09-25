@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: pgvs3 benchmark rig - private kind on EC2 with Aurora Serverless v2 I/O-Optimized
+Parameters:
+  DbSubnetA:
+    Type: AWS::EC2::Subnet::Id
+  DbSubnetB:
+    Type: AWS::EC2::Subnet::Id
+  SshSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Approved private-network SSH group for the benchmark instance
+  DbClientSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Approved DB client group; the Aurora group already allows it on port 5432
+  ClusterSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Approved Aurora group with 5432 inbound from the DB client group
+  AmiId:
+    Type: AWS::EC2::Image::Id
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Type: String
+    Default: m7i.4xlarge
+  RootVolumeGiB:
+    Type: Number
+    Default: 250
+  EngineVersion:
+    Type: String
+    Default: '18.6'
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the pgvs3 kind rig
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-db-subnets' }
+        - { Key: Project, Value: pgvs3 }
+  Cluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Ref AWS::StackName
+      Engine: aurora-postgresql
+      EngineVersion: !Ref EngineVersion
+      DatabaseName: pgvs3
+      MasterUsername: pgvs3admin
+      ManageMasterUserPassword: true
+      StorageType: aurora-iopt1
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref ClusterSecurityGroupId]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 2
+        MaxCapacity: 16
+      Tags:
+        - { Key: Name, Value: !Ref AWS::StackName }
+        - { Key: Project, Value: pgvs3 }
+  Writer:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-writer'
+      DBClusterIdentifier: !Ref Cluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      AvailabilityZone: !GetAtt Host.AvailabilityZone
+      PubliclyAccessible: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-writer' }
+        - { Key: Project, Value: pgvs3 }
+  Host:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref DbSubnetA
+      SecurityGroupIds: [!Ref SshSecurityGroupId, !Ref DbClientSecurityGroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeGiB
+            VolumeType: gp3
+            Iops: 6000
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          # AL2023 includes curl-minimal; installing curl conflicts with it.
+          dnf install -y docker git tar gzip unzip gcc make rsync
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          sudo -iu ec2-user bash -c 'curl -fsSL https://mise.run | sh'
+          touch /var/tmp/pgvs3-bootstrap-ready
+      Tags:
+        - { Key: Name, Value: !Ref AWS::StackName }
+        - { Key: Project, Value: pgvs3 }
+Outputs:
+  InstanceId:
+    Value: !Ref Host
+  PrivateIp:
+    Value: !GetAtt Host.PrivateIp
+  DbEndpoint:
+    Value: !GetAtt Cluster.Endpoint.Address
+  DbClusterIdentifier:
+    Value: !Ref Cluster

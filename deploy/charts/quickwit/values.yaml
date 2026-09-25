@@ -37,5 +37,5 @@ ingestApiConfig:
   shard_throughput_limit: 20MiB
   shard_burst_limit: 100MiB
 resources:
-  requests: { cpu: 1000m, memory: 8Gi }
+  requests: { cpu: 500m, memory: 2Gi }
   limits: { memory: 16Gi }

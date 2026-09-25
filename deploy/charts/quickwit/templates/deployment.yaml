@@ -25,6 +25,10 @@ spec:
             - { containerPort: 7281, name: grpc }
             - { containerPort: 4317, name: otlp-grpc }
             - { containerPort: 4318, name: otlp-http }
+          readinessProbe:
+            httpGet: { path: /api/v1/cluster, port: rest }
+            periodSeconds: 5
+            failureThreshold: 24
           volumeMounts:
             - { name: config, mountPath: /etc/quickwit }
           resources:

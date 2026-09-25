@@ -51,7 +51,10 @@ def load(con, stack: str, sf: float) -> float:
 def run_pass(con, queries) -> dict:
     times = {}
     for q in queries:
-        times[q] = benchlib.run_sql(con, f"PRAGMA tpch({q})")[0]
+        seconds, error = benchlib.run_sql(con, f"PRAGMA tpch({q})")
+        if error:
+            raise RuntimeError(f"TPC-H Q{q}: {error}")
+        times[q] = seconds
     return times
 
 

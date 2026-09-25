@@ -1,8 +1,10 @@
 replicas: 1
 image: postgres:18
 storage: 20Gi
+# Requests are small so the stack schedules on a 16 GiB CI runner; the limits
+# are the headroom a real run uses.
 resources:
-  requests: { cpu: 500m, memory: 2Gi }
+  requests: { cpu: 250m, memory: 1Gi }
   limits: { memory: 8Gi }
 # Two logical databases: the object rows and DuckLake's catalog (PostgreSQL
 # is the simple single-client-plus-shared-readers catalog). Quickwit's

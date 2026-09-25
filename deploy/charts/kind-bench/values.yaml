@@ -5,6 +5,9 @@ image: kind-bench:latest
 pgHost: postgres
 pgUser: postgres
 pgPassword: postgres
+# An external database provides `host`, `user`, `password`, `url`, and
+# `sslmode` from this Secret; local kind uses the values above instead.
+pgSecretName: ""
 quickwitUrl: http://quickwit:7280
 pgvs3Url: http://pgvs3:8014
 # One Job per suite; `just kind-bench` runs them and concatenates the JSON
@@ -20,5 +23,5 @@ suites:
   - search
   - stress
 resources:
-  requests: { cpu: 500m, memory: 2Gi }
+  requests: { cpu: 500m, memory: 1Gi }
   limits: { memory: 8Gi }

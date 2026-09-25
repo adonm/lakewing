@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suite runner for the kind benchmarks. One suite per invocation; all four
+# Suite runner for the kind benchmarks. One suite per invocation; all five
 # write a JSON line to stdout (the `just kind-bench` recipe concatenates them
 # into .tmp/pgvs3/kind-bench.jsonl).
 #
@@ -12,13 +12,14 @@ set -euo pipefail
 PG_HOST=${PG_HOST:-postgres}
 PG_USER=${PG_USER:-postgres}
 PG_PASSWORD=${PG_PASSWORD:-postgres}
-PG_URL="postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:5432/pgvs3"
+PG_URL=${PG_URL:-"postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:5432/pgvs3"}
 # pgbench authenticates with PGPASSWORD, not the URL.
 export PGPASSWORD="$PG_PASSWORD"
 # The harness talks to the gateway directly (DuckDB s3_endpoint, stats route).
-export PGVS3_ENDPOINT=${PGVS3_ENDPOINT:-${PGVS3_URL#*://}}
 QW_URL=${QUICKWIT_URL:-http://quickwit:7280}
 PGVS3_URL=${PGVS3_URL:-http://pgvs3:8014}
+export PGVS3_URL
+export PGVS3_ENDPOINT=${PGVS3_ENDPOINT:-${PGVS3_URL#*://}}
 # One DuckLake data root: the catalog records its data path at first attach
 # and every later attach must match it.
 LAKE_ROOT=${LAKE_ROOT:-s3://lake/v/}
@@ -57,20 +58,29 @@ validate)
     if out=$("$@" 2>&1); then echo "PASS  $name"; pass=$((pass + 1));
     else echo "FAIL  $name: $(echo "$out" | tail -1)"; fail=$((fail + 1)); fi
   }
-  # urllib, not curl: the bench image is python:3.12-slim, which may not
-  # carry curl.
   http_ok() {
     python3 -c "import sys,urllib.request as u
 try: sys.exit(0 if u.urlopen(sys.argv[1], timeout=10).status == 200 else 1)
 except Exception: sys.exit(1)" "$1"
   }
   check "postgres (pg_isready)" pg_isready -h "$PG_HOST" -U "$PG_USER"
+  ensure_catalog() {
+    local exists
+    exists=$(psql -h "$PG_HOST" -U "$PG_USER" -d pgvs3 -tAc \
+      "SELECT 1 FROM pg_database WHERE datname = 'ducklake_catalog'")
+    if [ "$exists" != 1 ]; then
+      psql -v ON_ERROR_STOP=1 -h "$PG_HOST" -U "$PG_USER" -d pgvs3 \
+        -c 'CREATE DATABASE ducklake_catalog'
+    fi
+  }
+  check "ducklake (catalog database)" ensure_catalog
   # /healthz, not /_pgvs3/stats: the stats route is behind SigV4 (s3s
   # rejects unsigned GETs with 403), so it is not a probe path.
   check "pgvs3 (healthz)" http_ok "$PGVS3_URL/healthz"
   # Quickwit's REST API has no /healthz; /api/v1/cluster is the live node view.
   check "quickwit (search API)" http_ok "$QW_URL/api/v1/cluster"
   check "ducklake (attach + read)" python3 /bench/suites/duck_check.py
+  check "pgvs3 (overwrite self-heal)" python3 /bench/suites/overwrite_check.py
   echo "validate: $pass passed, $fail failed"
   [ "$fail" = 0 ]
   ;;
@@ -85,7 +95,7 @@ pgbench)
   # Init failure surfaces (set -e) instead of leaving an empty database to
   # time; the run's output is captured even on failure so the log says why.
   pgbench -h "$PG_HOST" -U "$PG_USER" -i -s "$scale" pgvs3 >/dev/null
-  out=$(pgbench -h "$PG_HOST" -U "$PG_USER" -c "$clients" -j "$clients" -T "$seconds" pgvs3 2>&1) || true
+  out=$(pgbench -h "$PG_HOST" -U "$PG_USER" -c "$clients" -j "$clients" -T "$seconds" pgvs3 2>&1)
   echo "$out"
   tps=$(echo "$out" | sed -n 's/.*tps = \([0-9.]*\).*/\1/p' | tail -1)
   lat=$(echo "$out" | sed -n 's/.*latency average = \([0-9.]*\) ms.*/\1/p' | tail -1)
@@ -100,7 +110,7 @@ tpch)
   # PostgreSQL, data = pgvs3). --passes 2 = one cold, one warm.
   python3 /bench/harness/tpch_bench.py --stack lake-s3 --sf "${SF:-10}" --load --passes "${PASSES:-2}" \
     --data-path "$LAKE_ROOT" \
-    --catalog "dbname=ducklake_catalog host=$PG_HOST user=$PG_USER password=$PG_PASSWORD" \
+    --catalog "dbname=ducklake_catalog host=$PG_HOST user=$PG_USER sslmode=${PGSSLMODE:-prefer}" \
     --out "$OUT/tpch.json"
   cat "$OUT/tpch.json"
   ;;
@@ -111,7 +121,7 @@ click)
   # (typed like the full set) so the run fits the budget; full is 13.8 GiB.
   python3 /bench/harness/analytics_bench.py --bench click --stack lake-s3 --download --load \
     --parts "${PARTS:-10}" --passes "${PASSES:-2}" \
-    --catalog "dbname=ducklake_catalog host=$PG_HOST user=$PG_USER password=$PG_PASSWORD" \
+    --catalog "dbname=ducklake_catalog host=$PG_HOST user=$PG_USER sslmode=${PGSSLMODE:-prefer}" \
     --data-path "$LAKE_ROOT" \
     --out "$OUT/click.json"
   cat "$OUT/click.json"

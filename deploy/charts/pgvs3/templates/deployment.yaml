@@ -16,7 +16,12 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: PGVS3_URL
+              {{- if .Values.urlSecretName }}
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.urlSecretName | quote }}, key: url }
+              {{- else }}
               value: {{ .Values.url | quote }}
+              {{- end }}
             - name: PGVS3_ACCESS_KEY
               value: {{ .Values.accessKey | quote }}
             - name: PGVS3_SECRET_KEY
@@ -26,8 +31,12 @@ spec:
             - name: PGVS3_POOL_MIN
               value: {{ .Values.poolMin | quote }}
           ports: [{ containerPort: 8014, name: s3 }]
-          # Health is the stats route: cheap, and it proves the pool is
-          # reachable (the gateway connects lazily).
+          # Starting a warm pool over TLS to Aurora can take longer than a
+          # local kind connection. Do not apply liveness until it is serving.
+          startupProbe:
+            httpGet: { path: /healthz, port: 8014 }
+            periodSeconds: 5
+            failureThreshold: 36
           readinessProbe:
             httpGet: { path: /healthz, port: 8014 }
             initialDelaySeconds: 3

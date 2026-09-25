@@ -19,10 +19,9 @@ Needs [mise](https://mise.jdx.dev/) and Docker (or any PostgreSQL 13+: pass
 `--url`).
 
 ```sh
-just setup    # toolchain (rust, just, python, uv) + cargo fetch
-just dev-db   # PostgreSQL 18 in Docker
-just smoke    # build, seed, serve; ranged GET byte for byte, then again
-              # after an overwrite behind the gateway (the cache must heal)
+just setup    # toolchain (rust, just, python, uv, kind, helm, kubectl) + cargo fetch
+just dev-db   # PostgreSQL 18 in Docker, for running the gateway by hand
+just smoke    # the tests: kind cluster up, every workload once at smoke scale
 ```
 
 Run the gateway (SigV4 key `cachebench` / `cachebench-local-only` unless you
@@ -190,6 +189,10 @@ What the code says and the measurements confirm:
 
 ## Benchmarks
 
+Testing lives here too: `just smoke` is `kind-up`, the validate suite and a
+smoke-scale `kind-bench`, and CI runs exactly that (`just ci` = fmt, clippy,
+build, tests, smoke). One stack, one way to be wrong.
+
 ### The kind stack (local or EC2)
 
 `just kind-up && just kind-validate && just kind-bench` brings up one cluster
@@ -219,18 +222,40 @@ PostgreSQL is stated once in `deploy/charts/postgres/values.yaml`
 `.tmp/pgvs3/kind-bench.jsonl`, one line per measurement; the full records are
 in the suite job logs.
 
-### DuckLake and the GET matrix (local)
+### Harness entry points (development)
 
-`just clickbench`, `just spatialbench sf=10` and `just tpch sf=10` run
-DuckLake through the gateway against a local (or any) PostgreSQL;
-`just seed && just micro` is the GET latency/throughput matrix. Pass harness
-arguments through `extra='--set name=value'` for A/B runs.
+For working on the gateway or the harness without a cluster: `just dev-db`
+runs a plain PostgreSQL, `just seed && just micro` is the GET matrix, and
+`just clickbench`, `just spatialbench sf=10` and `just tpch sf=10` drive the
+DuckLake harnesses directly (pass arguments through
+`extra='--set name=value'` for A/B runs).
 
-### AWS rig (dormant)
+### EC2 rig (kind with external Aurora PostgreSQL)
 
-The rig scripts remain: `just rig mode=load|quick|full|micro|verify`,
-`rig-wait`, `rig-ssh`, `rig-stop`, `rig-teardown` (copy `.env.example` to
-`.env` first). Results land in `.tmp/pgvs3/rig-out/`.
+CI and a laptop use in-kind PostgreSQL. The EC2 rig runs **the same kind
+charts and benchmark Jobs**, but pgvs3's object database and DuckLake's
+catalog are two logical databases on **Aurora PostgreSQL 18.6 Serverless v2,
+I/O-Optimized**. Quickwit remains single-node with its metastore and index
+splits on pgvs3's S3 endpoint. This separates Aurora round trips and I/O from
+the kind host while retaining the CI workload shape.
+
+Configure the rig in the ignored `.env` (see `.env.example`) and authenticate
+with the selected AWS profile before running the commands below.
+
+```sh
+just rig-up                       # tagged CloudFormation stack; sync, deploy, validate
+just rig-validate                 # CI's kind smoke gate against Aurora
+SUITES=tpch,click just rig-bench  # or run all five suites with just rig-bench
+QUICK=1 just rig-bench            # smoke-scale benchmark
+just rig-results                  # download latest JSONL after a disconnected run
+just rig-status                   # stack status and endpoints
+just rig-teardown                 # terminates the rig and its related resources
+```
+
+The rig uses an m7i.4xlarge (16 vCPU, 64 GiB), a 250 GiB gp3 volume and
+Aurora scaling from 2 to 16 ACUs. Results are copied to
+`.tmp/pgvs3/rig-out/`. **Both EC2 and Aurora keep accruing charges** until
+`just rig-teardown`.
 
 ## Potential further gains
 
@@ -297,9 +322,9 @@ containers:
 - `crates/pgvs3/schema.sql`: the storage layout.
 - `crates/pgvs3/*.py` and `queries/`: the benchmark harness (ClickBench,
   SpatialBench, TPC-H).
-- `deploy/`: `kind/cluster.yaml`, `charts/` — `postgres`, `pgvs3`,
-  `quickwit` and `kind-bench` (the benchmark jobs; `duckbench` is the AWS
-  rig's) — and `bench/`, the benchmark image (suite runners plus a copy of
-  the harness, synced at build time).
+- `deploy/`: `kind/cluster.yaml`, `kind/rig.yaml` (the EC2 +
+  Aurora stack), `charts/` — `postgres`, `pgvs3`, `quickwit`, `kind-bench` —
+  and `bench/`, the benchmark image (suite runners plus a copy of the
+  harness, synced at build time).
 - `justfile`: every task (`just` lists them); `.env.example`: the rig's
   settings.

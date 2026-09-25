@@ -230,6 +230,8 @@ def main() -> None:
     print(json.dumps({"suite": bench, "stack": args.stack,
                       "load_s": record.get("load_s"), "rows": record.get("rows"),
                       "pass_s": [round(sum(p["times"].values()), 2) for p in record["passes"]]}))
+    if any(p["errors"] for p in record["passes"]):
+        raise SystemExit(f"{bench}: queries failed (see results above)")
 
 
 if __name__ == "__main__":
