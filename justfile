@@ -54,7 +54,13 @@ dev-db-clean:
 smoke: kind-up
     #!/usr/bin/env bash
     set -euo pipefail
+    {{ just_executable() }} kind-contract
     QUICK=1 SUITES=validate,pgbench,tpch,click,search,stress {{ just_executable() }} kind-bench
+
+# Rust S3 contract against both kind gateway pods and its PostgreSQL storage.
+[group('kind')]
+kind-contract:
+    bash deploy/kind/contract.sh
 
 # Load generator: 8 GiB of 64 MiB objects (a stable set for `just micro`).
 [group('bench')]
@@ -88,8 +94,7 @@ image push="false":
 ci:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo fmt --all --check
-    mbx clippy --workspace --all-targets -- -D warnings
+    hk check --all
     mbx build --release --locked
     mbx test --workspace
     just smoke
@@ -122,6 +127,12 @@ kind-stress concurrency="1,8,32,64" requests="4000":
 [group('kind')]
 kind-down:
     kind delete cluster --name pgvs3
+
+# Pre-release test data only: replace three kind databases, not the cluster.
+[group('kind')]
+[confirm("Discard pgvs3, DuckLake and Quickwit data in this kind cluster?")]
+kind-reset:
+    bash deploy/kind/reset.sh
 
 # TPC-H on DuckLake through the gateway, stable DuckDB (extra = harness args).
 [group('bench')]
@@ -158,6 +169,11 @@ rig-sync:
 rig-validate:
     bash deploy/kind/rig.sh validate
 
+# Rust S3/DB contract against the Aurora-backed two-gateway rig.
+[group('rig')]
+rig-contract:
+    bash deploy/kind/rig.sh contract
+
 # Run the kind benchmark suites on EC2; SUITES, QUICK, SF, DOCS, etc. work here too.
 [group('rig')]
 rig-bench:
@@ -172,6 +188,13 @@ rig-status:
 [group('rig')]
 rig-results:
     bash deploy/kind/rig.sh results
+
+# Pre-release test data only: reset the three rig databases and redeploy.
+[group('rig')]
+[confirm("Discard all pgvs3, DuckLake and Quickwit data on the EC2/Aurora rig?")]
+rig-reset:
+    bash deploy/kind/rig.sh reset
+    bash deploy/kind/rig.sh sync
 
 # Open an SSH shell on the rig (restricted to the current operator IP).
 [group('rig')]

@@ -1,4 +1,4 @@
-image: postgres:18
+image: pgvs3-postgres:18-cron
 storage: 20Gi
 # Requests are small so the stack schedules on a 16 GiB CI runner; the limits
 # are the headroom a real run uses.

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pgvs3-databases
+  name: __JOB_NAME__
   namespace: pgvs3
 spec:
   backoffLimit: 0
@@ -21,16 +21,31 @@ spec:
               valueFrom: { secretKeyRef: { name: __DB_SECRET__, key: password } }
             - name: PGSSLMODE
               valueFrom: { secretKeyRef: { name: __DB_SECRET__, key: sslmode } }
+            - { name: PGVS3_DB_PHASE, value: __PHASE__ }
           command: [sh, -ec]
           args:
             - |
-              for db in pgvs3 ducklake_catalog quickwit_metastore; do
-                exists=$(psql -v ON_ERROR_STOP=1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$db'")
-                if [ "$exists" != 1 ]; then
-                  psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE $db"
+              if [ "$PGVS3_DB_PHASE" = reset ]; then
+                if psql -v ON_ERROR_STOP=1 -d pgvs3 -tAc "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'" | grep -qx 1; then
+                  psql -v ON_ERROR_STOP=1 -d pgvs3 -c "SELECT cron.unschedule(jobid) FROM cron.job WHERE jobname = 'pgvs3-expire-uploads'"
                 fi
-                echo "$db ready"
-              done
+                for db in quickwit_metastore ducklake_catalog pgvs3; do
+                  psql -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE IF EXISTS $db WITH (FORCE)"
+                  psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE $db"
+                  echo "$db reset"
+                done
+              elif [ "$PGVS3_DB_PHASE" = databases ]; then
+                for db in pgvs3 ducklake_catalog quickwit_metastore; do
+                  exists=$(psql -v ON_ERROR_STOP=1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$db'")
+                  if [ "$exists" != 1 ]; then
+                    psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE $db"
+                  fi
+                  echo "$db ready"
+                done
+              else
+                psql -v ON_ERROR_STOP=1 -d pgvs3 -c 'CREATE EXTENSION IF NOT EXISTS pg_cron'
+                psql -v ON_ERROR_STOP=1 -d pgvs3 -c "SELECT cron.schedule('pgvs3-expire-uploads', '* * * * *', 'SELECT s3p.expire_uploads()')"
+              fi
           resources:
             requests: { cpu: 100m, memory: 64Mi }
             limits: { memory: 256Mi }

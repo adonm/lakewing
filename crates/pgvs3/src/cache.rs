@@ -3,10 +3,8 @@
 //!
 //! Coherence: a write through this process updates or drops its entry, and a
 //! GET that finds stale rows (missing) or a stale size (range clamped into a
-//! bogus 416) re-resolves and retries before failing. `HEAD` has no such
-//! check, so after an overwrite it can serve the old metadata until the entry
-//! is evicted — fine for the design center (objects are immutable), wrong for
-//! hot keys.
+//! bogus 416) re-resolves and retries before failing. HEAD fetches metadata
+//! from PostgreSQL to avoid stale existence, size and ETag across gateways.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -85,14 +83,44 @@ pub fn meta_put(bucket: &str, key: &str, meta: Meta) {
 }
 
 pub fn meta_invalidate(bucket: &str, key: &str) {
-    cache()
-        .lock()
-        .unwrap()
-        .map
-        .remove(&(bucket.to_owned(), key.to_owned()));
+    let k = (bucket.to_owned(), key.to_owned());
+    let mut c = cache().lock().unwrap();
+    if c.map.remove(&k).is_some() {
+        c.order.retain(|entry| entry != &k);
+    }
 }
 
 /// Timestamp from a `EXTRACT(EPOCH FROM ...)` float.
 pub fn epoch(secs: f64) -> SystemTime {
     SystemTime::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalidation_does_not_leave_unbounded_fifo_entries() {
+        let bucket = "test-cache-invalidation";
+        let key = "same-key";
+        for _ in 0..1000 {
+            meta_put(
+                bucket,
+                key,
+                Meta {
+                    size: 0,
+                    etag: Vec::new(),
+                    created_at: SystemTime::UNIX_EPOCH,
+                    file_id: 0,
+                    parts: None,
+                    part_ends: None,
+                },
+            );
+            meta_invalidate(bucket, key);
+        }
+        let c = cache().lock().unwrap();
+        let k = (bucket.to_owned(), key.to_owned());
+        assert!(!c.map.contains_key(&k));
+        assert!(!c.order.contains(&k));
+    }
 }

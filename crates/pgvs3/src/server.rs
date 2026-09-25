@@ -1,5 +1,5 @@
 //! The S3 service: `s3s` REST/SigV4 layer over `db::` PostgreSQL storage.
-//! Only HEAD, GET(+Range), PUT, DELETE and ListObjectsV2/Buckets are
+//! Only HEAD, GET(+Range), PUT, DELETE, multipart and bucket operations are
 //! implemented; everything else stays `NotImplemented` (s3s trait defaults).
 
 use std::collections::BTreeSet;
@@ -15,16 +15,15 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketOutput,
     CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketOutput,
-    DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadBucketOutput, HeadObjectInput,
-    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
-    PutObjectInput, PutObjectOutput, Range, StreamingBlob, Timestamp, UploadPartInput,
-    UploadPartOutput,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+    GetObjectInput, GetObjectOutput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+    ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput,
+    PutObjectOutput, Range, StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::db;
-use crate::janitor;
 
 /// Stateless over Aurora: multipart upload state lives in `s3p.uploads`, so
 /// any gateway instance can serve any request of any upload.
@@ -110,10 +109,21 @@ impl S3 for PgS3 {
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
-        let meta = db::meta(&self.pool, &input.bucket, &input.key)
+        let Some(meta) = db::meta_fresh(&self.pool, &input.bucket, &input.key)
             .await
             .map_err(internal)?
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
+        else {
+            return Err(
+                if db::bucket_exists(&self.pool, &input.bucket)
+                    .await
+                    .map_err(internal)?
+                {
+                    s3_error!(NoSuchKey)
+                } else {
+                    s3_error!(NoSuchBucket)
+                },
+            );
+        };
         let out = HeadObjectOutput {
             accept_ranges: Some("bytes".to_owned()),
             content_length: Some(meta.size),
@@ -132,9 +142,9 @@ impl S3 for PgS3 {
         let ranged = input.range.is_some();
         let (first, last, suffix) = range_params(input.range);
         // One round trip: metadata + a stream of exactly the requested bytes.
-        let (meta, body) = db::get_body(
+        let Some((meta, body)) = db::get_body(
             self.pool.clone(),
-            input.bucket,
+            input.bucket.clone(),
             input.key,
             first,
             last,
@@ -142,7 +152,18 @@ impl S3 for PgS3 {
         )
         .await
         .map_err(internal)?
-        .ok_or_else(|| s3_error!(NoSuchKey))?;
+        else {
+            return Err(
+                if db::bucket_exists(&self.pool, &input.bucket)
+                    .await
+                    .map_err(internal)?
+                {
+                    s3_error!(NoSuchKey)
+                } else {
+                    s3_error!(NoSuchBucket)
+                },
+            );
+        };
 
         if meta.size > 0 && (meta.start > meta.end || meta.start >= meta.size) {
             return Err(s3_error!(InvalidRange));
@@ -170,19 +191,36 @@ impl S3 for PgS3 {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let mut input = req.input;
+        if !db::bucket_exists(&self.pool, &input.bucket)
+            .await
+            .map_err(internal)?
+        {
+            return Err(s3_error!(NoSuchBucket));
+        }
         let body = input
             .body
             .take()
             .unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
         // Streams into its own COPY (never buffered whole); the writer hashes.
-        let writer = db::ChunkWriter::start(self.pool.clone())
-            .await
-            .map_err(internal)?;
-        let file_id = writer.file_id;
-        let (size, sum) = db::ingest_body(writer, body).await.map_err(internal)?;
-        db::publish(&self.pool, &input.bucket, &input.key, file_id, size, &sum)
-            .await
-            .map_err(internal)?;
+        let writer =
+            db::ChunkWriter::start_object(self.pool.clone(), input.bucket.clone(), input.key)
+                .await
+                .map_err(internal)?;
+        let (_size, sum) = match db::ingest_body(writer, body).await {
+            Ok(done) => done,
+            Err(e) => {
+                return Err(
+                    if db::bucket_exists(&self.pool, &input.bucket)
+                        .await
+                        .map_err(internal)?
+                    {
+                        internal(e)
+                    } else {
+                        s3_error!(NoSuchBucket)
+                    },
+                );
+            }
+        };
         Ok(S3Response::new(PutObjectOutput {
             e_tag: etag(&sum),
             ..Default::default()
@@ -194,10 +232,60 @@ impl S3 for PgS3 {
         req: S3Request<s3s::dto::DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
+        if !db::bucket_exists(&self.pool, &input.bucket)
+            .await
+            .map_err(internal)?
+        {
+            return Err(s3_error!(NoSuchBucket));
+        }
         db::delete(&self.pool, &input.bucket, &input.key)
             .await
             .map_err(internal)?;
         Ok(S3Response::new(DeleteObjectOutput::default()))
+    }
+
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let input = req.input;
+        if !db::bucket_exists(&self.pool, &input.bucket)
+            .await
+            .map_err(internal)?
+        {
+            return Err(s3_error!(NoSuchBucket));
+        }
+        if input.delete.objects.len() > 1000 {
+            return Err(s3_error!(InvalidRequest));
+        }
+        // This store is unversioned. Validate the whole batch before any
+        // deletion so an unsupported conditional/versioned request cannot
+        // partially delete it.
+        for obj in &input.delete.objects {
+            if obj.version_id.is_some()
+                || obj.e_tag.is_some()
+                || obj.last_modified_time.is_some()
+                || obj.size.is_some()
+            {
+                return Err(s3_error!(NotImplemented));
+            }
+        }
+        let mut deleted = Vec::new();
+        for obj in input.delete.objects {
+            db::delete(&self.pool, &input.bucket, &obj.key)
+                .await
+                .map_err(internal)?;
+            if input.delete.quiet != Some(true) {
+                deleted.push(DeletedObject {
+                    key: Some(obj.key),
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: Some(deleted),
+            ..Default::default()
+        }))
     }
 
     async fn create_multipart_upload(
@@ -209,7 +297,8 @@ impl S3 for PgS3 {
         // to the in-progress upload instead of forking a second id.
         let id = db::create_upload(&self.pool, &input.bucket, &input.key)
             .await
-            .map_err(internal)?;
+            .map_err(internal)?
+            .ok_or_else(|| s3_error!(NoSuchBucket))?;
         Ok(S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(input.key),
@@ -223,7 +312,7 @@ impl S3 for PgS3 {
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let mut input = req.input;
-        if !db::upload_exists(&self.pool, &input.upload_id)
+        if !db::upload_exists(&self.pool, &input.upload_id, &input.bucket, &input.key)
             .await
             .map_err(internal)?
         {
@@ -277,9 +366,15 @@ impl S3 for PgS3 {
         }
         // Parts are already rows in Aurora: Complete validates and publishes,
         // moving no data (so no long response window to lose).
-        match db::complete_upload(&self.pool, &input.upload_id, &parts)
-            .await
-            .map_err(internal)?
+        match db::complete_upload(
+            &self.pool,
+            &input.upload_id,
+            &input.bucket,
+            &input.key,
+            &parts,
+        )
+        .await
+        .map_err(internal)?
         {
             db::Completed::Done {
                 bucket,
@@ -304,7 +399,7 @@ impl S3 for PgS3 {
                 // Retried after a lost success response: the object is
                 // already published (S3 clients treat identical
                 // re-completion as success).
-                match db::meta(&self.pool, &input.bucket, &input.key)
+                match db::meta_fresh(&self.pool, &input.bucket, &input.key)
                     .await
                     .map_err(internal)?
                 {
@@ -324,9 +419,13 @@ impl S3 for PgS3 {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        db::abort_upload(&self.pool, &req.input.upload_id)
+        let input = req.input;
+        if !db::abort_upload(&self.pool, &input.upload_id, &input.bucket, &input.key)
             .await
-            .map_err(internal)?;
+            .map_err(internal)?
+        {
+            return Err(s3_error!(NoSuchUpload));
+        }
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
@@ -336,6 +435,12 @@ impl S3 for PgS3 {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
         let bucket = &input.bucket;
+        if !db::bucket_exists(&self.pool, bucket)
+            .await
+            .map_err(internal)?
+        {
+            return Err(s3_error!(NoSuchBucket));
+        }
         let prefix = input.prefix.unwrap_or_default();
         let delimiter = input.delimiter.unwrap_or_default();
         let max = input.max_keys.unwrap_or(1000).clamp(0, 1000) as usize;
@@ -400,6 +505,9 @@ impl S3 for PgS3 {
         &self,
         req: S3Request<s3s::dto::CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
+        db::create_bucket(&self.pool, &req.input.bucket)
+            .await
+            .map_err(internal)?;
         Ok(S3Response::new(CreateBucketOutput {
             location: Some(format!("/{}", req.input.bucket)),
             ..Default::default()
@@ -408,16 +516,29 @@ impl S3 for PgS3 {
 
     async fn head_bucket(
         &self,
-        _req: S3Request<s3s::dto::HeadBucketInput>,
+        req: S3Request<s3s::dto::HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
+        if !db::bucket_exists(&self.pool, &req.input.bucket)
+            .await
+            .map_err(internal)?
+        {
+            return Err(s3_error!(NoSuchBucket));
+        }
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
     async fn delete_bucket(
         &self,
-        _req: S3Request<s3s::dto::DeleteBucketInput>,
+        req: S3Request<s3s::dto::DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        Ok(S3Response::new(DeleteBucketOutput {}))
+        match db::delete_bucket(&self.pool, &req.input.bucket)
+            .await
+            .map_err(internal)?
+        {
+            db::BucketDeletion::Deleted => Ok(S3Response::new(DeleteBucketOutput {})),
+            db::BucketDeletion::NotEmpty => Err(s3_error!(BucketNotEmpty)),
+            db::BucketDeletion::NotFound => Err(s3_error!(NoSuchBucket)),
+        }
     }
 
     async fn list_buckets(
@@ -429,8 +550,9 @@ impl S3 for PgS3 {
             buckets: Some(
                 names
                     .into_iter()
-                    .map(|name| Bucket {
+                    .map(|(name, created_at)| Bucket {
                         name: Some(name),
+                        creation_date: Some(Timestamp::from(created_at)),
                         ..Default::default()
                     })
                     .collect(),
@@ -492,43 +614,13 @@ pub struct ServeConfig {
 }
 
 pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
-    // Keep the chunk index hot while it is small beside shared_buffers (see
-    // janitor::prewarm_index). Best-effort, in the background.
+    // Best-effort performance warmup; no gateway-owned cleanup or cursor.
     let warm = pool.clone();
     tokio::spawn(async move {
-        match janitor::prewarm_index(&warm).await {
+        match crate::warmup::prewarm_index(&warm).await {
             Ok(Some(blocks)) => eprintln!("pgvs3: prewarmed chunk index ({blocks} blocks)"),
             Ok(None) => eprintln!("pgvs3: chunk index exceeds 10% of shared_buffers: left cold"),
             Err(e) => eprintln!("pgvs3: prewarm skipped: {e}"),
-        }
-    });
-    // Janitor, at startup and hourly, for state that gateways killed mid-write
-    // (by any instance) leave in Aurora: multipart uploads abandoned for 24h
-    // (S3's incomplete-upload lifecycle) and chunk files nothing references
-    // once provably 24h old. The first pass scans every file; later passes
-    // resume where it stopped. Idempotent, so every gateway can run it.
-    let gc = pool.clone();
-    tokio::spawn(async move {
-        let grace = std::time::Duration::from_secs(24 * 3600);
-        let mut from = 0i64;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
-        loop {
-            tick.tick().await;
-            match janitor::expire_uploads(&gc, grace).await {
-                Ok(0) => {}
-                Ok(n) => eprintln!("pgvs3: janitor expired {n} abandoned multipart uploads"),
-                Err(e) => eprintln!("pgvs3: janitor upload expiry failed: {e}"),
-            }
-            match janitor::sweep_orphans(&gc, grace, from).await {
-                Ok((files, rows, next)) => {
-                    if files > 0 {
-                        let mib = rows as i64 * db::ROW_BYTES / (1 << 20);
-                        eprintln!("pgvs3: janitor reaped {files} orphaned files ({rows} rows, ~{mib} MiB)");
-                    }
-                    from = next;
-                }
-                Err(e) => eprintln!("pgvs3: janitor orphan sweep failed: {e}"),
-            }
         }
     });
     let s3 = PgS3 { pool };

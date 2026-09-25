@@ -5,11 +5,11 @@ built to be DuckLake's object store: DuckLake keeps its catalog in PostgreSQL,
 and with pgvs3 the data files live there too, so every DuckDB that attaches
 the catalog sees the same tables and the same data.
 
-- One Rust binary with no local state: objects and in-progress multipart
-  uploads live in PostgreSQL, so any number of gateways can share a database.
+- One Rust binary with no local state: buckets, objects and in-progress
+  multipart uploads live in PostgreSQL, so gateways share one S3 namespace.
 - An S3 subset: `GET` (with ranges), `HEAD`, `PUT`, `DELETE`, `ListObjectsV2`,
-  `ListBuckets`, `CreateBucket`, `HeadBucket` and multipart uploads. Anything
-  else returns `NotImplemented`.
+  `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket` and multipart
+  uploads. Anything else returns `NotImplemented`.
 - No data cache: clients such as DuckDB cache what they read. A per-process
   metadata cache only removes the lookup round trip per GET.
 
@@ -35,6 +35,8 @@ Use it like any path-style S3:
 
 ```sh
 curl --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
+     -X PUT http://127.0.0.1:8014/lake  # create the bucket once
+curl --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
      -H 'Range: bytes=0-1023' http://127.0.0.1:8014/lake/some-object
 ```
 
@@ -45,23 +47,35 @@ matrix plus the direct-PostgreSQL floor), `stat` (logical vs physical size).
 
 ## How it works
 
-Two tables (`crates/pgvs3/schema.sql`): `s3p.objects` maps bucket/key to a
+Five storage tables (`crates/pgvs3/schema.sql`): `s3p.buckets` stores S3-managed
+bucket existence and creation times; `s3p.objects` maps bucket/key to a
 file id, size, sha256 ETag and, for multipart objects, the list of part files;
-`s3p.chunks` holds each file as numbered rows of 8120 bytes.
+`s3p.chunks` holds each file as numbered rows of 8120 bytes. The separate
+`s3p.uploads` and `s3p.upload_parts` tables track incomplete multipart work.
 
 - **Writes** stream into a binary `COPY`, one per PUT and one per multipart
-  part, all in parallel. An object appears atomically when its `objects` row
-  is written. Completing a multipart upload only checks and publishes the
-  part list; no data moves.
+  part. A direct PUT commits its chunks and object row in one transaction:
+  interrupted writes cannot leave committed, unaddressable bytes. Parts
+  commit with their upload record; Complete publishes the ordered part list
+  without moving data. Acknowledged writes use synchronous commits.
 - **Reads** turn a byte range into a row range by arithmetic (row =
   offset / 8120) and run one row-range query per 8 MiB. Bigger ranges run up
   to 8 of those in parallel on separate connections. Rows go to the client as
   they arrive.
-- **Janitor** (at start, then hourly): aborts multipart uploads idle for
-  24 hours and deletes chunk rows nothing references, such as those left by
-  a gateway killed mid-write.
+- **Maintenance** belongs to PostgreSQL: a bounded cleanup function reaps
+  abandoned multipart parts after 24 hours (scheduled by `pg_cron` in kind
+  and on Aurora), and per-partition autovacuum runs without a gateway janitor
+  or manual table VACUUM. `kind-up` registers the cron job after schema setup;
+  the standalone `dev-db` command does not install a scheduler.
+- **Buckets** are explicit: create them through S3 before writing. Empty
+  buckets remain listed; deleting a bucket with objects or an incomplete upload
+  returns `BucketNotEmpty`. The kind harness provisions its three workload
+  buckets through S3 at startup. The `seed` load generator creates its own
+  bucket if absent.
 - **Layout version** (`s3p.layout`): a gateway refuses to run against a layout
-  it was not built for.
+  it was not built for. The pre-release v3 bucket layout requires a fresh
+  database; `just kind-reset` or `just rig-reset` discards only that
+  environment's three disposable test databases and redeploys them.
 
 Why 8120-byte rows (from the PostgreSQL 18 source, `heaptoast.c`,
 `heaptoast.h`, `reloptions.c`): PostgreSQL moves a value out of line only when
@@ -83,7 +97,6 @@ A flag overrides the same-named variable.
 | `--secret-key` | `PGVS3_SECRET_KEY` | `cachebench-local-only` | SigV4 secret key. |
 | | `PGVS3_POOL_MIN` | 64 | Connections opened at start and kept warm. Clamped to the max. |
 | | `PGVS3_POOL_MAX` | 64 | Connections open at once, per gateway. Include all replicas, rollout headroom and other clients in the local Postgres `maxConnections` or Aurora connection budget. |
-| | `PGVS3_DURABLE=1` | off | Synchronous commits. Off is safe for objects (sha256-addressed, idempotent: a lost commit only means a retried PUT). |
 
 `GET /healthz` is an unauthenticated liveness probe. `GET /_pgvs3/stats`
 (SigV4-signed) returns one line of read counters; the gateway also logs it
@@ -281,8 +294,13 @@ upstream durable queue/replay path before treating that pod as disposable.
 ## Benchmarks
 
 Testing lives here too: `just smoke` is `kind-up`, the validate suite and a
-smoke-scale `kind-bench`, and CI runs exactly that (`just ci` = fmt, clippy,
-build, tests, smoke). One stack, one way to be wrong.
+smoke-scale `kind-bench`, and CI runs exactly that (`just ci` = `hk check
+--all`, Rust build/unit tests, kind contract tests and smoke workloads).
+`hk.pkl` checks Rust formatting/Clippy, shell and Python syntax, chart
+rendering and the justfile with the same mise-pinned tools on developer
+machines and CI. Install repository-local, mise-aware Git hooks once with
+`mise exec -- hk install --mise`; checks never fix/stash/stage files during a
+commit. One stack, one way to be wrong.
 Mise installs Mr Boxington (`mbx`) for the native Rust builds in `just ci`
 and the benchmark image build; the CI check job restores its Cargo cache with
 `jdx/mr-boxington-action`. The published multi-arch Docker image compiles
@@ -350,18 +368,21 @@ DuckLake harnesses directly (pass arguments through
 CI and a laptop use in-kind PostgreSQL. The EC2 rig runs **the same kind
 charts and benchmark Jobs**, but pgvs3's objects, the DuckLake catalog and
 Quickwit's metastore are three logical databases on **Aurora PostgreSQL 18.6
-Serverless v2, I/O-Optimized**. Quickwit remains single-node with its index
-splits on pgvs3's S3 endpoint. This separates Aurora round trips and I/O from
-the kind host while retaining the CI workload shape.
+Serverless v2, I/O-Optimized**. Quickwit has one core writer and optional
+search-only replicas, with its index splits on pgvs3's S3 endpoint. This
+separates Aurora round trips and I/O from the kind host while retaining the CI
+workload shape.
 
 Configure the rig in the ignored `.env` (see `.env.example`) and authenticate
 with the selected AWS profile before running the commands below.
 
 ```sh
 just rig-up                       # tagged CloudFormation stack; sync, deploy, validate
+just rig-contract                 # Rust S3 contract against Aurora's gateway pods
 just rig-validate                 # CI's kind smoke gate against Aurora
 SUITES=tpch,click just rig-bench  # or run all five suites with just rig-bench
 QUICK=1 just rig-bench            # smoke-scale benchmark
+just rig-reset                   # pre-release test data only; explicit confirmation
 just rig-results                  # download latest JSONL after a disconnected run
 just rig-status                   # stack status and endpoints
 just rig-teardown                 # terminates the rig and its related resources
@@ -399,8 +420,8 @@ building.
 - **Tried, no gain:** a proxy cache or prefetcher, splitting reads under
   8 MiB, bigger TCP buffers, DuckDB's curl HTTP client.
 
-Before more tuning: integration tests against a local PostgreSQL (range
-edges, multipart lifecycle, overwrite/delete, the orphan sweep).
+Before more tuning: run `just kind-contract` against the two gateway pods
+(bucket lifecycle, range edges, multipart, overwrite/delete, scheduled expiry).
 
 ## Running in a container
 
@@ -436,8 +457,8 @@ containers:
 - `crates/pgvs3/src/`: `main.rs` (CLI), `server.rs` (the S3 API on
   [s3s](https://crates.io/crates/s3s): routes, `/healthz`, the stats line),
   `db.rs` (object storage: metadata, reads, writes, multipart), `ingest.rs`
-  (the `COPY` write path), `cache.rs` (metadata cache), `janitor.rs` (the
-  orphan sweep), `stats.rs` (read counters), `pg.rs` (PostgreSQL pool and
+  (the `COPY` write path), `cache.rs` (metadata cache), `warmup.rs` (index
+  warmup), `stats.rs` (read counters), `pg.rs` (PostgreSQL pool and
   TLS), `bench.rs` and `seed.rs` (the GET matrix and load generator).
 - `crates/pgvs3/schema.sql`: the storage layout.
 - `crates/pgvs3/*.py` and `queries/`: the benchmark harness (ClickBench,

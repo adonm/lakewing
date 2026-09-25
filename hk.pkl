@@ -1,0 +1,36 @@
+amends "package://github.com/jdx/hk/releases/download/v2.1.0/hk@2.1.0#/Config.pkl"
+
+steps {
+  ["rustfmt"] {
+    glob = "**/*.rs"
+    check = "cargo fmt --all --check"
+  }
+  ["clippy"] {
+    glob = "**/*.rs"
+    check = "mbx clippy --workspace --all-targets -- -D warnings"
+  }
+  ["shell-syntax"] {
+    glob = "**/*.sh"
+    check = "bash -n {{files}}"
+  }
+  ["python-syntax"] {
+    glob = "**/*.py"
+    check = "hk util python-check-ast {{files}}"
+  }
+  ["helm-lint"] {
+    glob = "deploy/charts/**/*.yaml"
+    check = "for chart in postgres pgvs3 quickwit kind-bench; do helm lint deploy/charts/$chart >/dev/null || exit 1; done"
+  }
+  ["just-syntax"] {
+    glob = "justfile"
+    check = "just --list >/dev/null"
+  }
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = false
+    stage = false
+    stash = "none"
+  }
+}

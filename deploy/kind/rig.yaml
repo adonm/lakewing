@@ -57,6 +57,18 @@ Resources:
       Tags:
         - { Key: Name, Value: !Ref AWS::StackName }
         - { Key: Project, Value: pgvs3 }
+  CronParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Database-owned pgvs3 multipart expiry on the Aurora writer
+      Family: aurora-postgresql18
+      Parameters:
+        shared_preload_libraries: pg_stat_statements,pg_cron
+        cron.database_name: pgvs3
+        cron.log_run: "off"
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-cron' }
+        - { Key: Project, Value: pgvs3 }
   Writer:
     Type: AWS::RDS::DBInstance
     Properties:
@@ -64,6 +76,7 @@ Resources:
       DBClusterIdentifier: !Ref Cluster
       Engine: aurora-postgresql
       DBInstanceClass: db.serverless
+      DBParameterGroupName: !Ref CronParameterGroup
       AvailabilityZone: !GetAtt Host.AvailabilityZone
       PubliclyAccessible: false
       Tags:

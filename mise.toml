@@ -5,6 +5,7 @@
 just = "1"
 rust = "stable"
 mr-boxington = "1.17.0"
+hk = "2.1.0"
 uv = "0.12.1"
 python = "3.12.14"
 duckdb = "1.5.5"

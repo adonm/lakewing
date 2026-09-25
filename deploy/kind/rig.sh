@@ -162,7 +162,8 @@ case ${1:-} in
   sync)
     check_account
     [ -s "$key_file" ] || die "missing SSH key: $key_file"
-    tar czf - Cargo.toml Cargo.lock .cargo crates deploy Dockerfile .dockerignore mise.toml mise.ec2.toml justfile \
+    tar czf - Cargo.toml Cargo.lock .cargo crates deploy Dockerfile .dockerignore \
+      mise.toml mise.ec2.toml hk.pkl justfile README.md \
       | ssh_run 'mkdir -p pgvs3 && tar xzf - -C pgvs3'
     ssh_run 'cd pgvs3 && ~/.local/bin/mise trust mise.toml && ~/.local/bin/mise trust mise.ec2.toml && ~/.local/bin/mise -E ec2 bootstrap --yes'
     ssh_run 'docker info >/dev/null && echo "rig: Docker ready after mise bootstrap"'
@@ -191,6 +192,10 @@ case ${1:-} in
     ssh_run "cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora QUICKWIT_SEARCHERS=$searchers ~/.local/bin/mise exec -- just smoke"
     copy_results
     ;;
+  contract)
+    check_account
+    ssh_run 'cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora ~/.local/bin/mise exec -- just kind-contract'
+    ;;
   bench)
     check_account
     # Export only the same suite knobs kind-bench accepts; no database secret
@@ -211,6 +216,13 @@ case ${1:-} in
     check_account
     copy_results
     ;;
+  reset)
+    check_account
+    [ -s "$key_file" ] || die "missing SSH key: $key_file"
+    tar czf - deploy/kind/reset.sh deploy/kind/db.sh deploy/kind/db-job.yaml \
+      | ssh_run 'cd pgvs3 && tar xzf -'
+    ssh_run 'cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora ~/.local/bin/mise exec -- bash deploy/kind/reset.sh'
+    ;;
   ssh)
     check_account
     ssh_run
@@ -226,5 +238,5 @@ case ${1:-} in
     rm -f "$key_file" "$known_hosts"
     echo "rig: deleted $stack and its key pair"
     ;;
-  *) die 'usage: rig.sh up|sync|validate|bench|results|status|ssh|teardown' ;;
+  *) die 'usage: rig.sh up|sync|contract|validate|bench|results|status|ssh|reset|teardown' ;;
 esac

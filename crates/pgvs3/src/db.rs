@@ -1,18 +1,11 @@
 //! PostgreSQL storage: an object is numbered 8120-byte rows in `s3p.chunks`
 //! plus one row in `s3p.objects` (layout: schema.sql).
 //!
-//! Reads: object metadata is cached in-process (filled at publish and first
-//! lookup, dropped at delete), so a GET costs one query per 8 MiB of range.
-//! Rows go to the response as they arrive; a range over 8 MiB fetches up to 8
-//! parts at once on separate connections, since one connection tops out near
-//! 600 MiB/s. Row bytes are not cached: DuckDB caches what it reads, and a
-//! proxy cache behind it hit ~0% of the time.
+//! Reads cache metadata, never row bytes. Ranges stream rows in 8 MiB spans;
+//! larger ranges use up to eight connections concurrently.
 //!
-//! Writes: every PUT and every multipart part streams into its own binary
-//! COPY, with no staging and no global lock. A multipart object is the ordered
-//! list of its part files; upload state lives in PostgreSQL, so any gateway
-//! can take any part, and Complete only checks and publishes. An object
-//! appears atomically when its `objects` row is written.
+//! Writes use a binary COPY per PUT or multipart part. Object publication
+//! shares the COPY transaction; multipart Complete publishes existing parts.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
@@ -52,25 +45,14 @@ const PARTS_INFLIGHT: usize = 8;
 const CHUNK: usize = 256 << 10;
 
 pub async fn connect(url: &str) -> Result<Pool> {
-    // Index scans off: bitmap heap scans hand the whole row span to
-    // PostgreSQL 18's read-ahead, ~5x faster on cold ranges at no warm cost.
-    // work_mem keeps the bitmaps exact; effective_io_concurrency deepens the
-    // read-ahead (no gain past 32 on Aurora). The keepalive and
-    // idle-transaction limits bound what a dead gateway can leave holding
-    // locks.
-    let mut session = String::from(
+    // Bitmap scans use PostgreSQL 18 read-ahead for cold ranges; the session
+    // timeouts prevent dead gateways from holding locks indefinitely.
+    let session = String::from(
         "SET enable_indexscan = off; SET work_mem = '64MB'; SET effective_io_concurrency = 32; \
          SET tcp_keepalives_idle = 30; SET tcp_keepalives_interval = 10; \
-         SET tcp_keepalives_count = 3; SET idle_in_transaction_session_timeout = '5min';",
+         SET tcp_keepalives_count = 3; SET idle_in_transaction_session_timeout = '5min'; \
+         SET synchronous_commit = on;",
     );
-    // A synchronous commit costs every write an Aurora round trip, while
-    // objects are immutable and sha256-idempotent: a lost commit only means a
-    // retried PUT. PGVS3_DURABLE=1 turns synchronous commits back on.
-    if std::env::var_os("PGVS3_DURABLE").is_none() {
-        session.push_str(" SET synchronous_commit = off;");
-    }
-    // (io_combine_limit cannot go here: PostgreSQL clamps it to the server's
-    // io_max_combine_limit, which only a parameter-group change raises.)
     Pool::connect(
         url,
         crate::pg::Options {
@@ -92,7 +74,7 @@ pub async fn connect(url: &str) -> Result<Pool> {
 
 /// Storage layout this binary reads and writes (schema.sql); bumped only by
 /// breaking layout changes.
-pub const LAYOUT_VERSION: i32 = 2;
+pub const LAYOUT_VERSION: i32 = 3;
 
 /// Create the layout if absent, and fail closed on any other version rather
 /// than misread it. Serialized across gateways by an advisory lock, so
@@ -219,6 +201,12 @@ pub async fn meta(pool: &Pool, bucket: &str, key: &str) -> Result<Option<Meta>> 
     if let Some(m) = meta_get(bucket, key) {
         return Ok(Some(m));
     }
+    meta_fresh(pool, bucket, key).await
+}
+
+/// Current metadata for operations such as HEAD that cannot serve a stale
+/// size, ETag or existence result after another gateway modifies the key.
+pub async fn meta_fresh(pool: &Pool, bucket: &str, key: &str) -> Result<Option<Meta>> {
     let row = pool
         .get()
         .await?
@@ -228,7 +216,10 @@ pub async fn meta(pool: &Pool, bucket: &str, key: &str) -> Result<Option<Meta>> 
             &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
         )
         .await?;
-    let Some(r) = row else { return Ok(None) };
+    let Some(r) = row else {
+        meta_invalidate(bucket, key);
+        return Ok(None);
+    };
     let meta = Meta {
         file_id: r.try_get(0)?,
         size: r.try_get(1)?,
@@ -566,41 +557,43 @@ pub struct Slice {
     pub bytes: Bytes,
 }
 
-/// Overwrite-or-create a buffered object through the ingest pipeline (seed and
-/// bench; the server streams request bodies through the same writer). The
-/// ETag is the caller's sha256 (idempotent retries); visibility is atomic via
-/// `publish`.
-pub async fn put(pool: &Pool, bucket: &str, key: &str, data: &[u8], etag: &[u8]) -> Result<()> {
-    let writer = ChunkWriter::start(pool.clone()).await?;
-    let file_id = writer.file_id;
+/// Overwrite-or-create a buffered object through the same atomic write path
+/// as the S3 PUT handler. The writer hashes and publishes in its COPY
+/// transaction; failed writes leave no committed chunk rows behind.
+pub async fn put(pool: &Pool, bucket: &str, key: &str, data: &[u8]) -> Result<()> {
+    let writer = ChunkWriter::start_object(pool.clone(), bucket.to_owned(), key.to_owned()).await?;
     for chunk in data.chunks(SEND_BATCH) {
         writer.push(Bytes::copy_from_slice(chunk)).await?;
     }
-    let (size, _sum) = writer.finish().await?;
-    publish(pool, bucket, key, file_id, size, etag).await
+    writer.finish().await?;
+    Ok(())
+}
+
+enum WriterTarget {
+    Object { bucket: String, key: String },
+    Part { upload_id: String, part_no: i32 },
 }
 
 /// Streaming ingest: bytes flow into one open binary COPY stream through
 /// `push` (rows cut across pushes through a single cursor). Every ingest has
 /// its own connection and COPY, so PUTs and multipart parts write in parallel.
 pub struct ChunkWriter {
-    pub file_id: i64,
     tx: Option<tokio::sync::mpsc::Sender<IngestMsg>>,
     done: Option<tokio::task::JoinHandle<IngestResult>>,
 }
 
 impl ChunkWriter {
-    pub async fn start(pool: Pool) -> Result<Self> {
-        Self::begin(pool, None).await
+    pub async fn start_object(pool: Pool, bucket: String, key: String) -> Result<Self> {
+        Self::begin(pool, WriterTarget::Object { bucket, key }).await
     }
 
     /// A multipart part: its rows and its `upload_parts` record commit in one
     /// transaction, so a part is either fully recorded or absent.
     pub async fn start_part(pool: Pool, upload_id: String, part_no: i32) -> Result<Self> {
-        Self::begin(pool, Some((upload_id, part_no))).await
+        Self::begin(pool, WriterTarget::Part { upload_id, part_no }).await
     }
 
-    async fn begin(pool: Pool, part: Option<(String, i32)>) -> Result<Self> {
+    async fn begin(pool: Pool, target: WriterTarget) -> Result<Self> {
         let file_id: i64 = pool
             .get()
             .await?
@@ -611,9 +604,8 @@ impl ChunkWriter {
             .await?
             .try_get(0)?;
         let (tx, rx) = tokio::sync::mpsc::channel::<IngestMsg>(8);
-        let done = tokio::spawn(ingest_writer(pool, file_id, part, rx));
+        let done = tokio::spawn(ingest_writer(pool, file_id, target, rx));
         Ok(Self {
-            file_id,
             tx: Some(tx),
             done: Some(done),
         })
@@ -672,7 +664,7 @@ where
 async fn ingest_writer(
     pool: Pool,
     file_id: i64,
-    part: Option<(String, i32)>,
+    target: WriterTarget,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
 ) -> Result<(i64, Vec<u8>)> {
     // No global write lock: each ingest owns a connection and a COPY, and the
@@ -681,6 +673,17 @@ async fn ingest_writer(
 
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+    if let WriterTarget::Object { bucket, .. } = &target {
+        anyhow::ensure!(
+            tx.query_typed_opt(
+                "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE",
+                &[(&bucket, Type::TEXT)],
+            )
+            .await?
+            .is_some(),
+            "bucket does not exist"
+        );
+    }
     let mut sink = std::pin::pin!(tx.copy_in::<_, Bytes>(COPY_SQL).await?);
     sink.send(Bytes::from_static(COPY_HEADER)).await?;
 
@@ -698,8 +701,18 @@ async fn ingest_writer(
     let (last, (total, sum)) = framer.finish();
     sink.send(last).await?;
     sink.as_mut().finish().await?;
-    commit_part(&tx, part, file_id, total, &sum).await?;
+    match &target {
+        WriterTarget::Object { bucket, key } => {
+            swap_object(&tx, bucket, key, file_id, total, &sum, None).await?;
+        }
+        WriterTarget::Part { upload_id, part_no } => {
+            commit_part(&tx, upload_id, *part_no, file_id, total, &sum).await?;
+        }
+    }
     tx.commit().await?;
+    if let WriterTarget::Object { bucket, key } = target {
+        publish_cache(&bucket, &key, file_id, total, &sum, None);
+    }
     eprintln!(
         "pgvs3: ingest {:.1} MiB at {:.0} MiB/s",
         total as f64 / 1024.0 / 1024.0,
@@ -713,14 +726,12 @@ async fn ingest_writer(
 /// invisible: objects appear atomically at publish / Complete.
 async fn commit_part(
     tx: &Transaction<'_>,
-    part: Option<(String, i32)>,
+    upload_id: &str,
+    part_no: i32,
     file_id: i64,
     total: i64,
     sum: &[u8],
 ) -> Result<()> {
-    let Some((upload_id, part_no)) = part else {
-        return Ok(());
-    };
     let old = tx
         .query_typed_opt(
             "DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2 RETURNING file_id",
@@ -746,24 +757,6 @@ async fn commit_part(
         ],
     )
     .await?;
-    Ok(())
-}
-
-/// Publish an object row: pointer-swap on overwrite (old rows reap after the
-/// swap), then refresh the meta cache. This is the visibility boundary.
-pub async fn publish(
-    pool: &Pool,
-    bucket: &str,
-    key: &str,
-    file_id: i64,
-    size: i64,
-    etag: &[u8],
-) -> Result<()> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-    swap_object(&tx, bucket, key, file_id, size, etag, None).await?;
-    tx.commit().await?;
-    publish_cache(bucket, key, file_id, size, etag, None);
     Ok(())
 }
 
@@ -860,27 +853,105 @@ pub async fn delete(pool: &Pool, bucket: &str, key: &str) -> Result<bool> {
     Ok(found)
 }
 
-/// Start (or re-attach, for a retried Create) the multipart upload of a key.
-pub async fn create_upload(pool: &Pool, bucket: &str, key: &str) -> Result<String> {
-    Ok(pool
-        .get()
+pub async fn create_bucket(pool: &Pool, name: &str) -> Result<()> {
+    pool.get()
         .await?
-        .query_typed_one(
-            "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) \
-             ON CONFLICT (bucket, key) DO UPDATE SET bucket = EXCLUDED.bucket RETURNING upload_id",
-            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+        .query_typed(
+            "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+            &[(&name, Type::TEXT)],
         )
-        .await?
-        .try_get(0)?)
+        .await?;
+    Ok(())
 }
 
-pub async fn upload_exists(pool: &Pool, upload_id: &str) -> Result<bool> {
+pub async fn bucket_exists(pool: &Pool, name: &str) -> Result<bool> {
     Ok(pool
         .get()
         .await?
         .query_typed_opt(
-            "SELECT 1 FROM s3p.uploads WHERE upload_id = $1",
-            &[(&upload_id, Type::TEXT)],
+            "SELECT 1 FROM s3p.buckets WHERE name = $1",
+            &[(&name, Type::TEXT)],
+        )
+        .await?
+        .is_some())
+}
+
+pub enum BucketDeletion {
+    Deleted,
+    NotEmpty,
+    NotFound,
+}
+
+pub async fn delete_bucket(pool: &Pool, name: &str) -> Result<BucketDeletion> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    if tx
+        .query_typed_opt(
+            "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR UPDATE",
+            &[(&name, Type::TEXT)],
+        )
+        .await?
+        .is_none()
+    {
+        return Ok(BucketDeletion::NotFound);
+    }
+    let occupied: bool = tx
+        .query_typed_one(
+            "SELECT EXISTS (SELECT 1 FROM s3p.objects WHERE bucket = $1) \
+                    OR EXISTS (SELECT 1 FROM s3p.uploads WHERE bucket = $1)",
+            &[(&name, Type::TEXT)],
+        )
+        .await?
+        .try_get(0)?;
+    if occupied {
+        return Ok(BucketDeletion::NotEmpty);
+    }
+    tx.query_typed(
+        "DELETE FROM s3p.buckets WHERE name = $1",
+        &[(&name, Type::TEXT)],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(BucketDeletion::Deleted)
+}
+
+/// Start (or re-attach, for a retried Create) the multipart upload of a key.
+pub async fn create_upload(pool: &Pool, bucket: &str, key: &str) -> Result<Option<String>> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    if tx
+        .query_typed_opt(
+            "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE",
+            &[(&bucket, Type::TEXT)],
+        )
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let id = tx
+        .query_typed_one(
+            "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) \
+              ON CONFLICT (bucket, key) DO UPDATE SET bucket = EXCLUDED.bucket RETURNING upload_id",
+            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+        )
+        .await?
+        .try_get(0)?;
+    tx.commit().await?;
+    Ok(Some(id))
+}
+
+pub async fn upload_exists(pool: &Pool, upload_id: &str, bucket: &str, key: &str) -> Result<bool> {
+    Ok(pool
+        .get()
+        .await?
+        .query_typed_opt(
+            "SELECT 1 FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            &[
+                (&upload_id, Type::TEXT),
+                (&bucket, Type::TEXT),
+                (&key, Type::TEXT),
+            ],
         )
         .await?
         .is_some())
@@ -903,6 +974,8 @@ pub enum Completed {
 pub async fn complete_upload(
     pool: &Pool,
     upload_id: &str,
+    request_bucket: &str,
+    request_key: &str,
     listed: &[(i32, String)],
 ) -> Result<Completed> {
     let mut conn = pool.get().await?;
@@ -917,6 +990,9 @@ pub async fn complete_upload(
         return Ok(Completed::NoSuchUpload);
     };
     let (bucket, key): (String, String) = (up.try_get(0)?, up.try_get(1)?);
+    if bucket != request_bucket || key != request_key {
+        return Ok(Completed::NoSuchUpload);
+    }
     let rows = tx
         .query_typed(
             "SELECT part_no, file_id, size, sha256 FROM s3p.upload_parts WHERE upload_id = $1 ORDER BY part_no",
@@ -962,9 +1038,23 @@ pub async fn complete_upload(
 }
 
 /// Drop a multipart upload and the rows of every part it recorded.
-pub async fn abort_upload(pool: &Pool, upload_id: &str) -> Result<()> {
+pub async fn abort_upload(pool: &Pool, upload_id: &str, bucket: &str, key: &str) -> Result<bool> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+    if tx
+        .query_typed_opt(
+            "SELECT 1 FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR UPDATE",
+            &[
+                (&upload_id, Type::TEXT),
+                (&bucket, Type::TEXT),
+                (&key, Type::TEXT),
+            ],
+        )
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
     let mut ids: Vec<i64> = Vec::new();
     for r in tx
         .query_typed(
@@ -986,7 +1076,7 @@ pub async fn abort_upload(pool: &Pool, upload_id: &str) -> Result<()> {
     )
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 #[derive(Debug, Clone)]
@@ -1037,18 +1127,19 @@ pub async fn list(
     Ok(out)
 }
 
-pub async fn buckets(pool: &Pool) -> Result<Vec<String>> {
+pub async fn buckets(pool: &Pool) -> Result<Vec<(String, SystemTime)>> {
     let mut out = Vec::new();
     for r in pool
         .get()
         .await?
         .query_typed(
-            "SELECT DISTINCT bucket FROM s3p.objects ORDER BY bucket",
+            "SELECT name, EXTRACT(EPOCH FROM created_at)::float8 \
+             FROM s3p.buckets ORDER BY name",
             &[],
         )
         .await?
     {
-        out.push(r.try_get(0)?);
+        out.push((r.try_get(0)?, epoch(r.try_get(1)?)));
     }
     Ok(out)
 }
@@ -1086,4 +1177,57 @@ pub async fn sizes(pool: &Pool) -> Result<(i64, i64)> {
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires kind; run just kind-contract"]
+    async fn a_failed_publish_rolls_back_its_copy_rows() -> Result<()> {
+        let url = std::env::var("PGVS3_TEST_DB_URL")?;
+        let pool = connect(&url).await?;
+        let file_id: i64 = pool
+            .get()
+            .await?
+            .query_typed_one(
+                "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
+                &[],
+            )
+            .await?
+            .try_get(0)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(IngestMsg::Data(Bytes::from(vec![
+            42;
+            ROW_BYTES as usize + 19
+        ])))
+        .await?;
+        drop(tx);
+
+        // PostgreSQL rejects NUL in the object key at the publish step,
+        // *after* COPY has received its rows. Neither action may commit.
+        let result = ingest_writer(
+            pool.clone(),
+            file_id,
+            WriterTarget::Object {
+                bucket: "pgvs3-contract".to_owned(),
+                key: "invalid\0key".to_owned(),
+            },
+            rx,
+        )
+        .await;
+        anyhow::ensure!(result.is_err(), "invalid key unexpectedly published");
+        let count: i64 = pool
+            .get()
+            .await?
+            .query_typed_one(
+                "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                &[(&file_id, Type::INT8)],
+            )
+            .await?
+            .try_get(0)?;
+        anyhow::ensure!(count == 0, "failed publish left orphan chunk rows");
+        Ok(())
+    }
 }

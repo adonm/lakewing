@@ -1,9 +1,7 @@
 //! Deterministic incompressible filler (splitmix64) + the `seed` command.
 
-use anyhow::Result;
-use sha2::{Digest, Sha256};
-
 use crate::db;
+use anyhow::Result;
 
 /// splitmix64 stream: cheap, deterministic, incompressible by pglz and BtrBlocks.
 pub struct Filler {
@@ -45,6 +43,7 @@ pub struct SeedConfig {
 
 pub async fn run(pool: &db::Pool, cfg: SeedConfig) -> Result<()> {
     db::init(pool).await?;
+    db::create_bucket(pool, &cfg.bucket).await?;
     let object_bytes = cfg.object_mib * 1024 * 1024;
     let n_objects = ((cfg.gigabytes * 1024.0 * 1024.0 * 1024.0) as usize).div_ceil(object_bytes);
     println!(
@@ -68,9 +67,8 @@ pub async fn run(pool: &db::Pool, cfg: SeedConfig) -> Result<()> {
                 let mut filler = Filler::new(0x5EED_0000 + i as u64);
                 let mut data = vec![0u8; object_bytes];
                 filler.fill(&mut data);
-                let etag = Sha256::digest(&data).to_vec();
                 let t_put = std::time::Instant::now();
-                db::put(&pool, &bucket, &key, &data, &etag).await?;
+                db::put(&pool, &bucket, &key, &data).await?;
                 let mb = object_bytes as f64 / 1024.0 / 1024.0;
                 println!(
                     "  {key}: {} MiB in {:.2}s ({:.0} MiB/s)",

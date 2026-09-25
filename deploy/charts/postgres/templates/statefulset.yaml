@@ -27,6 +27,12 @@ spec:
               "max_connections={{ .Values.maxConnections }}",
               "-c",
               "shared_buffers={{ .Values.sharedBuffers }}",
+              "-c",
+              "shared_preload_libraries=pg_cron",
+              "-c",
+              "cron.database_name=pgvs3",
+              "-c",
+              "cron.log_run=off",
             ]
           volumeMounts:
             - { name: data, mountPath: /var/lib/postgresql/data }
