@@ -570,9 +570,33 @@ pub async fn put(pool: &Pool, bucket: &str, key: &str, data: &[u8]) -> Result<()
 }
 
 enum WriterTarget {
-    Object { bucket: String, key: String },
-    Part { upload_id: String, part_no: i32 },
+    Object {
+        bucket: String,
+        key: String,
+        condition: PutCondition,
+    },
+    Part {
+        upload_id: String,
+        part_no: i32,
+    },
 }
+
+pub enum PutCondition {
+    Unconditional,
+    IfAbsent,
+    IfMatch(String),
+}
+
+#[derive(Debug)]
+pub struct PreconditionFailed;
+
+impl std::fmt::Display for PreconditionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("object precondition failed")
+    }
+}
+
+impl std::error::Error for PreconditionFailed {}
 
 /// Streaming ingest: bytes flow into one open binary COPY stream through
 /// `push` (rows cut across pushes through a single cursor). Every ingest has
@@ -584,7 +608,24 @@ pub struct ChunkWriter {
 
 impl ChunkWriter {
     pub async fn start_object(pool: Pool, bucket: String, key: String) -> Result<Self> {
-        Self::begin(pool, WriterTarget::Object { bucket, key }).await
+        Self::start_object_if(pool, bucket, key, PutCondition::Unconditional).await
+    }
+
+    pub async fn start_object_if(
+        pool: Pool,
+        bucket: String,
+        key: String,
+        condition: PutCondition,
+    ) -> Result<Self> {
+        Self::begin(
+            pool,
+            WriterTarget::Object {
+                bucket,
+                key,
+                condition,
+            },
+        )
+        .await
     }
 
     /// A multipart part: its rows and its `upload_parts` record commit in one
@@ -702,15 +743,31 @@ async fn ingest_writer(
     sink.send(last).await?;
     sink.as_mut().finish().await?;
     match &target {
-        WriterTarget::Object { bucket, key } => {
-            swap_object(&tx, bucket, key, file_id, total, &sum, None).await?;
+        WriterTarget::Object {
+            bucket,
+            key,
+            condition,
+        } => {
+            swap_object(
+                &tx,
+                bucket,
+                key,
+                ObjectWrite {
+                    file_id,
+                    size: total,
+                    etag: &sum,
+                    parts: None,
+                    condition,
+                },
+            )
+            .await?;
         }
         WriterTarget::Part { upload_id, part_no } => {
             commit_part(&tx, upload_id, *part_no, file_id, total, &sum).await?;
         }
     }
     tx.commit().await?;
-    if let WriterTarget::Object { bucket, key } = target {
+    if let WriterTarget::Object { bucket, key, .. } = target {
         publish_cache(&bucket, &key, file_id, total, &sum, None);
     }
     eprintln!(
@@ -762,22 +819,39 @@ async fn commit_part(
 
 /// Point (bucket, key) at new storage inside `tx` and reap the storage of any
 /// object it replaces (all of its files: the single file or every part).
+struct ObjectWrite<'a> {
+    file_id: i64,
+    size: i64,
+    etag: &'a [u8],
+    parts: Option<(&'a [i64], &'a [i64])>,
+    condition: &'a PutCondition,
+}
+
 async fn swap_object(
     tx: &Transaction<'_>,
     bucket: &str,
     key: &str,
-    file_id: i64,
-    size: i64,
-    etag: &[u8],
-    parts: Option<(&[i64], &[i64])>,
+    write: ObjectWrite<'_>,
 ) -> Result<()> {
+    lock_object_key(tx, bucket, key).await?;
     let old = tx
         .query_typed_opt(
-            "SELECT file_id, parts FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE",
+            "SELECT file_id, parts, etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE",
             &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
         )
         .await?;
-    let (ids, ends) = parts.unzip();
+    let allowed = match write.condition {
+        PutCondition::Unconditional => true,
+        PutCondition::IfAbsent => old.is_none(),
+        PutCondition::IfMatch(want) => match &old {
+            Some(row) => hex(&row.try_get::<_, Vec<u8>>(2)?) == *want,
+            None => false,
+        },
+    };
+    if !allowed {
+        return Err(PreconditionFailed.into());
+    }
+    let (ids, ends) = write.parts.unzip();
     tx.query_typed(
         "INSERT INTO s3p.objects (bucket, key, file_id, size, etag, parts, part_ends) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) \
@@ -786,9 +860,9 @@ async fn swap_object(
         &[
             (&bucket, Type::TEXT),
             (&key, Type::TEXT),
-            (&file_id, Type::INT8),
-            (&size, Type::INT8),
-            (&etag, Type::BYTEA),
+            (&write.file_id, Type::INT8),
+            (&write.size, Type::INT8),
+            (&write.etag, Type::BYTEA),
             (&ids, Type::INT8_ARRAY),
             (&ends, Type::INT8_ARRAY),
         ],
@@ -797,6 +871,17 @@ async fn swap_object(
     if let Some(r) = old {
         reap(tx, r.try_get(0)?, r.try_get(1)?).await?;
     }
+    Ok(())
+}
+
+// An absent row cannot be locked with FOR UPDATE. Mutations of the same key
+// must serialize before looking up the old file or checking a precondition.
+async fn lock_object_key(tx: &Transaction<'_>, bucket: &str, key: &str) -> Result<()> {
+    tx.query_typed(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0) # hashtextextended($2, 1))",
+        &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+    )
+    .await?;
     Ok(())
 }
 
@@ -838,6 +923,7 @@ fn publish_cache(
 pub async fn delete(pool: &Pool, bucket: &str, key: &str) -> Result<bool> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
+    lock_object_key(&tx, bucket, key).await?;
     let old = tx
         .query_typed_opt(
             "DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id, parts",
@@ -1021,7 +1107,19 @@ pub async fn complete_upload(
         ends.push(size);
     }
     let etag = hasher.finalize().to_vec();
-    swap_object(&tx, &bucket, &key, ids[0], size, &etag, Some((&ids, &ends))).await?;
+    swap_object(
+        &tx,
+        &bucket,
+        &key,
+        ObjectWrite {
+            file_id: ids[0],
+            size,
+            etag: &etag,
+            parts: Some((&ids, &ends)),
+            condition: &PutCondition::Unconditional,
+        },
+    )
+    .await?;
     tx.query_typed(
         "DELETE FROM s3p.uploads WHERE upload_id = $1",
         &[(&upload_id, Type::TEXT)],
@@ -1182,6 +1280,9 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::aws::AmazonS3Builder;
+    use object_store::path::Path;
+    use object_store::ObjectStoreExt;
 
     #[tokio::test]
     #[ignore = "requires kind; run just kind-contract"]
@@ -1205,19 +1306,25 @@ mod tests {
         .await?;
         drop(tx);
 
-        // PostgreSQL rejects NUL in the object key at the publish step,
-        // *after* COPY has received its rows. Neither action may commit.
+        // The precondition fails after COPY has received its rows.
         let result = ingest_writer(
             pool.clone(),
             file_id,
             WriterTarget::Object {
                 bucket: "pgvs3-contract".to_owned(),
-                key: "invalid\0key".to_owned(),
+                key: format!("contract/failed-publish-{file_id}"),
+                condition: PutCondition::IfMatch("\"missing\"".to_owned()),
             },
             rx,
         )
         .await;
-        anyhow::ensure!(result.is_err(), "invalid key unexpectedly published");
+        anyhow::ensure!(
+            result
+                .unwrap_err()
+                .downcast_ref::<PreconditionFailed>()
+                .is_some(),
+            "conditional publish did not fail at the expected boundary"
+        );
         let count: i64 = pool
             .get()
             .await?
@@ -1228,6 +1335,93 @@ mod tests {
             .await?
             .try_get(0)?;
         anyhow::ensure!(count == 0, "failed publish left orphan chunk rows");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires kind; run just kind-contract"]
+    async fn concurrent_creates_leave_no_hidden_chunks() -> Result<()> {
+        let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
+        let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("pgvs3-contract")
+            .with_region("us-east-1")
+            .with_endpoint(&endpoint)
+            .with_access_key_id("cachebench")
+            .with_secret_access_key("cachebench-local-only")
+            .with_allow_http(true)
+            .build()?;
+        let key = format!("contract/concurrent-{}", std::process::id());
+        let path = Path::from(key.clone());
+        let result: Result<()> = async {
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let id: i64 = pool
+                    .get()
+                    .await?
+                    .query_typed_one(
+                        "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
+                        &[],
+                    )
+                    .await?
+                    .try_get(0)?;
+                ids.push(id);
+            }
+            let mut writers = Vec::new();
+            for id in &ids {
+                let (tx, rx) = tokio::sync::mpsc::channel(2);
+                tx.send(IngestMsg::Data(Bytes::from(vec![
+                    *id as u8;
+                    ROW_BYTES as usize + 1
+                ])))
+                .await?;
+                drop(tx);
+                writers.push(ingest_writer(
+                    pool.clone(),
+                    *id,
+                    WriterTarget::Object {
+                        bucket: "pgvs3-contract".to_owned(),
+                        key: key.clone(),
+                        condition: PutCondition::IfAbsent,
+                    },
+                    rx,
+                ));
+            }
+            let (one, two) = tokio::join!(writers.remove(0), writers.remove(0));
+            anyhow::ensure!(
+                one.is_ok() != two.is_ok(),
+                "exactly one CREATE should commit"
+            );
+            for failed in [one, two].into_iter().filter_map(Result::err) {
+                anyhow::ensure!(failed.downcast_ref::<PreconditionFailed>().is_some());
+            }
+            let conn = pool.get().await?;
+            let current: i64 = conn
+                .query_typed_one(
+                    "SELECT file_id FROM s3p.objects WHERE bucket = $1 AND key = $2",
+                    &[(&"pgvs3-contract", Type::TEXT), (&key, Type::TEXT)],
+                )
+                .await?
+                .try_get(0)?;
+            for id in ids {
+                let count: i64 = conn
+                    .query_typed_one(
+                        "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                        &[(&id, Type::INT8)],
+                    )
+                    .await?
+                    .try_get(0)?;
+                anyhow::ensure!(
+                    count == if id == current { 2 } else { 0 },
+                    "failed COPY left hidden chunks"
+                );
+            }
+            Ok(())
+        }
+        .await;
+        let cleanup = store.delete(&path).await;
+        result?;
+        cleanup?;
         Ok(())
     }
 }

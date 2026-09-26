@@ -16,9 +16,10 @@ use s3s::dto::{
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketOutput,
     CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketOutput,
     DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-    GetObjectInput, GetObjectOutput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-    ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput,
-    PutObjectOutput, Range, StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
+    ETagCondition, GetObjectInput, GetObjectOutput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
+    PutObjectInput, PutObjectOutput, Range, StreamingBlob, Timestamp, UploadPartInput,
+    UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
@@ -34,6 +35,10 @@ pub struct PgS3 {
 
 fn etag(raw: &[u8]) -> Option<ETag> {
     format!("\"{}\"", db::hex(raw)).parse().ok()
+}
+
+fn valid_etag(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn internal(e: impl std::fmt::Display) -> s3s::S3Error {
@@ -191,6 +196,14 @@ impl S3 for PgS3 {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let mut input = req.input;
+        let condition = match (input.if_match.as_ref(), input.if_none_match.as_ref()) {
+            (None, None) => db::PutCondition::Unconditional,
+            (None, Some(ETagCondition::Any)) => db::PutCondition::IfAbsent,
+            (Some(ETagCondition::ETag(ETag::Strong(value))), None) if valid_etag(value) => {
+                db::PutCondition::IfMatch(value.to_owned())
+            }
+            _ => return Err(s3_error!(InvalidRequest)),
+        };
         if !db::bucket_exists(&self.pool, &input.bucket)
             .await
             .map_err(internal)?
@@ -202,13 +215,20 @@ impl S3 for PgS3 {
             .take()
             .unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
         // Streams into its own COPY (never buffered whole); the writer hashes.
-        let writer =
-            db::ChunkWriter::start_object(self.pool.clone(), input.bucket.clone(), input.key)
-                .await
-                .map_err(internal)?;
+        let writer = db::ChunkWriter::start_object_if(
+            self.pool.clone(),
+            input.bucket.clone(),
+            input.key,
+            condition,
+        )
+        .await
+        .map_err(internal)?;
         let (_size, sum) = match db::ingest_body(writer, body).await {
             Ok(done) => done,
             Err(e) => {
+                if e.downcast_ref::<db::PreconditionFailed>().is_some() {
+                    return Err(s3_error!(PreconditionFailed));
+                }
                 return Err(
                     if db::bucket_exists(&self.pool, &input.bucket)
                         .await
@@ -232,6 +252,13 @@ impl S3 for PgS3 {
         req: S3Request<s3s::dto::DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
+        if input.if_match.is_some()
+            || input.if_match_size.is_some()
+            || input.if_match_last_modified_time.is_some()
+            || input.version_id.is_some()
+        {
+            return Err(s3_error!(NotImplemented));
+        }
         if !db::bucket_exists(&self.pool, &input.bucket)
             .await
             .map_err(internal)?

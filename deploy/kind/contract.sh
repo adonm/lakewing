@@ -3,6 +3,8 @@
 # Port-forwards are local to this host (also works on the EC2 kind rig).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+mode=${1:-contract}
+case "$mode" in contract|churn) ;; *) echo "unknown contract mode: $mode" >&2; exit 2 ;; esac
 
 kubectl=(kubectl --context kind-pgvs3 -n pgvs3)
 mapfile -t pods < <("${kubectl[@]}" get pods -l app=pgvs3 -o json | python3 -c '
@@ -65,5 +67,10 @@ bash deploy/kind/buckets.sh "$PGVS3_TEST_ENDPOINT_A" pgvs3-contract
 # A previous failed run may have left published *test* objects behind. Purge
 # only our dedicated contract prefix through S3, never with table operations.
 mise exec -- mbx test -p pgvs3 --test s3_contract clean_failed_prior_contract_objects -- --ignored --exact
-mise exec -- mbx test -p pgvs3 --test s3_contract -- --ignored --skip clean_failed_prior_contract_objects --test-threads=1
-mise exec -- mbx test -p pgvs3 --lib -- --ignored --test-threads=1
+if [ "$mode" = churn ]; then
+  mise exec -- mbx test -p pgvs3 --test s3_contract sustained_churn_and_db_reclaim -- --ignored --exact --nocapture
+else
+  mise exec -- mbx test -p pgvs3 --test s3_contract -- --ignored \
+    --skip clean_failed_prior_contract_objects --skip sustained_churn_and_db_reclaim --test-threads=1
+  mise exec -- mbx test -p pgvs3 --lib -- --ignored --test-threads=1
+fi

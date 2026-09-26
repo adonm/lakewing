@@ -196,6 +196,19 @@ case ${1:-} in
     check_account
     ssh_run 'cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora ~/.local/bin/mise exec -- just kind-contract'
     ;;
+  churn)
+    check_account
+    remote='cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora'
+    for k in PGVS3_CHURN_ROUNDS PGVS3_CHURN_MIB; do
+      if [ -n "${!k:-}" ]; then
+        [[ "${!k}" =~ ^[0-9]+$ ]] || die "$k must be a positive integer"
+        remote+=" $k=${!k}"
+      fi
+    done
+    mkdir -p .tmp/pgvs3/rig-out
+    ssh_run "$remote ~/.local/bin/mise exec -- just kind-churn" \
+      | tee ".tmp/pgvs3/rig-out/churn-$(date -u +%Y%m%dT%H%M%SZ).log"
+    ;;
   bench)
     check_account
     # Export only the same suite knobs kind-bench accepts; no database secret
@@ -238,5 +251,5 @@ case ${1:-} in
     rm -f "$key_file" "$known_hosts"
     echo "rig: deleted $stack and its key pair"
     ;;
-  *) die 'usage: rig.sh up|sync|contract|validate|bench|results|status|ssh|reset|teardown' ;;
+  *) die 'usage: rig.sh up|sync|contract|churn|validate|bench|results|status|ssh|reset|teardown' ;;
 esac

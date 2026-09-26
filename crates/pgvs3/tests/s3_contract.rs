@@ -6,10 +6,21 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio_postgres::types::Type;
 
 fn bucket_request(endpoint: &str, method: &str, bucket: &str) -> Result<(u16, String)> {
+    signed_request(endpoint, method, bucket, &[])
+}
+
+fn signed_request(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+) -> Result<(u16, String)> {
     let mut cmd = std::process::Command::new("curl");
     cmd.args([
         "-sS",
@@ -25,7 +36,10 @@ fn bucket_request(endpoint: &str, method: &str, bucket: &str) -> Result<(u16, St
     if method == "HEAD" {
         cmd.arg("--head");
     }
-    let output = cmd.arg(format!("{endpoint}/{bucket}")).output()?;
+    for header in headers {
+        cmd.args(["-H", header]);
+    }
+    let output = cmd.arg(format!("{endpoint}/{path}")).output()?;
     ensure!(output.status.success(), "curl failed: {:?}", output.stderr);
     let text = String::from_utf8(output.stdout)?;
     let (body, code) = text
@@ -64,6 +78,26 @@ fn endpoints() -> Result<(AmazonS3, AmazonS3)> {
 async fn pool() -> Result<pgvs3::db::Pool> {
     let url = std::env::var("PGVS3_TEST_DB_URL")?;
     pgvs3::db::connect(&url).await
+}
+
+fn p95(samples: &mut [u128]) -> u128 {
+    samples.sort_unstable();
+    samples[((samples.len() * 95).div_ceil(100) - 1).min(samples.len() - 1)]
+}
+
+async fn chunk_maintenance(pool: &pgvs3::db::Pool) -> Result<(i64, i64, i64)> {
+    let row = pool
+        .get()
+        .await?
+        .query_typed_one(
+            "SELECT coalesce(sum(n_dead_tup), 0)::int8, \
+                coalesce(sum(autovacuum_count), 0)::int8, \
+                coalesce(sum(pg_total_relation_size(relid)), 0)::int8 \
+         FROM pg_stat_user_tables WHERE schemaname = 's3p' AND relname LIKE 'chunks_%'",
+            &[],
+        )
+        .await?;
+    Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
 }
 
 #[tokio::test]
@@ -274,6 +308,114 @@ async fn overwrite_and_delete_are_visible_on_both_gateways() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires kind; run just kind-contract"]
+async fn conditional_puts_are_atomic_across_gateways() -> Result<()> {
+    let (a, b) = endpoints()?;
+    let path = Path::from(format!("{}/conditional", prefix()));
+    let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+    let result: Result<()> = async {
+        let first = a
+            .put_opts(
+                &path,
+                Bytes::from_static(b"first").into(),
+                PutMode::Create.into(),
+            )
+            .await?;
+        let duplicate = b
+            .put_opts(
+                &path,
+                Bytes::from_static(b"duplicate").into(),
+                PutMode::Create.into(),
+            )
+            .await;
+        ensure!(matches!(
+            duplicate,
+            Err(object_store::Error::AlreadyExists { .. })
+                | Err(object_store::Error::Precondition { .. })
+        ));
+        ensure!(a.get(&path).await?.bytes().await? == b"first"[..]);
+
+        let old = UpdateVersion {
+            e_tag: first.e_tag,
+            version: None,
+        };
+        let updated = b
+            .put_opts(
+                &path,
+                Bytes::from_static(b"updated").into(),
+                PutMode::Update(old.clone()).into(),
+            )
+            .await?;
+        let stale = a
+            .put_opts(
+                &path,
+                Bytes::from_static(b"stale").into(),
+                PutMode::Update(old).into(),
+            )
+            .await;
+        ensure!(matches!(
+            stale,
+            Err(object_store::Error::Precondition { .. })
+        ));
+        ensure!(b.get(&path).await?.bytes().await? == b"updated"[..]);
+        ensure!(updated.e_tag.is_some());
+
+        let (status, body) = signed_request(
+            &endpoint,
+            "PUT",
+            &format!("pgvs3-contract/{path}"),
+            &["If-None-Match: not-a-wildcard"],
+        )?;
+        ensure!(status == 400 && body.contains("InvalidRequest"));
+        let (status, body) = signed_request(
+            &endpoint,
+            "DELETE",
+            &format!("pgvs3-contract/{path}"),
+            &["If-Match: *"],
+        )?;
+        ensure!(status == 501 && body.contains("NotImplemented"));
+        ensure!(a.get(&path).await?.bytes().await? == b"updated"[..]);
+
+        a.delete(&path).await?;
+        let left = a.put_opts(
+            &path,
+            Bytes::from_static(b"left").into(),
+            PutOptions::from(PutMode::Create),
+        );
+        let right = b.put_opts(
+            &path,
+            Bytes::from_static(b"right").into(),
+            PutOptions::from(PutMode::Create),
+        );
+        let (left, right) = tokio::join!(left, right);
+        ensure!(
+            left.is_ok() != right.is_ok(),
+            "exactly one conditional create must win"
+        );
+        ensure!(
+            matches!(
+                left,
+                Ok(_)
+                    | Err(object_store::Error::Precondition { .. })
+                    | Err(object_store::Error::AlreadyExists { .. })
+            ) && matches!(
+                right,
+                Ok(_)
+                    | Err(object_store::Error::Precondition { .. })
+                    | Err(object_store::Error::AlreadyExists { .. })
+            ),
+            "a conditional create failed for an unrelated reason"
+        );
+        let actual = a.get(&path).await?.bytes().await?;
+        ensure!(actual == b"left"[..] || actual == b"right"[..]);
+        Ok(())
+    }
+    .await;
+    let _ = a.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
 async fn multipart_completion_and_abort_manage_staged_rows() -> Result<()> {
     let (a, b) = endpoints()?;
     let key = format!("{}/multipart", prefix());
@@ -470,4 +612,121 @@ async fn scheduled_expiry_removes_old_empty_uploads() -> Result<()> {
     .await;
     let _ = upload.abort().await;
     result
+}
+
+#[tokio::test]
+#[ignore = "opt-in large-object churn; run just kind-churn or just rig-churn"]
+async fn sustained_churn_and_db_reclaim() -> Result<()> {
+    let rounds: usize = std::env::var("PGVS3_CHURN_ROUNDS")
+        .unwrap_or_else(|_| "64".to_owned())
+        .parse()?;
+    let mib: usize = std::env::var("PGVS3_CHURN_MIB")
+        .unwrap_or_else(|_| "32".to_owned())
+        .parse()?;
+    ensure!((1..=128).contains(&rounds) && (1..=64).contains(&mib));
+    let (a, b) = endpoints()?;
+    let pool = pool().await?;
+    let run = prefix();
+    let hot = Path::from(format!("{run}/hot"));
+    let stable = Path::from(format!("{run}/stable"));
+    let partial = Path::from(format!("{run}/partial"));
+    let mut bytes = vec![0; mib * 1024 * 1024];
+    pgvs3::seed::Filler::new(0x5EED).fill(&mut bytes);
+    let stable_body = Bytes::from(vec![0xa5; 1024 * 1024]);
+    a.put(&stable, stable_body.clone().into()).await?;
+    let baseline: Result<(u128, Vec<u128>)> = async {
+        let mut baseline = Vec::new();
+        for _ in 0..100 {
+            let t0 = std::time::Instant::now();
+            let got = b.get_range(&stable, 0..256 * 1024).await?;
+            ensure!(got.as_ref() == &stable_body[..256 * 1024]);
+            baseline.push(t0.elapsed().as_micros());
+        }
+        Ok((p95(&mut baseline), baseline))
+    }
+    .await;
+    let (baseline_p95, _) = baseline?;
+    let before = chunk_maintenance(&pool).await?;
+    let running = Arc::new(AtomicBool::new(true));
+    let reading = running.clone();
+    let reader_path = stable.clone();
+    let reader = tokio::spawn(async move {
+        let mut samples = Vec::new();
+        while reading.load(Ordering::Relaxed) {
+            let t0 = std::time::Instant::now();
+            let got = b.get_range(&reader_path, 0..256 * 1024).await?;
+            ensure!(got.as_ref() == &stable_body[..256 * 1024]);
+            samples.push(t0.elapsed().as_micros());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok::<_, anyhow::Error>(samples)
+    });
+
+    let work: Result<(Vec<u128>, Vec<u128>)> = async {
+        let mut puts = Vec::new();
+        let mut deletes = Vec::new();
+        for round in 0..rounds {
+            let conn = pool.get().await?;
+            let old = conn.query_typed_opt(
+                "SELECT file_id FROM s3p.objects WHERE bucket = $1 AND key = $2",
+                &[(&"pgvs3-contract", Type::TEXT), (&hot.as_ref(), Type::TEXT)],
+            ).await?.map(|r| r.try_get::<_, i64>(0)).transpose()?;
+            if round % 8 == 7 {
+                let t0 = std::time::Instant::now();
+                a.delete(&hot).await?;
+                deletes.push(t0.elapsed().as_micros());
+            }
+            bytes[0] = round as u8;
+            let t0 = std::time::Instant::now();
+            a.put(&hot, Bytes::copy_from_slice(&bytes).into()).await?;
+            puts.push(t0.elapsed().as_micros());
+            ensure!(a.head(&hot).await?.size == bytes.len() as u64);
+            if let Some(id) = old {
+                let count: i64 = conn.query_typed_one(
+                    "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                    &[(&id, Type::INT8)],
+                ).await?.try_get(0)?;
+                ensure!(count == 0, "overwrite/delete left {count} unreferenced rows for {id}");
+            }
+            if round % 8 == 7 {
+                let mut upload = a.put_multipart(&partial).await?;
+                let part: Result<i64> = async {
+                    upload.put_part(Bytes::from(vec![round as u8; 5 * 1024 * 1024 + 17]).into()).await?;
+                    Ok(conn.query_typed_one(
+                        "SELECT p.file_id FROM s3p.uploads u JOIN s3p.upload_parts p USING (upload_id) \
+                         WHERE u.bucket = $1 AND u.key = $2",
+                        &[(&"pgvs3-contract", Type::TEXT), (&partial.as_ref(), Type::TEXT)],
+                    ).await?.try_get(0)?)
+                }.await;
+                let aborted = upload.abort().await;
+                let id = part?;
+                aborted?;
+                let rows: i64 = conn.query_typed_one(
+                    "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                    &[(&id, Type::INT8)],
+                ).await?.try_get(0)?;
+                ensure!(rows == 0, "aborted part left {rows} hidden rows");
+            }
+        }
+        Ok((puts, deletes))
+    }.await;
+    running.store(false, Ordering::Relaxed);
+    let read_result = reader.await;
+    let _ = a.delete(&hot).await;
+    let _ = a.delete(&stable).await;
+    let _ = a.delete(&partial).await;
+    let (mut puts, mut deletes) = work?;
+    let mut reads = read_result??;
+    ensure!(!reads.is_empty() && !puts.is_empty());
+    let after = chunk_maintenance(&pool).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+    let settled = chunk_maintenance(&pool).await?;
+    println!(
+        "{{\"suite\":\"churn\",\"rounds\":{rounds},\"object_mib\":{mib},\"reads\":{},\"baseline_read_p95_us\":{baseline_p95},\"churn_read_p95_us\":{},\"put_p95_ms\":{:.1},\"delete_p95_ms\":{:.1},\"dead_before\":{},\"dead_after\":{},\"dead_settled\":{},\"autovac_before\":{},\"autovac_settled\":{},\"partition_mib_before\":{},\"partition_mib_settled\":{}}}",
+        reads.len(), p95(&mut reads), p95(&mut puts) as f64 / 1000.0,
+        if deletes.is_empty() { 0.0 } else { p95(&mut deletes) as f64 / 1000.0 },
+        before.0, after.0, settled.0, before.1, settled.1,
+        before.2 / (1024 * 1024), settled.2 / (1024 * 1024),
+    );
+    Ok(())
 }

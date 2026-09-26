@@ -57,7 +57,10 @@ file id, size, sha256 ETag and, for multipart objects, the list of part files;
   part. A direct PUT commits its chunks and object row in one transaction:
   interrupted writes cannot leave committed, unaddressable bytes. Parts
   commit with their upload record; Complete publishes the ordered part list
-  without moving data. Acknowledged writes use synchronous commits.
+  without moving data. `If-None-Match: *` and strong `If-Match` PUTs are
+  checked atomically at publication; mutations of the same key serialize
+  so concurrent creates cannot strand chunks. Unsupported conditional DELETEs
+  fail instead of silently deleting. Acknowledged writes use synchronous commits.
 - **Reads** turn a byte range into a row range by arithmetic (row =
   offset / 8120) and run one row-range query per 8 MiB. Bigger ranges run up
   to 8 of those in parallel on separate connections. Rows go to the client as
@@ -379,14 +382,23 @@ with the selected AWS profile before running the commands below.
 ```sh
 just rig-up                       # tagged CloudFormation stack; sync, deploy, validate
 just rig-contract                 # Rust S3 contract against Aurora's gateway pods
+just rig-churn                    # opt-in large overwrite/delete + multipart churn and DB stats
 just rig-validate                 # CI's kind smoke gate against Aurora
 SUITES=tpch,click just rig-bench  # or run all five suites with just rig-bench
 QUICK=1 just rig-bench            # smoke-scale benchmark
-just rig-reset                   # pre-release test data only; explicit confirmation
+just rig-reset                    # pre-release test data only; explicit confirmation
 just rig-results                  # download latest JSONL after a disconnected run
 just rig-status                   # stack status and endpoints
 just rig-teardown                 # terminates the rig and its related resources
 ```
+
+`just kind-churn` and `just rig-churn` run a separate, opt-in two-gateway test
+over 64 × 32 MiB PUTs (override with `PGVS3_CHURN_ROUNDS` and
+`PGVS3_CHURN_MIB`). They audit old chunk file IDs and aborted parts, measure
+read and write p95, and sample partition dead tuples/autovacuum before and
+90 seconds after. Aurora churn logs go to `.tmp/pgvs3/rig-out/`; the test
+cleans its objects through S3. These are measurements, not an assertion that
+autovacuum shrinks relation files.
 
 The rig uses an m7i.4xlarge (16 vCPU, 64 GiB), a 250 GiB gp3 volume and
 Aurora scaling from 2 to 16 ACUs. Results are copied to

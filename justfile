@@ -62,6 +62,11 @@ smoke: kind-up
 kind-contract:
     bash deploy/kind/contract.sh
 
+# Opt-in sustained overwrite/delete/multipart churn with DB vacuum evidence.
+[group('kind')]
+kind-churn:
+    bash deploy/kind/contract.sh churn
+
 # Load generator: 8 GiB of 64 MiB objects (a stable set for `just micro`).
 [group('bench')]
 seed:
@@ -173,6 +178,11 @@ rig-validate:
 [group('rig')]
 rig-contract:
     bash deploy/kind/rig.sh contract
+
+# Run kind-churn against Aurora; results are copied into .tmp/pgvs3/rig-out.
+[group('rig')]
+rig-churn:
+    bash deploy/kind/rig.sh churn
 
 # Run the kind benchmark suites on EC2; SUITES, QUICK, SF, DOCS, etc. work here too.
 [group('rig')]
