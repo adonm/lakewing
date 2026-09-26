@@ -215,6 +215,42 @@ for an Aurora-backed 100M-log test. Quickwit's selective in-memory caches
 remain on; putting entire splits in tmpfs would spend much more RAM without
 evidence of a latency benefit.
 
+### Aurora full rerun, 2026-09-26
+
+The current bucket/atomic-write layout ran the same scale as the earlier EC2
+kind full test: TPC-H SF10, ClickBench 10M rows, 1M Quickwit logs, 8 GiB seed,
+two gateway replicas, one Quickwit core and two searchers. Disk split caching
+is now off. The full result is in `.tmp/pgvs3/rig-out/` (ignored by Git).
+
+| Measure | Current | Earlier full run |
+| --- | ---: | ---: |
+| pgbench scale 10, 16 clients | 1,675 TPS | 1,763 TPS |
+| TPC-H 22 queries | 7.35 s first · 5.79 s warm | 7.4 s first · 5.8 s warm |
+| ClickBench 43 queries | 5.36 s first · 4.28 s warm | 5.2 s first · 4.3 s warm |
+| Quickwit repeated queries | p50 6.95 ms · p95 9.15 ms, 0 errors | p50 6.9 ms · p95 8.8 ms |
+| 1–8 MiB GET, 8–64 readers | ~1.39 GiB/s | ~1.4 GiB/s |
+| 64 KiB GET, 32 readers | 611 MiB/s | 847 MiB/s |
+
+An additional 400 fresh 10%-time-window Quickwit queries against the loaded
+1M-log index had p50 14.7 ms, p95 18.7 ms and zero errors. Small-GET
+throughput merits a controlled A/B; the unchanged large-GET plateau does not
+rule out a regression there. Minute-granularity writer metrics reached 16 ACUs
+and 147 connections, with CPU at most 57% for a minute. Those metrics cannot
+identify the 1.39 GiB/s bottleneck by themselves; EC2 network metrics were
+only available at five-minute resolution.
+
+### Aurora overwrite/abort churn, 2026-09-26
+
+`just rig-churn` overwrote one key 128 times with 32 MiB PUTs (4 GiB written),
+periodically deleted it and aborted multipart parts while another gateway read
+a stable 256 KiB range. The test found no stranded chunks. Across 683 reads,
+read p95 rose from 2.8 ms before churn to 18.0 ms during it; PUT p95 was
+449 ms and DELETE p95 46 ms. Estimated dead chunk tuples rose from 3,655 to
+26,736 immediately after churn, then fell to 2,844 after 90 seconds as
+partition autovacuum counts increased by 93. Partition storage stayed near
+1 GiB. This is one run, not proof of the cause of the read-latency increase;
+profile pool waits and Aurora I/O before moving deletes to a queue.
+
 ### Quickwit search at 100M logs, 2026-09-25
 
 This historical run used a file-backed S3 metastore; current deployments
