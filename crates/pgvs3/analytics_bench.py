@@ -89,7 +89,7 @@ def download_spatial(src: str, sf: float) -> None:
             continue
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         print(f"fetch {rel} ({f.get('size', 0) / 2**20:.0f} MiB)")
-        subprocess.run(["curl", "-fsL", "-o", dest, f"{HF_DL}/{rel}"], check=True)
+        subprocess.run(["curl", "-fsL", "--retry", "3", "-o", dest, f"{HF_DL}/{rel}"], check=True)
 
 
 def src_glob(bench: str, src: str, sf: float, table: str, parts: int) -> str:
@@ -129,9 +129,24 @@ def load(con, stack: str, bench: str, src: str, sf: float, parts: int) -> tuple[
     return __import__("time").perf_counter() - t0, rows
 
 
-def run_pass(con, queries: list[str], lo: int, hi: int, timeout: float) -> tuple[dict, dict]:
+def query_numbers(spec: str, count: int) -> list[int]:
+    numbers = []
+    for item in spec.split(","):
+        bounds = item.split("-")
+        if len(bounds) not in (1, 2) or not all(bound.isdigit() for bound in bounds):
+            raise ValueError(f"invalid query selection: {spec}")
+        lo, hi = int(bounds[0]), int(bounds[-1])
+        if not 1 <= lo <= hi <= count:
+            raise ValueError(f"query selection outside 1-{count}: {item}")
+        numbers.extend(range(lo, hi + 1))
+    if len(set(numbers)) != len(numbers):
+        raise ValueError(f"duplicate queries in selection: {spec}")
+    return numbers
+
+
+def run_pass(con, queries: list[str], numbers: list[int], timeout: float) -> tuple[dict, dict]:
     times, errors = {}, {}
-    for n in range(lo, hi + 1):
+    for n in numbers:
         secs, err = benchlib.run_sql(con, queries[n - 1], timeout)
         times[f"Q{n}"] = secs
         if err:
@@ -150,7 +165,7 @@ def main() -> None:
     ap.add_argument("--passes", type=int, default=2)
     ap.add_argument("--parts", type=int, default=0,
                     help="clickbench fast loop: load N of the 100 1%% slices (0 = full hits.parquet)")
-    ap.add_argument("--queries", default=None, help="range like 1-43 (default: all)")
+    ap.add_argument("--queries", default=None, help="query numbers/ranges like 1-3,6 (default: all)")
     ap.add_argument("--query-timeout", type=float, default=0, help="per-query seconds (0 = unlimited)")
     ap.add_argument("--memory-limit", default=None, help="DuckDB memory_limit (default: DuckDB's 80%% of RAM)")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
@@ -179,15 +194,14 @@ def main() -> None:
             setattr(args, attr, default)
 
     queries = load_queries(bench)
-    lo, _, hi = (args.queries or f"1-{len(queries)}").partition("-")
-    lo, hi = int(lo), int(hi or lo)
+    numbers = query_numbers(args.queries or f"1-{len(queries)}", len(queries))
 
     if args.download:
         (download_click(args.src_dir, args.parts) if bench == "click"
          else download_spatial(args.src_dir, args.sf))
 
     con = benchlib.connect(args.stack, args, extensions=("spatial",) if bench == "spatial" else ())
-    record = {"bench": bench, "stack": args.stack, "duckdb": duckdb.__version__, "passes": []}
+    record = {"bench": bench, "stack": args.stack, "duckdb": duckdb.__version__, "queries": numbers, "passes": []}
     if bench == "spatial":
         record["sf"] = args.sf
     if args.views_only:
@@ -199,9 +213,9 @@ def main() -> None:
 
     for p in range(args.passes):
         before = benchlib.gateway_counters(benchlib.gateway_stats())
-        times, errors = run_pass(con, queries, lo, hi, args.query_timeout or None)
+        times, errors = run_pass(con, queries, numbers, args.query_timeout or None)
         after = benchlib.gateway_counters(benchlib.gateway_stats())
-        # Resample until both ends of the diff come from one gateway process.
+        # Resample until both ends of the diff come from one gateway instance.
         for _ in range(20):
             if not (before and after and after[2] != before[2]):
                 break
@@ -209,10 +223,11 @@ def main() -> None:
         total = sum(times.values())
         rec = {"times": times, "errors": errors}
         line = f"[{args.stack}] pass {p + 1}: total {total:.1f}s"
-        if before and after and after[2] == before[2]:  # read KPIs: this pass's traffic through the gateway
+        if before and after and after[2] == before[2]:
             mib, gets = after[0] - before[0], after[1] - before[1]
-            rec.update(read_mib=mib, gets=gets, read_mib_s=round(mib / max(total, 1e-9), 1))
-            line += f" | proxy {gets} GETs, {mib} MiB, {rec['read_mib_s']:.0f} MiB/s"
+            if mib >= 0 and gets >= 0:
+                rec.update(sampled_gateway_read_mib=mib, sampled_gateway_gets=gets)
+                line += f" | one gateway: {gets} GETs, {mib} MiB (not cluster total)"
         record["passes"].append(rec)
         print(line)
         print("  " + "  ".join(f"{k}={v:.2f}" for k, v in times.items()))
@@ -227,7 +242,7 @@ def main() -> None:
 
     benchlib.write_record(record, args.out or f".tmp/pgvs3/{name}-{args.stack}-sf{args.sf:g}.json")
     # One compact line for the results JSONL (the pretty record goes to --out).
-    print(json.dumps({"suite": bench, "stack": args.stack,
+    print(json.dumps({"suite": bench, "stack": args.stack, "queries": numbers,
                       "load_s": record.get("load_s"), "rows": record.get("rows"),
                       "pass_s": [round(sum(p["times"].values()), 2) for p in record["passes"]]}))
     if any(p["errors"] for p in record["passes"]):

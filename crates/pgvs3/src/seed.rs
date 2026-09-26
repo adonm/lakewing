@@ -91,6 +91,5 @@ pub async fn run(pool: &db::Pool, cfg: SeedConfig) -> Result<()> {
         total.as_secs_f64(),
         total_bytes / 1024.0 / 1024.0 / total.as_secs_f64()
     );
-    db::sizes(pool).await?;
     Ok(())
 }

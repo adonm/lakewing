@@ -1,7 +1,6 @@
 # Benchmark image: pgbench (OLTP), duckdb (TPC-H + ClickBench over DuckLake),
-# opensearch-benchmark (Quickwit's ES API) and the pgvs3 stress load generator.
-# Built by `just kind-bench` on the kind node (image is host-built, then
-# `kind load`-ed), so no registry round trip.
+# OpenSearch Benchmark (Quickwit's ES API) and the pgvs3 stress load generator.
+# Built by `just kind-bench` on the host and loaded into kind.
 FROM python:3.12-slim
 
 RUN apt-get update \
@@ -22,13 +21,13 @@ RUN . /etc/os-release \
       postgresql-client-18 postgresql-18 \
  && rm -rf /var/lib/apt/lists/*
 
-# duckdb matches the harness pins; opensearch-benchmark needs Python <3.14.
-RUN pip install --no-cache-dir "duckdb==1.5.2" "opensearch-benchmark"
+# Keep the OSB driver fixed so ingest/search comparisons use the same client.
+RUN pip install --no-cache-dir "duckdb==2.0.0.dev2609222040" "opensearch-benchmark==2.4.0"
 
 WORKDIR /bench
-# The suite scripts wrap the repo's own harnesses (harness/) so one image
-# serves all four without duplicating the DuckLake/PostgreSQL wiring.
-COPY suites/ /bench/suites/
-COPY harness/ /bench/harness/
+COPY deploy/bench/suites/ /bench/suites/
+COPY crates/pgvs3/benchlib.py crates/pgvs3/tpch_bench.py \
+     crates/pgvs3/analytics_bench.py /bench/harness/
+COPY crates/pgvs3/queries/ /bench/harness/queries/
 # The load generator for the stress suite; staged here by the just recipe.
-COPY pgvs3-bin /usr/local/bin/pgvs3
+COPY deploy/bench/pgvs3-bin /usr/local/bin/pgvs3

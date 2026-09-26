@@ -214,7 +214,7 @@ case ${1:-} in
     # Export only the same suite knobs kind-bench accepts; no database secret
     # or AWS credential is sent in the command line.
     remote='cd pgvs3 && PGVS3_DB_SECRET=pgvs3-aurora'
-    for k in SUITES QUICK SCALE CLIENTS SECONDS_RUN SF PASSES PARTS QUERIES DOCS WORKERS WINDOW_FRAC SEARCH_INDEX SEED_GB REQUESTS CONCURRENCY SIZES; do
+    for k in SUITES QUICK SCALE CLIENTS SECONDS_RUN SF PASSES PARTS QUERIES DOCS WORKERS WINDOW_FRAC SEARCH_INDEX SEED_GB REQUESTS CONCURRENCY SIZES SPATIAL_SF SPATIAL_QUERIES SPATIAL_QUERY_TIMEOUT DUCKDB_MEMORY_LIMIT; do
       if [ -n "${!k:-}" ]; then remote+=" $k=$(printf '%q' "${!k}")"; fi
     done
     ssh_run "$remote ~/.local/bin/mise exec -- just kind-bench"

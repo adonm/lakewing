@@ -13,6 +13,43 @@ the catalog sees the same tables and the same data.
 - No data cache: clients such as DuckDB cache what they read. A per-process
   metadata cache only removes the lookup round trip per GET.
 
+> Postgres is all you need. ;P — for durable bytes and metadata here; DuckDB
+> and Quickwit still do the actual analytics and search.
+
+## Results at a glance
+
+On the EC2/Aurora test rig, pgvs3 served DuckLake's full ClickBench table
+(99,997,497 rows) and SpatialBench SF10 (60M trips). With the kind benchmark's
+pinned DuckDB **2.0.0 development build**, the 43 ClickBench queries took
+**35.35 s first / 30.13 s warm**; four spatial area-of-interest queries took
+**7.85 s first / 4.54 s warm**. Quickwit 0.9.1
+indexed **100M logs** with OpenSearch Benchmark (OSB) at ~230k docs/s and zero
+errors; fresh 10%-time-window search was **43.76 ms p50 / 52.04 ms p95** at
+eight clients. Prior DuckDB 1.5.2 numbers remain below for context.
+
+### Rough cost context, not a service benchmark
+
+Illustrative public US East on-demand rates, assuming 730 active hours/month
+(prices checked September 2026). These are **different architectures**, not
+same-hardware or measured ClickHouse/OpenSearch results:
+
+| Example | Compute if active 24/7 | Storage and caveat |
+| --- | ---: | --- |
+| This **test rig**: one m7i.4xlarge + 2–16 Aurora Serverless v2 I/O-Optimized ACUs | ~$1.12–$3.30/h (~$816–$2,411/mo) | Aurora ~$0.225/GB-month plus the EC2 gp3 volume (~$50/mo at 250 GB / 6k IOPS / 500 MiB/s); not a production HA topology. |
+| ClickHouse Cloud **Enterprise**: two 32 GiB replicas (8 compute units) | ~$3.12/h (~$2,279/mo) | $25.30/TB-month of stored data; backups, transfer and actual sizing add cost. Not benchmarked here. |
+| OpenSearch Serverless **NextGen**: *illustrative* four active OCUs | ~$0.96/h (~$701/mo) | Hot storage extra; can scale to zero when idle. Four OCUs are **not** validated to handle our 100M-log workload. |
+
+Sources: [Aurora](https://aws.amazon.com/rds/aurora/pricing/) ($0.156/ACU-hour),
+[EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and
+[m7i.4xlarge rate](https://cloudprice.net/aws/ec2/instances/m7i.4xlarge)
+(~$0.8064/hour), [gp3](https://aws.amazon.com/ebs/pricing/),
+[ClickHouse Cloud](https://clickhouse.com/pricing/) (Enterprise, AWS US East:
+$0.39030/compute-unit-hour), and
+[OpenSearch Service](https://aws.amazon.com/opensearch-service/pricing/)
+(example $0.24/OCU-hour). Storage formats, replication, availability, support,
+egress and sustained capacity differ. Use each vendor's calculator for a real
+deployment estimate; don't infer a price/performance winner from this table.
+
 ## Quick start
 
 Needs [mise](https://mise.jdx.dev/) and Docker (or any PostgreSQL 13+: pass
@@ -217,7 +254,7 @@ evidence of a latency benefit.
 
 ### Aurora full rerun, 2026-09-26
 
-The current bucket/atomic-write layout ran the same scale as the earlier EC2
+The bucket/atomic-write layout on DuckDB 1.5.2 ran the same scale as the earlier EC2
 kind full test: TPC-H SF10, ClickBench 10M rows, 1M Quickwit logs, 8 GiB seed,
 two gateway replicas, one Quickwit core and two searchers. Disk split caching
 is now off. The full result is in `.tmp/pgvs3/rig-out/` (ignored by Git).
@@ -238,6 +275,74 @@ rule out a regression there. Minute-granularity writer metrics reached 16 ACUs
 and 147 connections, with CPU at most 57% for a minute. Those metrics cannot
 identify the 1.39 GiB/s bottleneck by themselves; EC2 network metrics were
 only available at five-minute resolution.
+
+### OpenSearch Benchmark at 100M Quickwit logs, 2026-09-26
+
+The current PostgreSQL-metastore Quickwit 0.9.1 cluster (one indexer and two
+search-only nodes, disk split cache off) indexed a fresh 100M-document OTLP
+corpus through OSB 2.4's ES `create` bulk operation. The deterministic corpus
+was 20,218,013,718 bytes (SHA-256
+`1809bdce44079641a640f7eabee1fd922e497279a05d0dcc189501136f04b234`).
+OSB reported zero bulk errors and 230k docs/s mean bulk throughput with one
+ordered client; the complete corpus became searchable in 558 seconds after
+generation. The adapter checks exact indexed count before measuring queries.
+
+| Fresh severity-filtered 10%-time-window search | p50 | p99 | Throughput |
+| --- | ---: | ---: | ---: |
+| 1 client | 34.1 ms | 44.6 ms | 28.7 ops/s |
+| 8 clients | 43.6 ms | 55.0 ms | 179.5 ops/s |
+
+The run used Quickwit's default `stable_log` merge policy, not the tuned
+`no_merge` layout from the historical native-API 100M run below. These are
+OSB results from a portable custom workload, not stock-track or head-to-head
+OpenSearch results. The complete OSB metrics are in ignored
+`.tmp/pgvs3/rig-out/osb-100m-20260926.json`.
+
+### Full-scale analytics on Aurora, 2026-09-26
+
+With DuckDB 1.5.2, the canonical ClickBench `hits.parquet` loaded
+**99,997,497 rows** into DuckLake in 47.9 seconds. All 43 queries passed:
+34.19 seconds on the first pass and 27.21 seconds warm. Per-gateway GET counts
+from this run are not reliable: containers shared PID 1, so the harness could
+mix replica counters.
+
+Sedona-SpatialBench SF10 loaded 60M trips and 454,710 zones in 27.1 seconds.
+The area-of-interest subset Q1–Q3 and Q6 passed in 9.05 seconds first pass
+and 3.64 seconds warm:
+
+| AOI query | First pass | Warm |
+| --- | ---: | ---: |
+| Q1: nearby trip pickups | 1.87 s | 0.44 s |
+| Q2: county intersection count | 2.04 s | 0.80 s |
+| Q3: buffered-box monthly stats | 0.75 s | 0.59 s |
+| Q6: bounding-box zone/trip stats | 4.38 s | 1.81 s |
+
+The first full ClickBench attempt hit the benchmark Pod's 8 GiB memory limit;
+the full Aurora profile now permits 24 GiB with a 16 GiB DuckDB working
+limit. CI smoke keeps its smaller limit. Results live in ignored
+`.tmp/pgvs3/rig-out/`; these are DuckDB-over-DuckLake query times, not
+direct PostgreSQL scan timings.
+
+### DuckDB 2.0 full-scale rerun, 2026-09-26
+
+The same 99,997,497 ClickBench rows loaded in 50.39 seconds. All 43 queries
+passed in 35.35 seconds first pass and 30.13 seconds warm. SpatialBench SF10
+loaded 60M trips in 25.52 seconds; the AOI subset took 7.85 seconds first
+pass and 4.54 seconds warm:
+
+| AOI query | First pass | Warm |
+| --- | ---: | ---: |
+| Q1 | 2.70 s | 0.58 s |
+| Q2 | 2.45 s | 1.25 s |
+| Q3 | 0.77 s | 0.77 s |
+| Q6 | 1.93 s | 1.94 s |
+
+With the retained 100M-log index, a search-only OSB pass had zero errors:
+fresh 10%-window searches at eight clients were p50 43.76 ms, p95 52.04 ms,
+p99 57.09 ms (176 ops/s). The workloads and query times are valid, but
+per-gateway byte/GET deltas in these runs could mix two PID-1 pods; those
+counters are excluded from cross-version comparisons. This is one pass per
+version, not a controlled multi-run DuckDB A/B.
 
 ### Aurora overwrite/abort churn, 2026-09-26
 
@@ -348,7 +453,7 @@ inside its own builder without a remote compiler cache.
 ### The kind stack (local or EC2)
 
 `just kind-up && just kind-validate && just kind-bench` brings up one cluster
-and runs every workload in well under an hour with caching on — the same
+and runs every workload with caching on — the same
 commands on a laptop and on an EC2 instance, so numbers stay comparable.
 `QUICK=1 just kind-bench` runs the whole set at smoke scale first: minutes,
 to prove the wiring before spending an hour. `just kind-down` tears it down.
@@ -375,14 +480,20 @@ orchestrate these small charts. `PGVS3_DB_SECRET` selects an external database
 configuration; unset uses local PostgreSQL.
 
 The suites: `pgbench` (OLTP against the rows database), `tpch` (22 queries
-over DuckLake), `click` (43 ClickBench queries; default `PARTS=10` runs 10%
-of the canonical 13.8 GiB / 100M-row `hits`, while `PARTS=0` loads all of
-it), `search` (Quickwit on real OTLP-schema logs — latency against an
-empty index is a lie) and `stress` (the gateway's concurrency ceiling: HEAD
-and GET sweeps reporting aggregate MiB/s and req/s; `just kind-stress` runs
-it alone).
+over DuckLake), `click` (43 ClickBench queries over the full 100M-row
+`hits.parquet`), `spatial` (Sedona-SpatialBench AOIs Q1–Q3 and Q6 over SF10),
+`search` (OpenSearch Benchmark 2.4 bulk ingestion and fresh time-window queries
+against Quickwit) and `stress` (the gateway's GET concurrency ceiling).
+The standard full run defaults to 100M Quickwit logs, the full ClickBench
+dataset and SpatialBench SF10; `QUICK=1` keeps CI small (5k logs, 1M ClickBench
+rows, SpatialBench SF0.1). Use the EC2 rig for the large profile; its source
+downloads and generated corpus need tens of GiB of temporary disk. Reset the
+disposable rig databases before repeating a 100M-log ingestion run.
+Full Aurora benchmark Jobs allow 24 GiB of container memory with a 16 GiB
+DuckDB working limit; CI smoke retains the smaller default Job budget.
 
-Scale from the environment — `SF` (TPC-H), `PARTS` (ClickBench slices),
+Scale from the environment — `SF` (TPC-H), `PARTS` (ClickBench 1% slices;
+`0` is the full dataset), `SPATIAL_SF` and `SPATIAL_QUERIES` (AOI subset),
 `DOCS` and `WINDOW_FRAC` (Quickwit logs and query windows), `SEED_GB`,
 `REQUESTS`, `CONCURRENCY`, `SIZES`, `SECONDS_RUN` — for example
 `SF=30 CONCURRENCY=1,8,32,64,128 just kind-bench`. The local-only PostgreSQL
@@ -393,6 +504,39 @@ headroom. If the gateway replica or pool count changes, update
 Aurora-backed kind does not install that chart. Results land in
 `.tmp/pgvs3/kind-bench.jsonl`, one line per measurement; individual logs
 are in `.tmp/pgvs3/jobs/`.
+
+The Quickwit search suite uses the same OSB corpus, ES `create` bulk requests,
+and query DSL that can be run against OpenSearch. A loopback-only benchmark
+adapter supplies two OSB node-info responses missing from Quickwit 0.9.1;
+`_bulk` goes to the core and `_search` to the search service unchanged. OSB's
+per-item errors must be zero **and** the indexed count must match the corpus
+before search starts. The driver prints the corpus SHA-256 and both OSB runs'
+operation metrics. This is a portable custom workload, **not** a stock OSB
+track or a claim that the old native-API search numbers are cross-engine
+comparable. Quickwit's ES compatibility root identifies itself as ES 7.17 in
+OSB's raw metadata; the deployment is Quickwit 0.9.1, and OpenSearch node
+telemetry is not reported for it.
+
+To generate exactly the same corpus and OSB workloads for another ES-compatible
+stack:
+
+```sh
+OSB_OUT_DIR=.tmp/pgvs3/osb-portable python3 deploy/bench/suites/osb_run.py \
+  --generate-only --docs 100000000 --index otel-logs-v0_9
+```
+
+An example OpenSearch mapping is in
+`deploy/bench/workloads/opensearch-otel-mapping.json`. Pre-create the index,
+then run OSB `benchmark-only` against the generated `ingest/` workload,
+followed by `search/` with `OSB_DOCS=100000000 OSB_WINDOW_FRAC=0.1` and
+`--randomization-enabled --randomization-repeat-frequency=0`. Compare only
+equivalent index settings, data counts and client counts. The `search/`
+workload uses one and eight concurrent clients; ingestion has one ordered bulk
+client. Corpus generation is outside OSB ingest timing; `indexed_s` also
+includes the wait until every document is searchable.
+The generated 1k-document corpus and both OSB stages were smoke-tested against
+OpenSearch 2.19.4 with zero errors, an exact indexed-count check and nonempty
+matching time-window searches. No 100M OpenSearch comparison has been run yet.
 
 ### Harness entry points (development)
 
@@ -420,7 +564,7 @@ just rig-up                       # tagged CloudFormation stack; sync, deploy, v
 just rig-contract                 # Rust S3 contract against Aurora's gateway pods
 just rig-churn                    # opt-in large overwrite/delete + multipart churn and DB stats
 just rig-validate                 # CI's kind smoke gate against Aurora
-SUITES=tpch,click just rig-bench  # or run all five suites with just rig-bench
+SUITES=tpch,click just rig-bench  # or run all six suites with just rig-bench
 QUICK=1 just rig-bench            # smoke-scale benchmark
 just rig-reset                    # pre-release test data only; explicit confirmation
 just rig-results                  # download latest JSONL after a disconnected run
@@ -514,8 +658,8 @@ containers:
 - `deploy/`: `kind/cluster.yaml`, `kind/up.sh`, `kind/db.sh`, `kind/bench.sh`,
   `kind/rig.yaml` (the EC2 +
   Aurora stack), `charts/` — `postgres`, `pgvs3`, `quickwit`, `kind-bench` —
-  and `bench/`, the benchmark image (suite runners plus a copy of the
-  harness, synced at build time).
+  and `bench/`, the suite runners and benchmark image. The image copies the
+  canonical harness directly from `crates/pgvs3`; there is no tracked duplicate.
 - `justfile`: every task (`just` lists them); `mise.ec2.toml`: the opt-in EC2
   host bootstrap; `.env.example`: the rig's
   settings.

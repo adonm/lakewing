@@ -105,13 +105,12 @@ def gateway_stats():
 
 
 def gateway_counters(st):
-    """(MiB served, GETs, pid) from a gateway perf line, or None.
+    """(MiB served, GETs, instance) from one gateway perf line, or None.
 
-    pid says which gateway process answered: the Service round-robins across
-    replicas and counters are per-process, so a diff across two instances is
-    meaningless (it can go negative)."""
-    m = st and re.search(r"pid=(\d+).*small n=(\d+) .*\| stream n=(\d+) .* served=(\d+)MiB", st)
-    return (int(m.group(4)), int(m.group(2)) + int(m.group(3)), int(m.group(1))) if m else None
+    Container PIDs repeat; the instance token includes the pod and start time.
+    A Service can route successive requests to different replicas."""
+    m = st and re.search(r"instance=([^ ]+).*small n=(\d+) .*\| stream n=(\d+) .* served=(\d+)MiB", st)
+    return (int(m.group(4)), int(m.group(2)) + int(m.group(3)), m.group(1)) if m else None
 
 
 def write_record(record: dict, out: str) -> None:

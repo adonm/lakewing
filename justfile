@@ -55,7 +55,7 @@ smoke: kind-up
     #!/usr/bin/env bash
     set -euo pipefail
     {{ just_executable() }} kind-contract
-    QUICK=1 SUITES=validate,pgbench,tpch,click,search,stress {{ just_executable() }} kind-bench
+    QUICK=1 SUITES=validate,pgbench,tpch,click,spatial,search,stress {{ just_executable() }} kind-bench
 
 # Rust S3 contract against both kind gateway pods and its PostgreSQL storage.
 [group('kind')]
@@ -100,13 +100,14 @@ ci:
     #!/usr/bin/env bash
     set -euo pipefail
     hk check --all
+    python3 -m unittest discover -s deploy/bench/suites -p 'test_osb_run.py'
     mbx build --release --locked
     mbx test --workspace
     just smoke
 
 # --- kind: Postgres 18 + pgvs3 + DuckLake + Quickwit on one disk -----------
-# One command per step. `kind-bench` runs all five suites in under an hour
-# with caching on (real-world numbers). Results: .tmp/pgvs3/kind-bench.jsonl.
+# One command per step. Full-scale `kind-bench` runs six suites with caches on;
+# `QUICK=1` keeps CI at smoke scale. Results: .tmp/pgvs3/kind-bench.jsonl.
 
 # Stand up pgvs3, DuckLake and Quickwit in kind; PostgreSQL is local or external.
 [group('kind')]

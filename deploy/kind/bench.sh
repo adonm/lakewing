@@ -13,20 +13,23 @@ helm=(helm --kube-context "kind-$cluster")
 mbx build --release -p pgvs3
 cp target/release/pgvs3 deploy/bench/pgvs3-bin
 trap 'rm -f deploy/bench/pgvs3-bin' EXIT
-# The canonical harness sources live in crates/pgvs3, not the image context.
-cp crates/pgvs3/benchlib.py crates/pgvs3/tpch_bench.py \
-  crates/pgvs3/analytics_bench.py deploy/bench/harness/
-cp crates/pgvs3/queries/*.sql deploy/bench/harness/queries/
-docker build -q -t kind-bench:latest -f deploy/bench/Dockerfile deploy/bench
+docker build -q -t kind-bench:latest -f deploy/bench/Dockerfile .
 kind load docker-image kind-bench:latest --name "$cluster"
 
-suites=${SUITES:-pgbench,tpch,click,search,stress}
+suites=${SUITES:-pgbench,tpch,click,spatial,search,stress}
 env_args=()
+resource_args=()
 if [ -n "${PGVS3_DB_SECRET:-}" ]; then
   "${kubectl[@]}" get secret "$PGVS3_DB_SECRET" >/dev/null
   env_args+=(--set-string "pgSecretName=$PGVS3_DB_SECRET")
+  if [[ "${QUICK:-0}" != 1 && "${QUICK:-0}" != true ]]; then
+    resource_args+=(--set "resources.limits.memory=24Gi")
+    DUCKDB_MEMORY_LIMIT=${DUCKDB_MEMORY_LIMIT:-16GiB}
+  fi
 fi
 for key in QUICK SCALE CLIENTS SECONDS_RUN SF PASSES PARTS QUERIES DOCS \
+           SPATIAL_SF SPATIAL_QUERIES SPATIAL_QUERY_TIMEOUT \
+           DUCKDB_MEMORY_LIMIT \
            WORKERS WINDOW_FRAC SEARCH_INDEX SEED_GB REQUESTS CONCURRENCY SIZES; do
   if [ -n "${!key:-}" ]; then
     value=${!key}
@@ -39,12 +42,12 @@ done
 mkdir -p .tmp/pgvs3/jobs
 results=.tmp/pgvs3/kind-bench.jsonl
 : > "$results"
-wait_s=2700
+wait_s=7200
 case "${QUICK:-}" in 1 | true) wait_s=300 ;; esac
 
 for suite in ${suites//,/ }; do
   case "$suite" in
-    validate|pgbench|tpch|click|search|stress) ;;
+    validate|pgbench|tpch|click|spatial|search|stress) ;;
     *) echo "unknown suite: $suite" >&2; exit 2 ;;
   esac
   echo "=== $suite ==="
@@ -52,7 +55,7 @@ for suite in ${suites//,/ }; do
   "${kubectl[@]}" delete job "bench-$suite" --ignore-not-found --wait=true >/dev/null
   "${helm[@]}" upgrade --install kind-bench deploy/charts/kind-bench \
     --namespace "$namespace" --reset-values --set image=kind-bench:latest \
-    "${env_args[@]}" --set "suite=$suite"
+    "${env_args[@]}" "${resource_args[@]}" --set "suite=$suite"
 
   waited=0
   while :; do

@@ -4,6 +4,7 @@
 //! observability noise.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::OnceLock;
 
 /// Spans up to this size are one query, and "small" in the stats.
 pub const SMALL_MAX: usize = 8 << 20;
@@ -23,6 +24,21 @@ static TOTAL_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static PARTS: AtomicU64 = AtomicU64::new(0);
 static WAIT_US: AtomicU64 = AtomicU64::new(0);
 static SERVED: AtomicU64 = AtomicU64::new(0);
+static INSTANCE: OnceLock<String> = OnceLock::new();
+
+fn instance_id() -> &'static str {
+    INSTANCE.get_or_init(|| {
+        format!(
+            "{}-{}-{}",
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_owned()),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        )
+    })
+}
 
 /// Span-size histogram buckets: <64K <512K <2M <8M >=8M (the workload's read
 /// shapes; the last boundary is SMALL_MAX).
@@ -78,8 +94,9 @@ pub fn stage_stats_line() -> String {
     let s: Vec<u64> = SPANS.iter().map(|a| a.load(Relaxed)).collect();
     let lat: Vec<u64> = LAT.iter().map(|a| a.load(Relaxed)).collect();
     format!(
-        "perf: pid={} spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small n={} ttfb={:.0}ms total={:.0}ms | stream n={} ttfb={:.0}ms total={:.0}ms | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+        "perf: pid={} instance={} spans=[<64K:{} <512K:{} <2M:{} <8M:{} >=8M:{}] small n={} ttfb={:.0}ms total={:.0}ms | stream n={} ttfb={:.0}ms total={:.0}ms | parts={} wait(sum)={:.0}ms | served={}MiB | get p50={:.1}ms p95={:.1}ms p99={:.1}ms",
         std::process::id(),
+        instance_id(),
         s[0],
         s[1],
         s[2],

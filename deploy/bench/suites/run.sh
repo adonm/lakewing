@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suite runner for the kind benchmarks. One suite per invocation; all five
+# Suite runner for the kind benchmarks. One suite per invocation; each
 # write a JSON line to stdout (the `just kind-bench` recipe concatenates them
 # into .tmp/pgvs3/kind-bench.jsonl).
 #
@@ -43,10 +43,11 @@ case "${QUICK:-0}" in
   REQUESTS=${REQUESTS:-200}
   CONCURRENCY=${CONCURRENCY:-1,8}
   SIZES=${SIZES:-65536,262144}
+  SPATIAL_SF=${SPATIAL_SF:-0.1}
   ;;
 esac
 
-suite=${1:?suite: validate | pgbench | tpch | click | search | stress}
+suite=${1:?suite: validate | pgbench | tpch | click | spatial | search | stress}
 
 case "$suite" in
 
@@ -109,21 +110,31 @@ click)
   # --parts N downloads N disjoint 1% slices of canonical hits.parquet
   # (typed like the full set) so the run fits the budget; full is 13.8 GiB.
   python3 /bench/harness/analytics_bench.py --bench click --stack lake-s3 --download --load \
-    --parts "${PARTS:-10}" --passes "${PASSES:-2}" \
+    --parts "${PARTS:-0}" --passes "${PASSES:-2}" \
+    --memory-limit "${DUCKDB_MEMORY_LIMIT:-6GiB}" \
     --catalog "dbname=ducklake_catalog host=$PG_HOST user=$PG_USER sslmode=${PGSSLMODE:-prefer}" \
     --data-path "$LAKE_ROOT" \
     --out "$OUT/click.json"
   cat "$OUT/click.json"
   ;;
 
-# --- Search: Quickwit via its ES-compatible API -----------------------------
+# --- Spatial: AOI filters over Sedona SpatialBench trip/zone data ---------
+spatial)
+  python3 /bench/harness/analytics_bench.py --bench spatial --stack lake-s3 --download --load \
+    --sf "${SPATIAL_SF:-10}" --queries "${SPATIAL_QUERIES:-1-3,6}" \
+    --query-timeout "${SPATIAL_QUERY_TIMEOUT:-600}" --passes "${PASSES:-2}" \
+    --memory-limit "${DUCKDB_MEMORY_LIMIT:-6GiB}" \
+    --catalog "dbname=ducklake_catalog host=$PG_HOST user=$PG_USER sslmode=${PGSSLMODE:-prefer}" \
+    --data-path "$LAKE_ROOT" \
+    --out "$OUT/spatial.json"
+  cat "$OUT/spatial.json"
+  ;;
+
+# --- Search: OSB bulk + queries via Quickwit's ES-compatible API ----------
 search)
-  # --docs seeds the index first: latency against an empty index is a lie.
-  python3 /bench/suites/search_bench.py --url "$QW_URL" --docs "${DOCS:-1000000}" \
-    --ingest-url "$QW_INGEST_URL" \
-    --index "${SEARCH_INDEX:-auto}" \
-    --workers "${WORKERS:-8}" --window-frac "${WINDOW_FRAC:-0}" \
-    --queries "${QUERIES:-200}" --out "$OUT/search.json"
+  python3 /bench/suites/osb_run.py --docs "${DOCS:-100000000}" \
+    --index "${SEARCH_INDEX:-auto}" --window-frac "${WINDOW_FRAC:-0.1}" \
+    --queries "${QUERIES:-400}" --out "$OUT/search.json"
   ;;
 
 # --- pgvs3 stress: the ceiling ---------------------------------------------

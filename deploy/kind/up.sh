@@ -63,11 +63,12 @@ if [ "$strategy" = RollingUpdate ]; then
 fi
 "${helm[@]}" upgrade --install quickwit deploy/charts/quickwit --namespace "$namespace" \
   --reset-values --set-string "metastoreSecretName=$secret" --set "searcher.replicas=$searchers"
-# A ConfigMap update does not change Quickwit's Deployment pod template.
+# ConfigMap and Secret updates do not change Deployment pod templates.
 "${kubectl[@]}" -n "$namespace" rollout restart deployment/quickwit
 "${kubectl[@]}" -n "$namespace" rollout status deployment/quickwit --timeout=300s
 bash deploy/kind/db.sh "$secret" schedule
 if [ "$searchers" -gt 0 ]; then
+  "${kubectl[@]}" -n "$namespace" rollout restart deployment/quickwit-searcher
   "${kubectl[@]}" -n "$namespace" rollout status deployment/quickwit-searcher --timeout=300s
 fi
 echo 'kind up. next: just kind-validate && just kind-bench'
