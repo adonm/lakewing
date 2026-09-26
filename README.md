@@ -27,28 +27,31 @@ indexed **100M logs** with OpenSearch Benchmark (OSB) at ~230k docs/s and zero
 errors; fresh 10%-time-window search was **43.76 ms p50 / 52.04 ms p95** at
 eight clients. Prior DuckDB 1.5.2 numbers remain below for context.
 
-### Rough cost context, not a service benchmark
+### What native engines would need to match
 
-Illustrative public US East on-demand rates, assuming 730 active hours/month
-(prices checked September 2026). These are **different architectures**, not
-same-hardware or measured ClickHouse/OpenSearch results:
+pgvs3 **requires PostgreSQL** for its object bytes. “Without Postgres” here
+means alternative engines keeping their own data, not a pgvs3 standalone mode.
+Analytics and indexed search are separate workloads; neither substitutes for
+pgvs3's S3 GET API. These are sizing bounds, **not** measured equal-service
+configurations:
 
-| Example | Compute if active 24/7 | Storage and caveat |
-| --- | ---: | --- |
-| This **test rig**: one m7i.4xlarge + 2–16 Aurora Serverless v2 I/O-Optimized ACUs | ~$1.12–$3.30/h (~$816–$2,411/mo) | Aurora ~$0.225/GB-month plus the EC2 gp3 volume (~$50/mo at 250 GB / 6k IOPS / 500 MiB/s); not a production HA topology. |
-| ClickHouse Cloud **Enterprise**: two 32 GiB replicas (8 compute units) | ~$3.12/h (~$2,279/mo) | $25.30/TB-month of stored data; backups, transfer and actual sizing add cost. Not benchmarked here. |
-| OpenSearch Serverless **NextGen**: *illustrative* four active OCUs | ~$0.96/h (~$701/mo) | Hot storage extra; can scale to zero when idle. Four OCUs are **not** validated to handle our 100M-log workload. |
+| Workload and our target | Published native-engine evidence | What that supports |
+| --- | --- | --- |
+| ClickBench: 99,997,497 rows, 43 DuckDB/DuckLake queries, **35.35 s first / 30.13 s warm** | [ClickHouse Cloud AWS runs](https://github.com/ClickHouse/ClickBench/tree/main/clickhouse-cloud/results/20260925) on the same `hits` dataset: one **32 GiB** replica took 47.95/43.41 s (first/second); one **64 GiB** replica took 25.37/22.75 s. With two replicas: [**32 GiB each**](https://github.com/ClickHouse/ClickBench/blob/main/clickhouse-cloud/results/20260925/aws.2.32.json) took 52.47/47.43 s; [**64 GiB each**](https://github.com/ClickHouse/ClickBench/blob/main/clickhouse-cloud/results/20260925/aws.2.64.json) took 29.39/20.87 s. | Of the published sizes, **64 GiB per native ClickHouse replica clears our query-time target; 32 GiB does not**. This brackets the size, not the exact minimum. |
+| Log search: 100M OTLP logs, one bulk client **230k docs/s**, fresh 10%-window severity filter at eight clients **52.04 ms p95** | [AWS's OpenSearch Service OSB study](https://repost.aws/articles/ARBeQf6qJuSNKiSUFrCDLtsA/benchmarking-instance-types-for-amazon-opensearch-workloads) used two **8-vCPU/32-GiB data nodes** plus three **2-vCPU/4-GiB cluster managers** on **247M different HTTP logs**; term/range query p99 was about 29–51 ms, but query shape, concurrency and ingestion differ. | **No verified performance-equivalent OpenSearch size.** Try that published configuration, then sweep 2/4/8 data nodes with [our identical OSB corpus and track](#benchmarks) until both ingest throughput and eight-client p95 meet the targets. Do not extrapolate node count from the other corpus. |
 
-Sources: [Aurora](https://aws.amazon.com/rds/aurora/pricing/) ($0.156/ACU-hour),
-[EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and
-[m7i.4xlarge rate](https://cloudprice.net/aws/ec2/instances/m7i.4xlarge)
-(~$0.8064/hour), [gp3](https://aws.amazon.com/ebs/pricing/),
-[ClickHouse Cloud](https://clickhouse.com/pricing/) (Enterprise, AWS US East:
-$0.39030/compute-unit-hour), and
-[OpenSearch Service](https://aws.amazon.com/opensearch-service/pricing/)
-(example $0.24/OCU-hour). Storage formats, replication, availability, support,
-egress and sustained capacity differ. Use each vendor's calculator for a real
-deployment estimate; don't infer a price/performance winner from this table.
+The ClickHouse figures are the first and second query runs on September 25;
+September 23–24 show the same 32-to-64-GiB bracket. [ClickBench's version
+benchmark](https://benchmark.clickhouse.com/versions/) also uses 100M `hits`
+rows on a 16-vCPU/32-GiB reference host. ClickHouse Cloud defines a compute
+unit as [8 GiB RAM and 2 vCPU](https://clickhouse.com/pricing/), so the
+published 32–64 GiB tiers correspond to roughly **8–16 vCPU per replica**.
+Our first DuckDB pass reads remote
+DuckLake files, while published native ClickHouse runs use their own caches and
+storage layout; “first” is not an identical cold-cache definition. OpenSearch's
+published `http_logs` queries are **not** our OSB time-window query. Matching
+either service requires a same-track, same-cache-policy trial before claiming
+price/performance equivalence.
 
 ## Quick start
 
